@@ -4,7 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
+async-channel = "2"
+futures-lite = "2"
 gpui-kit = { version = "0.7", features = ["gpui-fast"] }
+image = { version = "0.25", default-features = false }
+maplibre_native = { version = "0.10", features = ["wgpu"] }
+wgpu = "29"
+
+[dev-dependencies]
+gpui-kit = { version = "0.7", features = ["test-support"] }
 
 [profile.dev]
 debug = 0
+
+# The native C++ bridge treats warnings as errors; Nix's fortify flags need -O.
+[profile.dev.package.maplibre_native]
+opt-level = 1
