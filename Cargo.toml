@@ -6,9 +6,11 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 async-channel = "2"
+env_logger = "0.11"
 futures-lite = "2"
 gpui-kit = { version = "0.7", features = ["gpui-fast"] }
 image = { version = "0.25", default-features = false }
+log = "0.4"
 maplibre_native = { version = "0.10", features = ["wgpu"] }
 wgpu = "29"
 

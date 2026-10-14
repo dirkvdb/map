@@ -6,6 +6,8 @@ mod map_view;
 use gpui_kit::{AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 
 fn main() {
+    env_logger::init();
+
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
         gpui_kit::init(cx);
         map_view::init(cx);
@@ -28,7 +30,7 @@ fn main() {
                 cx.new(map_view::MapView::new)
             },
         ) {
-            eprintln!("Failed to open window: {error:#}");
+            log::error!("Failed to open window: {error:#}");
             cx.quit();
             return;
         }

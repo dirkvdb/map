@@ -74,7 +74,7 @@ impl MapView {
                                 view.error = None;
                             }
                             Err(error) => {
-                                eprintln!("Map rendering failed: {error:#}");
+                                log::error!("Map rendering failed: {error:#}");
                                 view.error = Some(format!("Couldn’t load the map. {error}").into());
                             }
                         }
@@ -297,14 +297,6 @@ impl Render for MapView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(surface)
-            .child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("MapLibre demo tiles · Natural Earth"),
-            )
     }
 }
 

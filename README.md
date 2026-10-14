@@ -9,6 +9,9 @@ A minimal GPUI desktop app with a vector basemap rendered by
 devenv shell -- cargo run
 ```
 
+Logging uses `log` with `env_logger` and defaults to errors. Set `RUST_LOG` to
+adjust verbosity, for example `RUST_LOG=map=debug devenv shell -- cargo run`.
+
 Both GPUI and MapLibre use wgpu 29. The development shell supplies the native
 build tools and libraries and sets `MLN_PRECOMPILE=0`: MapLibre 0.10 does not
 publish a precompiled wgpu core for this release. The first build fetches the
@@ -51,7 +54,7 @@ devenv shell -- cargo test --locked
 devenv shell -- cargo test vector_basemap_renders_geographic_content -- --ignored --nocapture
 devenv shell -- cargo test retained_renderer_updates_camera_and_viewport -- --ignored --nocapture
 devenv shell -- cargo test streaming_worker_delivers_frames_and_accepts_new_viewports -- --ignored --nocapture
-devenv shell -- cargo test --release navigation_frame_timings -- --ignored --nocapture
+RUST_LOG=map=info devenv shell -- cargo test --release navigation_frame_timings -- --ignored --nocapture
 ```
 
 The opt-in rendering smoke test requires internet access and a working native

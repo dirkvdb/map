@@ -251,6 +251,8 @@ mod tests {
     #[test]
     #[ignore = "manual GPU performance measurement; requires internet access"]
     fn navigation_frame_timings() -> Result<()> {
+        let _ = env_logger::builder().is_test(true).try_init();
+
         let viewport = Viewport {
             width: NonZeroU32::new(1200).unwrap(),
             height: NonZeroU32::new(760).unwrap(),
@@ -278,7 +280,7 @@ mod tests {
             readback += rendered.elapsed();
             assert_eq!(image.dimensions(), (1800, 1140));
         }
-        eprintln!(
+        log::info!(
             "Average navigation frame: first-frame rendering={:?}, readback/copy={:?}",
             rendering / 12,
             readback / 12
