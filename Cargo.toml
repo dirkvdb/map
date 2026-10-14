@@ -1,0 +1,10 @@
+[package]
+name = "map"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = { version = "0.7", features = ["gpui-fast"] }
+
+[profile.dev]
+debug = 0
