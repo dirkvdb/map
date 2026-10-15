@@ -40,22 +40,20 @@ pub(crate) struct MapView {
 
 impl MapView {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
-        let (renderer, error) = match MapRenderer::new() {
-            Ok(renderer) => (Some(renderer), None),
-            Err(error) => (None, Some(format!("Couldn’t start the map. {error}").into())),
-        };
-        let task = renderer.as_ref().map(|renderer| Self::watch_frames(renderer, cx));
+        let renderer = MapRenderer::new().expect("Failed to create the map renderer");
+
+        let task = Self::watch_frames(&renderer, cx);
         Self {
             viewport: None,
             bounds: None,
             camera: MapCamera::default(),
             requested: None,
-            renderer,
+            renderer: Some(renderer),
             drag_position: None,
             focus: cx.focus_handle().tab_stop(true),
             image: None,
-            error,
-            _frames_task: task,
+            error: None,
+            _frames_task: Some(task),
         }
     }
 
@@ -111,17 +109,9 @@ impl MapView {
     }
 
     fn retry(&mut self, cx: &mut Context<Self>) {
-        match MapRenderer::new() {
-            Ok(renderer) => {
-                self._frames_task = Some(Self::watch_frames(&renderer, cx));
-                self.renderer = Some(renderer);
-            }
-            Err(error) => {
-                self.error = Some(format!("Couldn’t start the map. {error}").into());
-                cx.notify();
-                return;
-            }
-        }
+        let renderer = MapRenderer::new().expect("Failed to create the map renderer");
+        self._frames_task = Some(Self::watch_frames(&renderer, cx));
+        self.renderer = Some(renderer);
         self.requested = None;
         self.request_render(cx);
     }
