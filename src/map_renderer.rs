@@ -13,33 +13,33 @@ use maplibre_native::{Continuous, ImageRenderer, ImageRendererBuilder, RunLoopHa
 use crate::map_camera::MapCamera;
 use crate::map_readback::GpuReadback;
 
-pub(crate) const STYLE_URL: &str = "https://demotiles.maplibre.org/style.json";
+pub const STYLE_URL: &str = "https://demotiles.maplibre.org/style.json";
 
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) struct Viewport {
-    pub(crate) width: NonZeroU32,
-    pub(crate) height: NonZeroU32,
-    pub(crate) scale: f32,
+pub struct Viewport {
+    pub width: NonZeroU32,
+    pub height: NonZeroU32,
+    pub scale: f32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) struct MapRequest {
-    pub(crate) viewport: Viewport,
-    pub(crate) camera: MapCamera,
+pub struct MapRequest {
+    pub viewport: Viewport,
+    pub camera: MapCamera,
 }
 
-pub(crate) struct MapFrame {
-    pub(crate) viewport: Viewport,
-    pub(crate) image: Result<Arc<RenderImage>>,
+pub struct MapFrame {
+    pub viewport: Viewport,
+    pub image: Result<Arc<RenderImage>>,
 }
 
-pub(crate) struct MapRenderer {
+pub struct MapRenderer {
     sender: mpsc::Sender<MapRequest>,
     frames: async_channel::Receiver<MapFrame>,
 }
 
 impl MapRenderer {
-    pub(crate) fn new() -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let (sender, receiver) = mpsc::channel::<MapRequest>();
         let (frame_sender, frames) = async_channel::bounded(1);
         let pending_frame = frames.clone();
@@ -48,81 +48,94 @@ impl MapRenderer {
         // in-flight request, drops all native resources, and exits.
         std::thread::Builder::new()
             .name("map-renderer".into())
-            .spawn(move || {
-                let mut map: Option<NativeMap> = None;
-                let mut current: Option<MapRequest> = None;
-                let mut next_frame = Instant::now();
-                loop {
-                    let incoming = if map.is_none() {
-                        receiver.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
-                    } else {
-                        receiver.recv_timeout(next_frame.saturating_duration_since(Instant::now()))
-                    };
-                    let mut request = match incoming {
-                        Ok(request) => Some(request),
-                        Err(mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    };
-                    for latest in receiver.try_iter() {
-                        request = Some(latest);
-                    }
-                    if let Some(request) = request {
-                        current = Some(request);
-                    }
-                    let Some(current) = current else { continue };
-                    let frame_started = Instant::now();
-                    let result = (|| {
-                        if map.as_ref().is_none_or(|map| map.viewport.scale != current.viewport.scale) {
-                            map = Some(NativeMap::new(current.viewport)?);
-                        }
-                        let map = map.as_mut().context("Map renderer unavailable")?;
-                        if request.is_some() {
-                            map.apply_request(current);
-                        }
-                        if Instant::now() < next_frame {
-                            return Ok(None);
-                        }
-                        map.poll_frame()?
-                            .map(|texture| {
-                                let pixels = map.readback.read(&texture, &map.device, &map.queue)?;
-                                Ok(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])))
-                            })
-                            .transpose()
-                    })();
-                    if result.is_err() {
-                        map = None;
-                    }
-                    if let Ok(None) = result {
-                        // Poll native resource/fade callbacks without busy-waiting.
-                        if Instant::now() >= next_frame {
-                            next_frame = Instant::now() + Duration::from_millis(16);
-                        }
-                        continue;
-                    }
-                    let frame = MapFrame {
-                        viewport: current.viewport,
-                        image: result.and_then(|image| image.context("Missing map frame")),
-                    };
-                    if let Err(async_channel::TrySendError::Full(frame)) = frame_sender.try_send(frame) {
-                        // Keep one newest completed frame if GPUI is still busy.
-                        let _ = pending_frame.try_recv();
-                        let _ = frame_sender.try_send(frame);
-                    }
-                    next_frame = frame_started + Duration::from_millis(16);
-                }
-            })
+            .spawn(move || run_renderer(receiver, frame_sender, pending_frame))
             .context("Could not start the map rendering thread")?;
         Ok(Self { sender, frames })
     }
 
-    pub(crate) fn render(&self, request: MapRequest) -> Result<()> {
+    pub fn render(&self, request: MapRequest) -> Result<()> {
         self.sender.send(request).context("Map rendering thread stopped")?;
         Ok(())
     }
 
-    pub(crate) fn frames(&self) -> async_channel::Receiver<MapFrame> {
+    pub fn frames(&self) -> async_channel::Receiver<MapFrame> {
         self.frames.clone()
     }
+}
+
+fn run_renderer(requests: mpsc::Receiver<MapRequest>, frames: async_channel::Sender<MapFrame>, pending_frame: async_channel::Receiver<MapFrame>) {
+    let mut map = None;
+    let mut current_request = None;
+    let mut next_frame = Instant::now();
+
+    loop {
+        let timeout = map.as_ref().map(|_| next_frame.saturating_duration_since(Instant::now()));
+        let Ok(request) = receive_latest_request(&requests, timeout) else {
+            break;
+        };
+        if let Some(request) = request {
+            current_request = Some(request);
+        }
+        let Some(current_request) = current_request else { continue };
+
+        let frame_started = Instant::now();
+        let image = match poll_map_image(&mut map, current_request, request.is_some(), next_frame) {
+            Ok(Some(image)) => Ok(image),
+            Ok(None) => {
+                // Poll native resource/fade callbacks without busy-waiting.
+                if Instant::now() >= next_frame {
+                    next_frame = Instant::now() + Duration::from_millis(16);
+                }
+                continue;
+            }
+            Err(error) => {
+                map = None;
+                Err(error)
+            }
+        };
+        let frame = MapFrame {
+            viewport: current_request.viewport,
+            image,
+        };
+        if let Err(async_channel::TrySendError::Full(frame)) = frames.try_send(frame) {
+            // Keep one newest completed frame if GPUI is still busy.
+            let _ = pending_frame.try_recv();
+            let _ = frames.try_send(frame);
+        }
+        next_frame = frame_started + Duration::from_millis(16);
+    }
+}
+
+fn receive_latest_request(requests: &mpsc::Receiver<MapRequest>, timeout: Option<Duration>) -> Result<Option<MapRequest>, mpsc::RecvTimeoutError> {
+    let incoming = match timeout {
+        Some(timeout) => requests.recv_timeout(timeout),
+        None => requests.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+    };
+    let mut request = match incoming {
+        Ok(request) => Some(request),
+        Err(mpsc::RecvTimeoutError::Timeout) => None,
+        Err(error) => return Err(error),
+    };
+    for latest in requests.try_iter() {
+        request = Some(latest);
+    }
+    Ok(request)
+}
+
+fn poll_map_image(map: &mut Option<NativeMap>, request: MapRequest, request_changed: bool, next_frame: Instant) -> Result<Option<Arc<RenderImage>>> {
+    if map.as_ref().is_none_or(|map| map.viewport.scale != request.viewport.scale) {
+        *map = Some(NativeMap::new(request.viewport)?);
+    }
+    let map = map.as_mut().context("Map renderer unavailable")?;
+    if request_changed {
+        map.apply_request(request);
+    }
+    if Instant::now() < next_frame {
+        return Ok(None);
+    }
+    let Some(texture) = map.poll_frame()? else { return Ok(None) };
+    let pixels = map.readback.read(&texture, &map.device, &map.queue)?;
+    Ok(Some(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]))))
 }
 
 struct NativeMap {
@@ -141,12 +154,10 @@ impl NativeMap {
         // The wgpu FFI backend requires a host-supplied device and queue. This
         // initialization can later accept GPUI's device instead of creating one.
         let (device, queue) = futures_lite::future::block_on(async {
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-            let adapter = instance
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle())
                 .request_adapter(&wgpu::RequestAdapterOptions::default())
                 .await
-                .context("Could not find a wgpu adapter for the map")?;
-            adapter
+                .context("Could not request wgpu adapter")?
                 .request_device(&wgpu::DeviceDescriptor {
                     label: Some("MapLibre device"),
                     ..Default::default()
@@ -225,11 +236,7 @@ impl NativeMap {
         RunLoopHandle::current().tick();
         if self.needs_frame.replace(false) {
             self.renderer.render_once();
-            return self
-                .renderer
-                .take_texture()
-                .map(Some)
-                .context("MapLibre did not produce a wgpu texture");
+            return self.renderer.take_texture().map(Some).context("MapLibre did not produce a wgpu texture");
         }
         Ok(None)
     }
@@ -350,11 +357,7 @@ mod tests {
         })?;
         assert_eq!(image.dimensions(), (800, 600));
         let colors: std::collections::HashSet<_> = image.pixels().map(|pixel| pixel.0).collect();
-        assert!(
-            colors.len() > 100,
-            "Expected vector features and labels, got {} colors",
-            colors.len()
-        );
+        assert!(colors.len() > 100, "Expected vector features and labels, got {} colors", colors.len());
         assert!(image.pixels().all(|pixel| pixel[3] == 255));
         Ok(())
     }

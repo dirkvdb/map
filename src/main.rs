@@ -32,7 +32,7 @@ fn create_main_window(cx: &mut App) -> anyhow::Result<()> {
 
     gpui_kit::open_window(window_options, cx, |window, cx| {
         window.set_window_title("Map");
-        cx.new(map_view::MapView::new)
+        cx.new(|cx| map_view::MapView::new(window, cx))
     })?;
 
     Ok(())

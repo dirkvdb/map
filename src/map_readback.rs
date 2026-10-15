@@ -25,13 +25,13 @@ struct ReadbackTarget {
     stride: u32,
 }
 
-pub(crate) struct GpuReadback {
+pub struct GpuReadback {
     pipeline: wgpu::RenderPipeline,
     target: Option<ReadbackTarget>,
 }
 
 impl GpuReadback {
-    pub(crate) fn new(device: &wgpu::Device) -> Self {
+    pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Map BGRA conversion"),
             source: wgpu::ShaderSource::Wgsl(COPY_SHADER.into()),
@@ -64,7 +64,7 @@ impl GpuReadback {
         Self { pipeline, target: None }
     }
 
-    pub(crate) fn read(&mut self, source: &wgpu::Texture, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<RgbaImage> {
+    pub fn read(&mut self, source: &wgpu::Texture, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<RgbaImage> {
         if self.target.as_ref().is_none_or(|target| target.texture.size() != source.size()) {
             let stride = source
                 .width()
@@ -72,10 +72,7 @@ impl GpuReadback {
                 .and_then(|row| row.checked_next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))
                 .context("Map row size overflowed")?;
             let size = u64::from(stride) * u64::from(source.height());
-            ensure!(
-                size <= device.limits().max_buffer_size,
-                "Map image exceeds the GPU readback buffer limit"
-            );
+            ensure!(size <= device.limits().max_buffer_size, "Map image exceeds the GPU readback buffer limit");
             self.target = Some(ReadbackTarget {
                 texture: device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("Map BGRA target"),

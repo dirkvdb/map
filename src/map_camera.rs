@@ -6,7 +6,7 @@ const MIN_ZOOM: f64 = 0.0;
 const MAX_ZOOM: f64 = 18.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct MapCamera {
+pub struct MapCamera {
     // Normalized Web Mercator coordinates; one world spans 512 logical pixels
     // at zoom zero, independent of display DPI.
     x: f64,
@@ -25,7 +25,7 @@ impl Default for MapCamera {
 }
 
 impl MapCamera {
-    pub(crate) fn update(self) -> CameraUpdate {
+    pub fn update(self) -> CameraUpdate {
         CameraUpdate::new()
             .center(LatLng {
                 lat: (PI * (1.0 - 2.0 * self.y)).sinh().atan().to_degrees(),
@@ -34,14 +34,14 @@ impl MapCamera {
             .zoom(self.zoom)
     }
 
-    pub(crate) fn pan(&mut self, dx: f64, dy: f64) {
+    pub fn pan(&mut self, dx: f64, dy: f64) {
         let world_size = self.world_size();
         self.x = (self.x - dx / world_size).rem_euclid(1.0);
         self.y = (self.y - dy / world_size).clamp(0.0, 1.0);
     }
 
     /// `offset` is the pointer's logical-pixel offset from the viewport center.
-    pub(crate) fn zoom_at(&mut self, delta: f64, offset: (f64, f64)) {
+    pub fn zoom_at(&mut self, delta: f64, offset: (f64, f64)) {
         let old_size = self.world_size();
         self.zoom = (self.zoom + delta).clamp(MIN_ZOOM, MAX_ZOOM);
         let new_size = self.world_size();
