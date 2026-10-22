@@ -6,8 +6,10 @@ mod map_readback;
 mod map_renderer;
 mod map_view;
 mod pixel_info;
+mod raster_layer;
 mod raster_panel;
 mod raster_source;
+mod raster_tiles;
 mod settings;
 
 use gpui_kit::{App, AppContext, Bounds, QuitMode, Window, WindowBounds, WindowOptions, px, size};

@@ -1,0 +1,143 @@
+[package]
+name = "maplibre_native"
+version = "0.10.0"
+description = "Rust bindings to the MapLibre Native map rendering engine"
+authors = ["Yuri Astrakhan <YuriAstrakhan@gmail.com>", "MapLibre contributors"]
+repository = "https://github.com/maplibre/maplibre-native-rs"
+edition.workspace = true
+license.workspace = true
+keywords = ["maplibre", "rendering", "gis", "tiles"]
+categories = ["external-ffi-bindings", "science::geo", "rendering"]
+rust-version = "1.90" # due to image crate
+exclude = []
+
+[package.metadata.mln]
+repo = "maplibre/maplibre-native"
+# This version is used only if maplibre-native-rs is build with prebuilt
+# maplibre-native binaries. It is not used when building maplibre-native from source.
+# When building from source, the version of maplibre-native is specified in the `build.rs` file
+release = "core-a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b"
+
+[features]
+default = ["log", "json", "geojson"]
+metal = []
+opengl = []
+vulkan = []
+wgpu = ["dep:webgpu-shim", "dep:wgpu"]
+
+# Use a GLX context for OpenGL (Linux)
+glx = ["opengl"]
+
+# Enables parsing style-spec layer JSON via `AnyLayer::from_json_str`/`from_json_value`.
+json = ["dep:serde_json"]
+# Interoperate with the `geojson` crate
+geojson = ["dep:geojson"]
+# Logging via the `log` crate.
+log = ["dep:log"]
+# Thin adapter to register `tokio`-native async file sources.
+tokio = ["dep:tokio", "tokio/rt"]
+
+[dependencies]
+cxx.workspace = true
+geojson = { workspace = true, optional = true }
+image.workspace = true
+log = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+url.workspace = true
+webgpu-shim = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+
+[build-dependencies]
+cmake.workspace = true
+cxx-build.workspace = true
+downloader.workspace = true
+flate2.workspace = true
+tar.workspace = true
+toml.workspace = true
+walkdir.workspace = true
+webgpu-shim = { workspace = true, optional = true }
+
+[dev-dependencies]
+env_logger.workspace = true
+futures.workspace = true
+insta = { workspace = true, features = ["json", "redactions"] }
+rstest.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "sync", "rt-multi-thread"] }
+
+[[test]]
+name = "ambient_cache"
+required-features = ["tokio"]
+
+[[test]]
+name = "file_source_tokio"
+required-features = ["tokio"]
+
+[[test]]
+name = "file_source_cache"
+required-features = ["tokio"]
+
+##########################################################
+##########################################################
+####  Workspace configuration for the entire project  ####
+##########################################################
+##########################################################
+
+[workspace]
+members = [".", "examples/render", "examples/tile-server", "webgpu-shim"]
+# examples/slint requires wgpu backend which is not compatible with other backends enabled
+exclude = ["examples/slint"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+axum = "0.8"
+clap = { version = "4.5.27", features = ["derive", "env", "unstable-markdown"] }
+cmake = "0.1"
+cxx = "1.0"
+cxx-build = "1.0" # TODO: required to be a dependency and not only a build dependency?
+downloader = "0.2"
+env_logger = "0.11"
+flate2 = "1.1"
+futures = "0.3"
+geojson = "1.0.0"
+image = "0.25"
+insta = "1.43"
+log = "0.4"
+maplibre_native = { path = ".", version = "0.10.0" }
+rstest = "0.27.0"
+serde_json = "1.0"
+tar = "0.4.44"
+thiserror = "2.0.16"
+tokio = { version = "1", features = [], default-features = false }
+toml = "1.1"
+url = "2.5.7"
+walkdir = "2.5.0"
+webgpu-shim = { path = "webgpu-shim", version = "0.1" }
+wgpu = { version = "29.0.0" }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[lints]
+workspace = true
+
+# https://insta.rs/docs/quickstart/
+[profile.dev.package]
+insta.opt-level = 3
+similar.opt-level = 3
+
+# To debug the build script
+# Use `cargo build -v 2>&1 | grep build-script-build`
+# to find the location of the build script
+[profile.dev.build-override]
+debug = true

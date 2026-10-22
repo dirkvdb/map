@@ -1,0 +1,124 @@
+diff --git a/include/mln/style/layers/webgpu/custom_layer_render_parameters.hpp b/include/mln/style/layers/webgpu/custom_layer_render_parameters.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/mln/style/layers/webgpu/custom_layer_render_parameters.hpp
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include <mln/style/layers/custom_layer_render_parameters.hpp>
++#include <cstdint>
++
++namespace mln::style::webgpu {
++
++// Encoder and attachment formats are borrowed only for CustomLayerHost::render.
++// The host must not end the pass or retain its encoder after the callback.
++struct CustomLayerRenderParameters : mln::style::CustomLayerRenderParameters {
++    std::uintptr_t encoder;
++    uint32_t colorFormat;
++    uint32_t depthStencilFormat;
++    bool depthTest;
++
++    explicit CustomLayerRenderParameters(const mln::PaintParameters&);
++};
++
++} // namespace mln::style::webgpu
+diff --git a/src/mln/gfx/drawable_custom_layer_host_tweaker.cpp b/src/mln/gfx/drawable_custom_layer_host_tweaker.cpp
+--- a/src/mln/gfx/drawable_custom_layer_host_tweaker.cpp
++++ b/src/mln/gfx/drawable_custom_layer_host_tweaker.cpp
+@@ -12,6 +12,8 @@
+ #elif MLN_RENDER_BACKEND_VULKAN
+ #include <mln/style/layers/vulkan/custom_layer_render_parameters.hpp>
+ #include <mln/vulkan/render_pass.hpp>
++#elif MLN_RENDER_BACKEND_WEBGPU
++#include <mln/style/layers/webgpu/custom_layer_render_parameters.hpp>
+ #endif
+ 
+ #include <memory>
+@@ -33,6 +35,8 @@
+     style::mtl::CustomLayerRenderParameters parameters(paintParameters);
+ #elif MLN_RENDER_BACKEND_VULKAN
+     style::vulkan::CustomLayerRenderParameters parameters(paintParameters);
++#elif MLN_RENDER_BACKEND_WEBGPU
++    style::webgpu::CustomLayerRenderParameters parameters(paintParameters);
+ #else
+     style::CustomLayerRenderParameters parameters(paintParameters);
+ #endif
+diff --git a/src/mln/style/layers/custom_layer_render_parameters.cpp b/src/mln/style/layers/custom_layer_render_parameters.cpp
+--- a/src/mln/style/layers/custom_layer_render_parameters.cpp
++++ b/src/mln/style/layers/custom_layer_render_parameters.cpp
+@@ -2,6 +2,12 @@
+ #include <mln/renderer/paint_parameters.hpp>
+ #include <mln/util/mat4.hpp>
+ 
++#if MLN_RENDER_BACKEND_WEBGPU
++#include <mln/style/layers/webgpu/custom_layer_render_parameters.hpp>
++#include <mln/webgpu/render_pass.hpp>
++#include <mln/webgpu/renderer_backend.hpp>
++#endif
++
+ namespace mln {
+ namespace style {
+ 
+@@ -23,3 +29,28 @@
+ 
+ } // namespace style
+ } // namespace mln
++
++#if MLN_RENDER_BACKEND_WEBGPU
++namespace mln::style::webgpu {
++
++CustomLayerRenderParameters::CustomLayerRenderParameters(const mln::PaintParameters& parameters)
++    : mln::style::CustomLayerRenderParameters(parameters) {
++    auto& backend = static_cast<mln::webgpu::RendererBackend&>(parameters.backend);
++    encoder = reinterpret_cast<std::uintptr_t>(
++        static_cast<mln::webgpu::RenderPass&>(*parameters.renderPass).getEncoder());
++    colorFormat = static_cast<uint32_t>(backend.getColorFormat());
++    depthStencilFormat = static_cast<uint32_t>(backend.getDepthStencilFormat());
++    // Native matrices are built bottom-to-top during upload, whereas the draw
++    // pass numbers currentLayer top-to-bottom. Use the upload index for depth.
++    projectionMatrix = parameters.transformParams.alignedProjMatrix;
++    depthTest = parameters.currentLayer >= parameters.opaquePassCutoff;
++    if (depthTest) {
++        const auto depthIndex = parameters.layerGroupCount - 1 - parameters.currentLayer;
++        projectionMatrix[14] -= (1 + depthIndex) *
++                                mln::PaintParameters::numSublayers *
++                                mln::PaintParameters::depthEpsilon;
++    }
++}
++
++} // namespace mln::style::webgpu
++#endif
+diff --git a/platform/default/src/mln/layermanager/layer_manager.cpp b/platform/default/src/mln/layermanager/layer_manager.cpp
+--- a/platform/default/src/mln/layermanager/layer_manager.cpp
++++ b/platform/default/src/mln/layermanager/layer_manager.cpp
+@@ -79,7 +79,7 @@
+ #if !defined(MBGL_LAYER_HEATMAP_DISABLE_ALL)
+     addLayerType(std::make_unique<HeatmapLayerFactory>());
+ #endif
+-#ifdef MLN_RENDER_BACKEND_OPENGL
++#if defined(MLN_RENDER_BACKEND_OPENGL) || defined(MLN_RENDER_BACKEND_WEBGPU)
+ #if !defined(MBGL_LAYER_CUSTOM_DISABLE_ALL)
+     addLayerType(std::make_unique<CustomLayerFactory>());
+ #endif
+diff --git a/src/mln/renderer/paint_parameters.hpp b/src/mln/renderer/paint_parameters.hpp
+--- a/src/mln/renderer/paint_parameters.hpp
++++ b/src/mln/renderer/paint_parameters.hpp
+@@ -139,6 +139,7 @@
+ 
+ public:
+     uint32_t currentLayer;
++    uint32_t layerGroupCount = 0;
+     float depthRangeSize;
+     uint32_t opaquePassCutoff = 0;
+     float symbolFadeChange;
+diff --git a/src/mln/renderer/renderer_impl.cpp b/src/mln/renderer/renderer_impl.cpp
+--- a/src/mln/renderer/renderer_impl.cpp
++++ b/src/mln/renderer/renderer_impl.cpp
+@@ -264,6 +264,7 @@
+     }
+ 
+     orchestrator.processChanges();
++    parameters.layerGroupCount = static_cast<uint32_t>(orchestrator.numLayerGroups());
+ 
+     // Upload layer groups
+     {

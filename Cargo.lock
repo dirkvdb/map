@@ -4723,6 +4723,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "bytemuck",
  "directories",
  "env_logger",
  "futures-lite",
@@ -4736,6 +4737,7 @@ dependencies = [
  "raster-tile",
  "serde",
  "serde_json",
+ "sqlite",
  "tempfile",
  "tiler",
  "wgpu",
@@ -4744,8 +4746,6 @@ dependencies = [
 [[package]]
 name = "maplibre_native"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54d008fcc8e3769f122146610ec4efb2e82dcbda5a9c487529bcc5c63dbd1a31"
 dependencies = [
  "cmake",
  "cxx",
@@ -8752,8 +8752,6 @@ dependencies = [
 [[package]]
 name = "webgpu-shim"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e039f59b537f8cfbfc5508130ce499067e2fb4fd9ec247f59c904c6e2fcaaf4c"
 dependencies = [
  "bindgen",
  "cxx",

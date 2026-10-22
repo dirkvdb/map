@@ -5,20 +5,21 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, bail, ensure};
-use geo::Tile;
+use geo::{AnyDenseArray, Array, Tile};
 use inf::Legend;
-use inf::colormap::{ColorMap, ColorMapDirection, ColorMapPreset};
+use inf::colormap::{ColorMap, ColorMapDirection, ColorMapPreset, ProcessedColorMap};
 use maplibre_native::file_source::{ErrorReason, FileSource, FileSourceType, RequestHandle, ResourceRequest, Responder, Response, register_file_source};
+use raster_tile::RasterTileIO;
 use serde_json::{Value, json};
 use tiler::tileproviderfactory::TileProviderOptions;
-use tiler::{ColorMappedTileRequest, DynamicTileProvider, LayerMetadata, LayerSourceType, TileFormat, TileProvider, WarpingTileProvider};
+use tiler::{DynamicTileProvider, LayerMetadata, LayerSourceType, TileFormat, TileProvider, TileRequest, WarpingTileProvider};
 
 const TILE_SIZE: u32 = 256;
 const URL_PREFIX: &str = "raster://";
 static NEXT_STYLE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// An immutable tile style. Its URL identity changes with the color mapping so
-/// MapLibre never reuses tiles from a previous range or palette.
+/// An immutable display-style snapshot. Numeric tile caches use metadata.id,
+/// not this snapshot's ID, so styling never invalidates the data.
 pub struct RasterSource {
     id: u64,
     metadata: Arc<LayerMetadata>,
@@ -132,11 +133,66 @@ impl RasterSource {
         self.error_receiver.clone()
     }
 
+    pub fn is_numeric(&self) -> bool {
+        self.metadata.band_nr.is_some()
+    }
+
+    pub fn report_tile_error(&self, error: &anyhow::Error) {
+        let _ = self.errors.try_send(format!("Couldn’t render raster tiles: {error:#}"));
+    }
+
+    /// Raw data in a GPU-friendly format, independent of range and palette.
+    /// NaN represents nodata; numeric values are never normalized or clipped.
+    pub fn numeric_tile(&self, tile: Tile, dpi: u8) -> Result<Option<NumericTile>> {
+        let metadata = &self.metadata;
+        let request = TileRequest {
+            tile,
+            dpi_ratio: dpi,
+            tile_size: metadata.tile_size.unwrap_or(TILE_SIZE),
+            tile_format: TileFormat::RasterTile,
+        };
+        let warp = || {
+            let mut metadata = (**metadata).clone();
+            metadata.min_zoom = 0;
+            WarpingTileProvider::tile(&metadata, &request)
+        };
+        let raw = if metadata.source_format == LayerSourceType::CloudOptimizedGeoTiff {
+            if tile.z < metadata.min_zoom {
+                warp()?
+            } else {
+                DynamicTileProvider::get_tile_for_layer(metadata, &request).or_else(|_| warp())?
+            }
+        } else {
+            DynamicTileProvider::get_tile_for_layer(metadata, &request)?
+        };
+        if raw.data.is_empty() {
+            return Ok(None);
+        }
+        let data: AnyDenseArray = AnyDenseArray::from_raster_tile_bytes(&raw.data)?;
+        let data = data.cast_to::<f32>();
+        let width = data.columns().0 as u32;
+        let height = data.rows().0 as u32;
+        let values = data.iter_opt().map(|value| value.filter(|v| v.is_finite()).unwrap_or(f32::NAN)).collect();
+        Ok(Some(NumericTile { width, height, values }))
+    }
+
+    pub fn palette_rgba(&self) -> Vec<u8> {
+        // Sample the same processed palette as the legend, without involving
+        // the display range (which might have tiny or very large values).
+        let palette = ProcessedColorMap::<256>::create_for_preset(self.palette, ColorMapDirection::Regular);
+        (0..=255)
+            .flat_map(|ix| {
+                let color = palette.get_color_by_value(ix);
+                [color.r, color.g, color.b, color.a]
+            })
+            .collect()
+    }
+
     pub fn source_json(&self, dpi: u8) -> Value {
         let dpi = if self.metadata.supports_dpi_ratio { dpi.clamp(1, 4) } else { 1 };
         json!({
             "type": "raster",
-            "tiles": [format!("{URL_PREFIX}{}/{{z}}/{{x}}/{{y}}@{dpi}.png", self.id)],
+            "tiles": [format!("{URL_PREFIX}{}/{{z}}/{{x}}/{{y}}@{dpi}.png", self.metadata.id)],
             "tileSize": self.metadata.tile_size.unwrap_or(TILE_SIZE),
             "scheme": self.metadata.scheme,
             "minzoom": if self.metadata.band_nr.is_some() { 0 } else { self.metadata.min_zoom.clamp(0, 22) },
@@ -154,30 +210,16 @@ impl RasterSource {
 
     fn tile(&self, address: TileAddress) -> Result<Response> {
         let metadata = &self.metadata;
-        // MBTiles can contain already-rendered PNG/JPEG tiles as well as numeric
-        // raster tiles. The tiler passes image tiles through unchanged.
-        let request = ColorMappedTileRequest {
+        ensure!(!self.is_numeric(), "Numeric rasters are rendered by the custom layer");
+        // This protocol serves image-only MBTiles. Numeric data never goes
+        // through PNG encoding or MapLibre's image decoder.
+        let request = TileRequest {
             tile: address.tile,
             dpi_ratio: address.dpi,
             tile_size: metadata.tile_size.unwrap_or(TILE_SIZE),
-            legend: &self.legend,
+            tile_format: metadata.tile_format,
         };
-        let warp = || {
-            let mut metadata = (**metadata).clone();
-            metadata.min_zoom = 0;
-            WarpingTileProvider::color_mapped_tile(&metadata, &request)
-        };
-        let data = if metadata.source_format == LayerSourceType::CloudOptimizedGeoTiff {
-            // An overview pyramid need not reach zoom zero. Synthesize coarser
-            // tiles so fitting the full raster never makes it disappear.
-            if address.tile.z < metadata.min_zoom {
-                warp()?
-            } else {
-                DynamicTileProvider::get_tile_color_mapped_for_layer(metadata, &request).or_else(|_| warp())?
-            }
-        } else {
-            DynamicTileProvider::get_tile_color_mapped_for_layer(metadata, &request)?
-        };
+        let data = DynamicTileProvider::get_tile_for_layer(metadata, &request)?;
         ensure!(
             matches!(data.format, TileFormat::Png | TileFormat::Jpeg) || data.data.is_empty(),
             "The raster provider returned a non-image tile"
@@ -188,6 +230,13 @@ impl RasterSource {
             Response::data(data.data).with_expires(SystemTime::now() + Duration::from_secs(3600))
         })
     }
+}
+
+#[non_exhaustive]
+pub struct NumericTile {
+    pub width: u32,
+    pub height: u32,
+    pub values: Vec<f32>,
 }
 
 fn display_range(min: f32, max: f32) -> (f32, f32) {
@@ -234,7 +283,7 @@ impl TileAddress {
     }
 }
 
-type Sources = Arc<RwLock<HashMap<u64, Weak<RasterSource>>>>;
+type Sources = Arc<RwLock<HashMap<tiler::LayerId, Weak<RasterSource>>>>;
 struct TileJob {
     url: String,
     responder: Responder,
@@ -281,7 +330,7 @@ impl RasterTiles {
     pub fn register(&self, source: &Arc<RasterSource>) -> Result<()> {
         let mut sources = self.sources.write().map_err(|_| anyhow::anyhow!("Raster registry lock poisoned"))?;
         sources.retain(|_, source| source.strong_count() > 0);
-        sources.insert(source.id, Arc::downgrade(source));
+        sources.insert(source.metadata.id, Arc::downgrade(source));
         Ok(())
     }
 }
@@ -292,7 +341,7 @@ fn tile_response(sources: &Sources, url: &str) -> Response {
         let source = sources
             .read()
             .map_err(|_| anyhow::anyhow!("Raster registry lock poisoned"))?
-            .get(&address.source)
+            .get(&address.source.into())
             .and_then(Weak::upgrade);
         match source {
             Some(source) => source.tile(address).inspect_err(|error| {
@@ -367,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn geographic_rasters_are_warped_into_transparent_png_tiles() -> Result<()> {
+    fn geographic_rasters_are_warped_into_raw_numeric_tiles_with_nodata() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("geographic.tif");
         super::test_support::write_raster(&path, 4326, 2)?;
@@ -376,36 +425,33 @@ mod tests {
         let source = &sources[0];
         assert!(source.range().0 < source.range().1);
         assert!(source.range().0 >= 0.0, "Nodata must not affect the color range");
-        let response = source.tile(TileAddress::parse(&format!("raster://{}/3/3/3@2.png", source.id()))?)?;
-        let image = image::load_from_memory(response.data.as_ref().context("Missing PNG tile")?)?.to_rgba8();
-        assert_eq!(image.dimensions(), (512, 512));
-        assert!(image.pixels().any(|pixel| pixel[3] == 0), "Outside pixels and nodata must be transparent");
-        assert!(image.pixels().any(|pixel| pixel[3] == 255), "The warped tile must contain raster data");
-        let empty = source.tile(TileAddress::parse(&format!("raster://{}/4/0/0@1.png", source.id()))?)?;
-        assert!(empty.no_content, "Tiles outside the raster must be empty, not failed PNGs");
+        let tile = source.numeric_tile(Tile { z: 3, x: 3, y: 3 }, 2)?.context("Missing numeric tile")?;
+        assert_eq!((tile.width, tile.height), (512, 512));
+        assert!(tile.values.iter().any(|value| value.is_nan()), "Outside pixels and nodata must stay invalid");
+        assert!(tile.values.iter().any(|value| value.is_finite()), "The warped tile must contain raster data");
+        let empty = source.numeric_tile(Tile { z: 4, x: 0, y: 0 }, 1)?;
+        assert!(empty.is_none(), "Tiles outside the raster must be empty");
         Ok(())
     }
 
     #[test]
-    fn mercator_tiles_keep_declared_nodata_transparent() -> Result<()> {
+    fn mercator_tiles_keep_declared_nodata_invalid() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("nodata.tif");
         super::test_support::write_raster(&path, 3857, 1)?;
         let source = RasterSource::open(&path)?.remove(0);
-        let response = source.tile(TileAddress {
-            source: source.id(),
-            tile: Tile { z: 3, x: 3, y: 3 },
-            dpi: 1,
-        })?;
-        let image = image::load_from_memory(response.data.as_ref().context("Missing PNG tile")?)?.to_rgba8();
-        assert_eq!(image.get_pixel(0, 0)[3], 0, "Padding must be transparent");
-        assert_eq!(image.get_pixel(210, 250)[3], 0, "Declared nodata inside the raster must be transparent");
-        assert_eq!(image.get_pixel(250, 250)[3], 255, "Data must remain visible");
+        let tile = source.numeric_tile(Tile { z: 3, x: 3, y: 3 }, 1)?.context("Missing numeric tile")?;
+        assert!(tile.values[0].is_nan(), "Padding must stay invalid");
+        assert!(
+            tile.values[250 * tile.width as usize + 210].is_nan(),
+            "Declared nodata inside the raster must stay invalid"
+        );
+        assert!(tile.values[250 * tile.width as usize + 250].is_finite(), "Data must remain valid");
         Ok(())
     }
 
     #[test]
-    fn mercator_tiles_without_declared_nodata_keep_padding_transparent_and_zero_opaque() -> Result<()> {
+    fn mercator_tiles_without_declared_nodata_keep_padding_invalid_and_zero_valid() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("no-nodata.tif");
         let mut dataset = gdal::DriverManager::get_driver_by_name("GTiff")?.create_with_band_type::<f32, _>(&path, 64, 64, 1)?;
@@ -417,54 +463,55 @@ mod tests {
 
         let source = RasterSource::open(&path)?.remove(0);
         for (z, x, y) in [(3, 3, 3), (2, 1, 1)] {
-            let response = source.tile(TileAddress {
-                source: source.id(),
-                tile: Tile { z, x, y },
-                dpi: 1,
-            })?;
-            let image = image::load_from_memory(response.data.as_ref().context("Missing PNG tile")?)?.to_rgba8();
-            assert_eq!(image.get_pixel(0, 0)[3], 0, "Padding outside the raster must be transparent at zoom {z}");
-            assert_eq!(image.get_pixel(250, 250)[3], 255, "Valid zero pixels must remain opaque at zoom {z}");
-        }
-        let empty = source.tile(TileAddress {
-            source: source.id(),
-            tile: Tile { z: 3, x: 0, y: 0 },
-            dpi: 1,
-        })?;
-        if let Some(data) = empty.data {
-            let image = image::load_from_memory(&data)?.to_rgba8();
-            assert!(
-                image.pixels().all(|pixel| pixel[3] == 0),
-                "Tiles outside the raster must not contain colored padding"
+            let tile = source.numeric_tile(Tile { z, x, y }, 1)?.context("Missing numeric tile")?;
+            assert!(tile.values[0].is_nan(), "Padding outside the raster must stay invalid at zoom {z}");
+            assert_eq!(
+                tile.values[250 * tile.width as usize + 250],
+                0.0,
+                "Valid zero pixels must remain valid at zoom {z}"
             );
-        } else {
-            assert!(empty.no_content);
+        }
+        if let Some(tile) = source.numeric_tile(Tile { z: 3, x: 0, y: 0 }, 1)? {
+            assert!(
+                tile.values.iter().all(|value| value.is_nan()),
+                "Tiles outside the raster must not contain valid padding"
+            );
         }
         Ok(())
     }
 
     #[test]
-    fn palette_and_range_changes_invalidate_tile_identity_and_pixels() -> Result<()> {
+    fn palette_and_range_changes_preserve_numeric_tile_identity_and_values() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("mercator.tif");
         super::test_support::write_raster(&path, 3857, 1)?;
         let source = RasterSource::open(&path)?.remove(0);
         let gray = source.restyled(ColorMapPreset::Gray, (0.0, 1000.0))?;
         assert_ne!(source.id(), gray.id());
-        let address = || TileAddress {
-            source: source.id(),
-            tile: Tile { z: 3, x: 3, y: 3 },
-            dpi: 1,
+        assert_eq!(source.metadata().id, gray.metadata().id, "Style snapshots share one data identity");
+        let bits = |source: &RasterSource| -> Result<Vec<u32>> {
+            Ok(source
+                .numeric_tile(Tile { z: 3, x: 3, y: 3 }, 1)?
+                .context("Missing tile")?
+                .values
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
         };
-        assert_ne!(source.tile(address())?.data, gray.tile(address())?.data);
+        assert_eq!(bits(&source)?, bits(&gray)?, "Raw values must not depend on the legend");
+        assert_ne!(source.palette_rgba(), gray.palette_rgba());
         assert!(source.restyled(ColorMapPreset::Gray, (5.0, 5.0)).is_err());
         assert!(source.restyled(ColorMapPreset::Gray, (f32::NAN, 5.0)).is_err());
-        assert_eq!(gray.source_json(2)["tiles"][0], format!("raster://{}/{{z}}/{{x}}/{{y}}@2.png", gray.id()));
+        assert_eq!(
+            source.source_json(2),
+            gray.source_json(2),
+            "Image tile identities must also be style-independent"
+        );
         Ok(())
     }
 
     #[test]
-    fn protocol_returns_no_content_for_released_sources_and_errors_for_invalid_urls() -> Result<()> {
+    fn protocol_returns_no_content_for_released_sources_and_rejects_numeric_tiles() -> Result<()> {
         let sources: Sources = Arc::default();
         assert!(tile_response(&sources, "raster://999/0/0/0@1.png").no_content);
         assert!(tile_response(&sources, "raster://999/0/0/0@0.png").error.is_some());
@@ -472,9 +519,9 @@ mod tests {
         let path = dir.path().join("released.tif");
         super::test_support::write_raster(&path, 4326, 1)?;
         let source = RasterSource::open(&path)?.remove(0);
-        let url = format!("raster://{}/3/3/3@1.png", source.id());
-        sources.write().unwrap().insert(source.id(), Arc::downgrade(&source));
-        assert!(tile_response(&sources, &url).data.is_some());
+        let url = format!("raster://{}/3/3/3@1.png", source.metadata().id);
+        sources.write().unwrap().insert(source.metadata().id, Arc::downgrade(&source));
+        assert!(tile_response(&sources, &url).error.is_some(), "Numeric tiles must bypass the image protocol");
         drop(source);
         assert!(tile_response(&sources, &url).no_content);
         Ok(())
@@ -487,6 +534,62 @@ mod tests {
         let path = dir.path().join("not-a-raster.txt");
         std::fs::write(&path, "not raster data")?;
         assert!(RasterSource::open(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn byte_values_and_palette_entries_stay_valid_across_the_full_data_range() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("byte-values.tif");
+        super::test_support::write_byte_raster(&path)?;
+        let source = RasterSource::open(&path)?.remove(0);
+        let tile = source.numeric_tile(Tile { z: 0, x: 0, y: 0 }, 1)?.context("Missing byte tile")?;
+        assert_eq!((tile.width, tile.height), (256, 256));
+        let palette = source.palette_rgba();
+        assert!(palette.chunks_exact(4).all(|color| color[3] == 255));
+        for value in 0..255 {
+            assert_eq!(tile.values[128 * 256 + value], value as f32, "Valid byte {value} must not become nodata");
+        }
+        assert!(tile.values[128 * 256 + 255].is_nan(), "Only the nodata byte should be invalid");
+        Ok(())
+    }
+
+    #[test]
+    fn image_mbtiles_pass_through_unchanged_across_style_snapshots() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("image.mbtiles");
+        // Build MBTiles directly: the static GDAL build need not enable its
+        // optional MBTiles driver for our native SQLite tile provider to work.
+        let db = sqlite::Connection::new(&path, sqlite::AccessMode::Create)?;
+        db.execute_sql_statements(
+            "CREATE TABLE metadata (name TEXT, value TEXT);
+            INSERT INTO metadata VALUES ('format','png'), ('bounds','-180,-85,180,85'), ('minzoom','0'), ('maxzoom','0');
+            CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);",
+        )?;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(256, 256, image::Rgba([255, 0, 0, 255])).write_to(&mut png, image::ImageFormat::Png)?;
+        let mut insert = db.prepare_statement("INSERT INTO tiles VALUES (0,0,0,?1) RETURNING zoom_level")?;
+        insert.bind_blob(1, png.get_ref())?;
+        ensure!(insert.next().is_some(), "Could not create fixture tile: {}", db.last_error());
+        drop(insert);
+        drop(db);
+        let source = RasterSource::open(&path)?.remove(0);
+        assert!(!source.is_numeric());
+        let tiles = RasterTiles::init()?;
+        tiles.register(&source)?;
+        let url = format!("raster://{}/0/0/0@1.png", source.metadata().id);
+        let before = tile_response(&tiles.sources, &url);
+        let image = image::load_from_memory(before.data.as_ref().context("Missing image MBTile")?)?.to_rgba8();
+        assert_eq!(*image.get_pixel(128, 128), image::Rgba([255, 0, 0, 255]));
+        let gray = source.restyled(ColorMapPreset::Gray, (10.0, 100.0))?;
+        tiles.register(&gray)?;
+        assert_eq!(source.source_json(1), gray.source_json(1));
+        drop(source);
+        assert_eq!(
+            tile_response(&tiles.sources, &url).data,
+            before.data,
+            "Palette/range edits must not recolor MBTiles or release their URL identity"
+        );
         Ok(())
     }
 
@@ -519,14 +622,9 @@ mod tests {
             "Optimized COG tiles must not request unsupported DPI ratios"
         );
         for (z, x, y) in [(3, 3, 3), (2, 1, 1)] {
-            let tile = source.tile(TileAddress {
-                source: source.id(),
-                tile: Tile { z, x, y },
-                dpi: 1,
-            })?;
-            let image = image::load_from_memory(tile.data.as_ref().context("Missing COG tile")?)?.to_rgba8();
-            assert_eq!(image.dimensions(), (256, 256));
-            assert!(image.pixels().any(|pixel| pixel[3] == 255));
+            let tile = source.numeric_tile(Tile { z, x, y }, 1)?.context("Missing COG tile")?;
+            assert_eq!((tile.width, tile.height), (256, 256));
+            assert!(tile.values.iter().any(|value| value.is_finite()));
         }
         Ok(())
     }
@@ -535,6 +633,19 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+
+    pub fn write_byte_raster(path: &Path) -> Result<()> {
+        let mut dataset = gdal::DriverManager::get_driver_by_name("GTiff")?.create_with_band_type::<u8, _>(path, 256, 256, 1)?;
+        let extent = 20_037_508.342_789_244;
+        dataset.set_geo_transform(&[-extent, extent / 128.0, 0.0, extent, 0.0, -extent / 128.0])?;
+        dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(3857)?)?;
+        let mut band = dataset.rasterband(1)?;
+        band.set_no_data_value(Some(255.0))?;
+        let values = (0..256 * 256).map(|ix| (ix % 256) as u8).collect();
+        band.write((0, 0), (256, 256), &mut gdal::raster::Buffer::new((256, 256), values))?;
+        dataset.flush_cache()?;
+        Ok(())
+    }
 
     pub fn write_raster(path: &Path, epsg: u32, bands: usize) -> Result<()> {
         let mut dataset = gdal::DriverManager::get_driver_by_name("GTiff")?.create_with_band_type::<f32, _>(path, 64, 64, bands)?;

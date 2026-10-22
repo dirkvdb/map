@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 async-channel = "2"
+bytemuck = { version = "1", features = ["derive"] }
 directories = "6"
 env_logger = "0.11"
 futures-lite = "2"
@@ -23,9 +24,14 @@ tempfile = "3"
 tiler = { path = "infra-rs/crates/tiler" }
 wgpu = "29"
 
+[patch.crates-io]
+maplibre_native = { path = "vendor/maplibre_native" }
+webgpu-shim = { path = "vendor/webgpu-shim" }
+
 [dev-dependencies]
 gpui-kit = { version = "0.7", features = ["test-support"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+sqlite = { path = "infra-rs/crates/sqlite" }
 
 [profile.dev]
 debug = 0

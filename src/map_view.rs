@@ -200,7 +200,10 @@ impl MapView {
     }
 
     fn apply_frame(&mut self, frame: MapFrame, window: &mut Window, cx: &mut Context<Self>) {
-        if self.viewport != Some(frame.viewport) || self.raster.as_ref().map(|source| source.id()) != frame.raster_id {
+        // The worker completes frames in order. Show progress for this band
+        // even if another range/palette update arrived while it was rendering;
+        // requiring an exact style revision starves the display during dragging.
+        if self.viewport != Some(frame.viewport) || self.raster.as_ref().map(|source| source.metadata().id) != frame.raster_layer_id {
             return;
         }
         match frame.image {
@@ -898,6 +901,141 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn range_drag_displays_in_flight_frames_before_the_pointer_stops(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raster.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 2).unwrap();
+        let mut view = None;
+        let handle = cx.open_window(size(px(900.0), px(760.0)), |window, cx| {
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map.open_paths(vec![path], cx);
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let thumb = window.within("raster-range-slider").find(("slider-thumb", 1_u32)).bounds();
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: thumb.center(),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            let range = window.find("raster-range-slider").bounds();
+            // Cross the drag threshold before checking continuous updates.
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: range.origin + point(range.size.width * 0.1, range.size.height * 0.5),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        for fraction in [0.2, 0.3, 0.4] {
+            // Emulate a frame that started rendering before this pointer event
+            // and completes while the next range is already requested.
+            let source = cx.update(|cx| view.read(cx).raster.clone().unwrap());
+            cx.update_window(handle.into(), |_, window, cx| {
+                let range = window.find("raster-range-slider").bounds();
+                let position = range.origin + point(range.size.width * fraction, range.size.height * 0.5);
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position,
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert_ne!(cx.update(|cx| view.read(cx).raster.as_ref().unwrap().id()), source.id());
+            let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
+            cx.update_window(handle.into(), |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.apply_frame(
+                        MapFrame {
+                            viewport: view.viewport.unwrap(),
+                            raster_layer_id: Some(source.metadata().id),
+                            image: Ok(image.clone()),
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(
+                        view.image.as_ref().is_some_and(|shown| Arc::ptr_eq(shown, &image)),
+                        "A continuous range drag must display completed frames, not wait for an exact style match"
+                    );
+                });
+            })
+            .unwrap();
+        }
+
+        let obsolete_source = cx.update(|cx| view.read(cx).raster.clone().unwrap());
+        cx.update_window(handle.into(), |_, window, cx| {
+            let range = window.find("raster-range-slider").bounds();
+            window.dispatch_event(
+                MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: range.origin + point(range.size.width * 0.4, range.size.height * 0.5),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.click("raster-band", cx);
+            window.press("up", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert_ne!(view.raster.as_ref().unwrap().metadata().id, obsolete_source.metadata().id);
+                let shown = view.image.clone().unwrap();
+                let obsolete = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
+                view.apply_frame(
+                    MapFrame {
+                        viewport: view.viewport.unwrap(),
+                        raster_layer_id: Some(obsolete_source.metadata().id),
+                        image: Ok(obsolete),
+                    },
+                    window,
+                    cx,
+                );
+                assert!(
+                    Arc::ptr_eq(view.image.as_ref().unwrap(), &shown),
+                    "An in-flight frame from another band must still be rejected"
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn replacing_map_frames_evicts_obsolete_texture_cache_entries(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let mut view = None;
@@ -925,7 +1063,7 @@ mod tests {
                         view.apply_frame(
                             MapFrame {
                                 viewport,
-                                raster_id: None,
+                                raster_layer_id: None,
                                 image: Ok(image.clone()),
                             },
                             window,
