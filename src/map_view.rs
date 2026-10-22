@@ -1,22 +1,29 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::{ActiveTheme, button::Button};
 use gpui_kit::{
-    App, Bounds, Context, CursorStyle, DispatchPhase, FocusHandle, InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Styled, StyledImage, Task,
-    TestSupportExt, Window, canvas, div, img,
+    App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, Entity, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyBinding, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, TestSupportExt, Window, canvas, div, img,
 };
 
 use crate::map_camera::MapCamera;
 use crate::map_renderer::{MapFrame, MapRenderer, MapRequest, Viewport};
+use crate::pixel_info::PixelInfo;
+use crate::raster_panel::{ClearRasters, FitRaster, OpenRaster, RasterPanel, ToggleRasterControls};
+use crate::raster_source::RasterSource;
 
 gpui_kit::actions!(map, [ZoomIn, ZoomOut, PanLeft, PanRight, PanUp, PanDown]);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("secondary-o", OpenRaster, Some("RasterWorkspace")),
+        KeyBinding::new("secondary-0", FitRaster, Some("RasterWorkspace")),
+        KeyBinding::new("secondary-l", ToggleRasterControls, Some("RasterWorkspace")),
         KeyBinding::new("+", ZoomIn, Some("MapNavigation")),
         KeyBinding::new("=", ZoomIn, Some("MapNavigation")),
         KeyBinding::new("-", ZoomOut, Some("MapNavigation")),
@@ -103,7 +110,14 @@ pub struct MapView {
     viewport: Option<Viewport>,
     bounds: Option<Bounds<Pixels>>,
     camera: MapCamera,
-    requested: Option<MapRequest>,
+    requested: Option<(MapRequest, Option<u64>, f32)>,
+    raster_panel: Entity<RasterPanel>,
+    pixel_info: Entity<PixelInfo>,
+    pointer: Option<Point<Pixels>>,
+    raster: Option<Arc<RasterSource>>,
+    opacity: f32,
+    fit_pending: bool,
+    _raster_subscription: Subscription,
     renderer: Option<MapRenderer>,
     drag: Option<MapDrag>,
     coast: Option<MapCoast>,
@@ -119,25 +133,57 @@ impl MapView {
         let renderer = MapRenderer::new().expect("Failed to create the map renderer");
 
         let task = Self::watch_frames(&renderer, cx);
+        let raster_panel = cx.new(|cx| RasterPanel::new(window, cx));
+        let raster_subscription = cx.subscribe(&raster_panel, |view, _, event: &crate::raster_panel::RasterEvent, cx| {
+            view.raster = event.source();
+            view.opacity = event.opacity();
+            view.coast = None;
+            view.drag = None;
+            view.fit_pending = event.should_fit();
+            view.fit_raster();
+            view.request_render(cx);
+        });
         cx.on_release_in(window, |view, window, cx| {
             if let Some(image) = view.image.take() {
                 cx.drop_image(image, Some(window));
             }
         })
         .detach();
+        let focus = cx.focus_handle().tab_stop(true);
+        window.focus(&focus, cx);
         Self {
             viewport: None,
             bounds: None,
             camera: MapCamera::default(),
             requested: None,
+            raster_panel,
+            pixel_info: cx.new(|_| PixelInfo::new()),
+            pointer: None,
+            raster: None,
+            opacity: 1.0,
+            fit_pending: false,
+            _raster_subscription: raster_subscription,
             renderer: Some(renderer),
             drag: None,
             coast: None,
             coast_frame_pending: false,
-            focus: cx.focus_handle().tab_stop(true),
+            focus,
             image: None,
             error: None,
             _frames_task: Some(task),
+        }
+    }
+
+    pub fn open_paths(&self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.raster_panel.update(cx, |panel, cx| panel.open_paths(paths, cx));
+    }
+
+    fn fit_raster(&mut self) {
+        if self.fit_pending
+            && let (Some(source), Some(viewport)) = (&self.raster, self.viewport)
+        {
+            self.camera = MapCamera::fit_bounds(source.metadata().bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get()));
+            self.fit_pending = false;
         }
     }
 
@@ -153,7 +199,7 @@ impl MapView {
     }
 
     fn apply_frame(&mut self, frame: MapFrame, window: &mut Window, cx: &mut Context<Self>) {
-        if self.viewport != Some(frame.viewport) {
+        if self.viewport != Some(frame.viewport) || self.raster.as_ref().map(|source| source.id()) != frame.raster_id {
             return;
         }
         match frame.image {
@@ -173,19 +219,21 @@ impl MapView {
     }
 
     fn request_render(&mut self, cx: &mut Context<Self>) {
+        self.update_pixel_info(cx);
         let Some(viewport) = self.viewport else {
             return;
         };
         let request = MapRequest { viewport, camera: self.camera };
-        if self.requested == Some(request) {
+        let key = (request, self.raster.as_ref().map(|source| source.id()), self.opacity);
+        if self.requested == Some(key) {
             return;
         }
-        self.requested = Some(request);
+        self.requested = Some(key);
         let Some(renderer) = &self.renderer else {
             return;
         };
         self.error = None;
-        if let Err(error) = renderer.render(request) {
+        if let Err(error) = renderer.render_raster(request, self.raster.clone(), self.opacity) {
             self.error = Some(format!("Couldn’t load the map. {error}").into());
         }
         cx.notify();
@@ -260,6 +308,16 @@ impl MapView {
             self.pan(f64::from(f32::from(delta.x)), f64::from(f32::from(delta.y)), cx);
         }
     }
+
+    fn update_pixel_info(&self, cx: &mut Context<Self>) {
+        let (Some(position), Some(bounds)) = (self.pointer, self.bounds) else {
+            return;
+        };
+        let offset = position - bounds.center();
+        let coordinate = self.camera.coordinate_at((f64::from(f32::from(offset.x)), f64::from(f32::from(offset.y))));
+        let dpi = self.viewport.map_or(1, |viewport| viewport.scale.round().clamp(1.0, 4.0) as u8);
+        self.pixel_info.update(cx, |info, cx| info.show(coordinate, self.raster.clone(), dpi, cx));
+    }
 }
 
 impl Render for MapView {
@@ -292,11 +350,7 @@ impl Render for MapView {
             .border_1()
             .border_color(cx.theme().border)
             .focus_visible(move |style| style.border_color(focus_ring))
-            .cursor(if self.drag.is_some() {
-                CursorStyle::ClosedHand
-            } else {
-                CursorStyle::OpenHand
-            })
+            .cursor(if self.drag.is_some() { CursorStyle::ClosedHand } else { CursorStyle::Arrow })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, event: &MouseDownEvent, window, cx| {
@@ -315,6 +369,16 @@ impl Render for MapView {
                 };
                 view.zoom(delta, (f64::from(f32::from(offset.x)), f64::from(f32::from(offset.y))), cx);
                 cx.stop_propagation();
+            }))
+            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _, cx| {
+                view.pointer = Some(event.position);
+                view.update_pixel_info(cx);
+            }))
+            .on_hover(cx.listener(|view, hovered, _, cx| {
+                if !hovered {
+                    view.pointer = None;
+                    view.pixel_info.update(cx, |info, cx| info.clear(cx));
+                }
             }))
             .child(
                 canvas(
@@ -337,6 +401,7 @@ impl Render for MapView {
                                 let _ = view.update(cx, |view, cx| {
                                     view.bounds = Some(bounds);
                                     view.viewport = Some(viewport);
+                                    view.fit_raster();
                                     view.request_render(cx);
                                 });
                             });
@@ -388,26 +453,333 @@ impl Render for MapView {
                     .items_center()
                     .justify_center()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Loading vector map…"),
+                    .child("Loading map…"),
             );
         }
 
         div()
+            .id("raster-workspace")
+            .key_context("RasterWorkspace")
+            .on_action(cx.listener(|view, _: &OpenRaster, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx))))
+            .on_action(cx.listener(|view, _: &FitRaster, _, cx| view.raster_panel.update(cx, |panel, cx| panel.fit(cx))))
+            .on_action(cx.listener(|view, _: &ClearRasters, window, cx| view.raster_panel.update(cx, |panel, cx| panel.clear(window, cx))))
+            .on_action(cx.listener(|view, _: &ToggleRasterControls, window, cx| view.raster_panel.update(cx, |panel, cx| panel.toggle_controls(window, cx))))
+            .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| view.open_paths(paths.0.to_vec(), cx)))
             .flex()
             .flex_col()
+            .relative()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(surface)
+            .child(div().absolute().bottom_3().left_3().max_w_full().child(self.pixel_info.clone()))
+            .child(
+                div()
+                    .absolute()
+                    .top_3()
+                    .right_3()
+                    .bottom_3()
+                    .w_80()
+                    .max_w_full()
+                    .child(self.raster_panel.clone()),
+            )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{AppContext, TestAppContext, point, px, size};
+    use gpui_kit::{AppContext, InputEvent as _, TestAppContext, point, px, size};
 
     use super::*;
+
+    #[gpui_kit::test]
+    fn mouse_move_reads_the_active_band_and_hides_info_over_controls(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raster.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 2).unwrap();
+        let mut view = None;
+        let handle = cx.open_window(size(px(1200.0), px(760.0)), |window, cx| {
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.hover("map-surface", cx);
+            let info = window.find("pixel-info");
+            assert!(info.label().unwrap().contains("Lat:"));
+            assert_eq!(info.label().unwrap().split_whitespace().count(), 4);
+            assert!(
+                info.bounds().right() < window.find("map-surface").bounds().right(),
+                "The readout should be compact, not a full-width status bar"
+            );
+            window.click("open-raster", cx);
+        })
+        .unwrap();
+        cx.simulate_path_prompt_response(|_| Some(vec![path]));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.hover("map-surface", cx)).unwrap();
+        cx.run_until_parked();
+        let first_value = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let info = window.find("pixel-info");
+                let text = info.label().unwrap();
+                assert!(text.contains("Lat: 0.000000") && text.contains("Lon: 0.000000"), "{text}");
+                let value: f64 = text.split_whitespace().nth(4).unwrap().parse().unwrap();
+                assert!((value - 84.0).abs() <= 1.0, "Expected the second band's center value, got {value}");
+                window.hover("raster-layers-card", cx);
+                assert!(window.find("pixel-info").label().is_none(), "Controls must not sample the map underneath");
+                window.click("raster-band", cx);
+                window.press("up", cx);
+                window.press("enter", cx);
+                value
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.hover("map-surface", cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let info = window.find("pixel-info");
+            let value: f64 = info.label().unwrap().split_whitespace().nth(4).unwrap().parse().unwrap();
+            assert_eq!(value, first_value - 10.0, "Band changes must invalidate the cached numeric tile");
+            // Cached moves must render a value before any background work runs.
+            let center = window.find("map-surface").bounds().center();
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: center + point(px(5.0), px(0.0)),
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("pixel-info")
+                    .label()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(4)
+                    .unwrap()
+                    .parse::<f64>()
+                    .is_ok()
+            );
+            window.hover("raster-layers-card", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("pixel-info").label().is_none(), "Late reads must not restore a hidden readout");
+            window.click("clear-rasters", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.hover("map-surface", cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("pixel-info").label().unwrap().split_whitespace().count(), 4);
+            assert!(view.read(cx).raster.is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn floating_controls_preserve_the_full_map_and_own_their_input(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raster.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
+        let mut view = None;
+        let handle = cx.open_window(size(px(1200.0), px(760.0)), |window, cx| {
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("open-raster", cx);
+        })
+        .unwrap();
+        cx.simulate_path_prompt_response(|_| Some(vec![path]));
+        cx.run_until_parked();
+        assert!(
+            cx.update(|cx| view.read(cx).raster.is_some()),
+            "Opening through the floating control must select the raster"
+        );
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let map = window.find("map-surface").bounds();
+            let layers = window.find("raster-layers-card").bounds();
+            let range = window.find("raster-range-card").bounds();
+            assert_eq!(map.origin, point(px(0.0), px(0.0)), "Controls must not reserve a toolbar above the map");
+            assert_eq!(map.size, size(px(1200.0), px(760.0)));
+            assert!(layers.left() > map.center().x && layers.right() < map.right());
+            assert_eq!(layers.left(), range.left());
+            assert_eq!(layers.right(), range.right());
+            assert!(range.top() > layers.bottom() && range.bottom() < map.bottom());
+
+            let before = view.read(cx).camera;
+            window.scroll("raster-layers-card", ScrollDelta::Lines(point(0.0, 2.0)), cx);
+            let from = point(layers.left() + px(20.0), layers.top() + px(20.0));
+            window.drag(from, from + point(px(40.0), px(20.0)), cx);
+            assert_eq!(view.read(cx).camera, before, "Panel gestures must not pan or zoom the map");
+            assert!(view.read(cx).drag.is_none());
+
+            assert!(window.try_find("raster-opacity-input").is_none());
+            let opacity = window.find("raster-opacity").bounds();
+            window.click_at("raster-opacity", point(opacity.size.width * 0.5, opacity.size.height * 0.5), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            (cx.update(|cx| view.read(cx).opacity) - 0.5).abs() < 0.001,
+            "The opacity slider must update the raster"
+        );
+
+        let original_range = cx.update(|cx| view.read(cx).raster.as_ref().unwrap().range());
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let range = window.find("raster-range-slider").bounds();
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: range.origin + point(range.size.width * 0.25, range.size.height * 0.5),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let pressed_range = cx.update(|cx| view.read(cx).raster.as_ref().unwrap().range());
+        assert!(pressed_range.0 > original_range.0, "Range changes must apply before releasing the pointer");
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let range = window.find("raster-range-slider").bounds();
+            window.dispatch_event(
+                MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: range.origin + point(range.size.width * 0.25, range.size.height * 0.5),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            let thumb = window.within("raster-range-slider").find(("slider-thumb", 1_u32)).bounds();
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: thumb.center(),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            for fraction in [0.3, 0.4] {
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: range.origin + point(range.size.width * fraction, range.size.height * 0.5),
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.render_frame(cx);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            cx.update(|cx| view.read(cx).raster.as_ref().unwrap().range().0) > pressed_range.0,
+            "Dragging must continuously apply range changes"
+        );
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let range = window.find("raster-range-slider").bounds();
+            window.dispatch_event(
+                MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: range.origin + point(range.size.width * 0.4, range.size.height * 0.5),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.click("reset-raster-range", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| view.read(cx).raster.as_ref().unwrap().range()), original_range);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("toggle-raster-controls", cx);
+            assert!(window.try_find("raster-range-card").is_none());
+            assert!(window.try_find("raster-band").is_none());
+            assert_eq!(window.find("map-surface").bounds().size, size(px(1200.0), px(760.0)));
+            window.press("secondary-l", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("raster-range-card").visible());
+        })
+        .unwrap();
+
+        cx.simulate_window_resize(handle.into(), size(px(640.0), px(400.0)));
+        cx.update(|cx| gpui_kit::component::Theme::update(cx, |theme| theme.font_size = px(18.0)));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let map = window.find("map-surface").bounds();
+            let layers = window.find("raster-layers-card").bounds();
+            assert_eq!(map.size, size(px(640.0), px(400.0)));
+            assert!(layers.right() < map.right() && layers.left() > map.left());
+            window.scroll("raster-layers-card", ScrollDelta::Lines(point(0.0, -30.0)), cx);
+            assert!(
+                window.find("raster-max").visible(),
+                "The floating controls must scroll in short windows at larger UI scales"
+            );
+        })
+        .unwrap();
+    }
 
     #[gpui_kit::test]
     fn replacing_map_frames_evicts_obsolete_texture_cache_entries(cx: &mut TestAppContext) {
@@ -437,6 +809,7 @@ mod tests {
                         view.apply_frame(
                             MapFrame {
                                 viewport,
+                                raster_id: None,
                                 image: Ok(image.clone()),
                             },
                             window,

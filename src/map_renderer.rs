@@ -8,12 +8,13 @@ use anyhow::{Context as _, Result, ensure};
 use gpui_kit::RenderImage;
 #[cfg(test)]
 use image::RgbaImage;
-use maplibre_native::{Continuous, ImageRenderer, ImageRendererBuilder, RunLoopHandle, Size};
+use maplibre_native::{AnyLayer, AnySource, Continuous, ImageRenderer, ImageRendererBuilder, RunLoopHandle, Size};
 
 use crate::map_camera::MapCamera;
 use crate::map_readback::GpuReadback;
+use crate::raster_source::{RasterSource, RasterTiles};
 
-pub const STYLE_URL: &str = "https://demotiles.maplibre.org/style.json";
+pub const STYLE_URL: &str = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct Viewport {
@@ -30,17 +31,26 @@ pub struct MapRequest {
 
 pub struct MapFrame {
     pub viewport: Viewport,
+    pub raster_id: Option<u64>,
     pub image: Result<Arc<RenderImage>>,
 }
 
+#[derive(Clone)]
+struct RenderRequest {
+    map: MapRequest,
+    raster: Option<Arc<RasterSource>>,
+    opacity: f32,
+}
+
 pub struct MapRenderer {
-    sender: mpsc::Sender<MapRequest>,
+    sender: mpsc::Sender<RenderRequest>,
     frames: async_channel::Receiver<MapFrame>,
 }
 
 impl MapRenderer {
     pub fn new() -> Result<Self> {
-        let (sender, receiver) = mpsc::channel::<MapRequest>();
+        RasterTiles::init()?;
+        let (sender, receiver) = mpsc::channel::<RenderRequest>();
         let (frame_sender, frames) = async_channel::bounded(1);
         let pending_frame = frames.clone();
         // The !Send renderer and its run loop remain on this dedicated thread.
@@ -53,9 +63,16 @@ impl MapRenderer {
         Ok(Self { sender, frames })
     }
 
-    pub fn render(&self, request: MapRequest) -> Result<()> {
-        self.sender.send(request).context("Map rendering thread stopped")?;
+    pub fn render_raster(&self, map: MapRequest, raster: Option<Arc<RasterSource>>, opacity: f32) -> Result<()> {
+        self.sender
+            .send(RenderRequest { map, raster, opacity })
+            .context("Map rendering thread stopped")?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn render(&self, request: MapRequest) -> Result<()> {
+        self.render_raster(request, None, 1.0)
     }
 
     pub fn frames(&self) -> async_channel::Receiver<MapFrame> {
@@ -63,7 +80,7 @@ impl MapRenderer {
     }
 }
 
-fn run_renderer(requests: mpsc::Receiver<MapRequest>, frames: async_channel::Sender<MapFrame>, pending_frame: async_channel::Receiver<MapFrame>) {
+fn run_renderer(requests: mpsc::Receiver<RenderRequest>, frames: async_channel::Sender<MapFrame>, pending_frame: async_channel::Receiver<MapFrame>) {
     let mut map = None;
     let mut current_request = None;
     let mut next_frame = Instant::now();
@@ -73,13 +90,14 @@ fn run_renderer(requests: mpsc::Receiver<MapRequest>, frames: async_channel::Sen
         let Ok(request) = receive_latest_request(&requests, timeout) else {
             break;
         };
+        let request_changed = request.is_some();
         if let Some(request) = request {
             current_request = Some(request);
         }
-        let Some(current_request) = current_request else { continue };
+        let Some(current_request) = &current_request else { continue };
 
         let frame_started = Instant::now();
-        let image = match poll_map_image(&mut map, current_request, request.is_some(), next_frame) {
+        let image = match poll_map_image(&mut map, current_request, request_changed, next_frame) {
             Ok(Some(image)) => Ok(image),
             Ok(None) => {
                 // Poll native resource/fade callbacks without busy-waiting.
@@ -94,7 +112,8 @@ fn run_renderer(requests: mpsc::Receiver<MapRequest>, frames: async_channel::Sen
             }
         };
         let frame = MapFrame {
-            viewport: current_request.viewport,
+            viewport: current_request.map.viewport,
+            raster_id: current_request.raster.as_ref().map(|source| source.id()),
             image,
         };
         if let Err(async_channel::TrySendError::Full(frame)) = frames.try_send(frame) {
@@ -106,7 +125,7 @@ fn run_renderer(requests: mpsc::Receiver<MapRequest>, frames: async_channel::Sen
     }
 }
 
-fn receive_latest_request(requests: &mpsc::Receiver<MapRequest>, timeout: Option<Duration>) -> Result<Option<MapRequest>, mpsc::RecvTimeoutError> {
+fn receive_latest_request(requests: &mpsc::Receiver<RenderRequest>, timeout: Option<Duration>) -> Result<Option<RenderRequest>, mpsc::RecvTimeoutError> {
     let incoming = match timeout {
         Some(timeout) => requests.recv_timeout(timeout),
         None => requests.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
@@ -122,13 +141,15 @@ fn receive_latest_request(requests: &mpsc::Receiver<MapRequest>, timeout: Option
     Ok(request)
 }
 
-fn poll_map_image(map: &mut Option<NativeMap>, request: MapRequest, request_changed: bool, next_frame: Instant) -> Result<Option<Arc<RenderImage>>> {
-    if map.as_ref().is_none_or(|map| map.viewport.scale != request.viewport.scale) {
-        *map = Some(NativeMap::new(request.viewport)?);
+fn poll_map_image(map: &mut Option<NativeMap>, request: &RenderRequest, mut request_changed: bool, next_frame: Instant) -> Result<Option<Arc<RenderImage>>> {
+    if map.as_ref().is_none_or(|map| map.viewport.scale != request.map.viewport.scale) {
+        *map = Some(NativeMap::new(request.map.viewport)?);
+        request_changed = true;
     }
     let map = map.as_mut().context("Map renderer unavailable")?;
     if request_changed {
-        map.apply_request(request);
+        map.set_raster(request.raster.clone(), request.opacity)?;
+        map.apply_request(request.map);
     }
     if Instant::now() < next_frame {
         return Ok(None);
@@ -147,10 +168,17 @@ struct NativeMap {
     needs_frame: Rc<Cell<bool>>,
     readback: GpuReadback,
     deadline: Instant,
+    raster: Option<Arc<RasterSource>>,
+    opacity: f32,
 }
 
 impl NativeMap {
     fn new(viewport: Viewport) -> Result<Self> {
+        Self::with_style(viewport, None)
+    }
+
+    fn with_style(viewport: Viewport, json: Option<&str>) -> Result<Self> {
+        RasterTiles::init()?;
         // The wgpu FFI backend requires a host-supplied device and queue. This
         // initialization can later accept GPUI's device instead of creating one.
         let (device, queue) = futures_lite::future::block_on(async {
@@ -181,7 +209,10 @@ impl NativeMap {
             move || needs_frame.set(true)
         });
         let run_loop = RunLoopHandle::current();
-        let style = renderer.load_style_from_url(&STYLE_URL.parse()?);
+        let style = match json {
+            Some(json) => renderer.load_style_from_json_str(json),
+            None => renderer.load_style_from_url(&STYLE_URL.parse()?),
+        };
         wait_until_ready(&run_loop, Instant::now() + Duration::from_secs(30), || style.is_ready())?;
         style.finish().context("Could not load the vector map style")?;
         Ok(Self {
@@ -193,7 +224,33 @@ impl NativeMap {
             idle,
             needs_frame,
             deadline: Instant::now() + Duration::from_secs(30),
+            raster: None,
+            opacity: 1.0,
         })
+    }
+
+    fn set_raster(&mut self, raster: Option<Arc<RasterSource>>, opacity: f32) -> Result<()> {
+        let changed = self.raster.as_ref().map(|source| source.id()) != raster.as_ref().map(|source| source.id());
+        if !changed && self.opacity == opacity {
+            return Ok(());
+        }
+        self.renderer.style().remove_layer("local-raster-layer");
+        if changed {
+            self.renderer.style().remove_source("local-raster");
+            if let Some(source) = &raster {
+                RasterTiles::init()?.register(source)?;
+                let dpi = (self.viewport.scale.ceil() as u8).clamp(1, 4);
+                self.renderer
+                    .style()
+                    .add_source(AnySource::from_json_value("local-raster", &source.source_json(dpi))?)?;
+            }
+        }
+        if let Some(source) = &raster {
+            self.renderer.style().add_layer(AnyLayer::from_json_value(&source.layer_json(opacity))?)?;
+        }
+        self.raster = raster;
+        self.opacity = opacity;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -254,6 +311,48 @@ fn wait_until_ready(run_loop: &RunLoopHandle, deadline: Instant, is_ready: impl 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
+    fn local_raster_tiles_render_restyle_and_clear_without_network() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("raster.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 1)?;
+        let source = RasterSource::open(&path)?.remove(0);
+        let viewport = Viewport {
+            width: NonZeroU32::new(512).unwrap(),
+            height: NonZeroU32::new(512).unwrap(),
+            scale: 2.0,
+        };
+        let camera = MapCamera::fit_bounds(source.metadata().bounds, 512.0, 512.0);
+        let request = MapRequest { viewport, camera };
+        let mut map = NativeMap::with_style(
+            viewport,
+            Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##),
+        )?;
+        let background = map.render(request)?;
+        map.set_raster(Some(source.clone()), 1.0)?;
+        let rendered = map.render(request)?;
+        assert_eq!(rendered.dimensions(), (1024, 1024));
+        let changed_pixels = rendered.pixels().zip(background.pixels()).filter(|(a, b)| a != b).count();
+        assert!(
+            changed_pixels > 100_000,
+            "Raster tiles must visibly cover their geographic footprint, got {changed_pixels} pixels"
+        );
+        let gray = source.restyled(inf::colormap::ColorMapPreset::Gray, source.range())?;
+        map.set_raster(Some(gray.clone()), 1.0)?;
+        let restyled = map.render(request)?;
+        assert_ne!(rendered.as_raw(), restyled.as_raw(), "A palette change must replace cached raster tiles");
+        map.set_raster(Some(gray), 0.0)?;
+        assert_eq!(map.render(request)?.as_raw(), background.as_raw(), "Zero opacity must reveal the basemap");
+        map.set_raster(None, 1.0)?;
+        assert_eq!(
+            map.render(request)?.as_raw(),
+            background.as_raw(),
+            "Clearing the raster must remove its source and layer"
+        );
+        Ok(())
+    }
 
     #[test]
     #[ignore = "manual GPU performance measurement; requires internet access"]

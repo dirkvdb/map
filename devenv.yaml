@@ -1,6 +1,8 @@
 inputs:
   nixpkgs:
-    url: github:NixOS/nixpkgs/nixos-26.05
+    follows: pkgs-mod/nixpkgs
+  pkgs-mod:
+    url: github:VITO-RMA/nix-pkgs/main
   rust-overlay:
     url: github:oxalica/rust-overlay/stable
   s-stack:

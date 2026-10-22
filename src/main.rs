@@ -2,11 +2,20 @@ mod map_camera;
 mod map_readback;
 mod map_renderer;
 mod map_view;
+mod pixel_info;
+mod raster_panel;
+mod raster_source;
 
-use gpui_kit::{App, AppContext, Bounds, QuitMode, WindowBounds, WindowOptions, px, size};
+use gpui_kit::component::Theme;
+use gpui_kit::{App, AppContext, Bounds, QuitMode, Window, WindowBounds, WindowOptions, px, size};
 
 fn main() {
     env_logger::init();
+
+    if let Err(error) = raster_source::RasterTiles::init() {
+        log::error!("Failed to initialize raster tiling: {error:#}");
+        return;
+    }
 
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
         gpui_kit::init(cx);
@@ -27,13 +36,48 @@ fn create_main_window(cx: &mut App) -> anyhow::Result<()> {
     let window_bounds = Bounds::centered(None, size(px(1200.), px(760.)), cx);
     let window_options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(window_bounds)),
+        // Platform window constraints are physical geometry, not UI spacing.
+        window_min_size: Some(size(px(640.), px(400.))),
         ..Default::default()
     };
 
     gpui_kit::open_window(window_options, cx, |window, cx| {
+        follow_system_appearance(window, cx);
         window.set_window_title("Map");
-        cx.new(|cx| map_view::MapView::new(window, cx))
+        cx.new(|cx| {
+            let view = map_view::MapView::new(window, cx);
+            view.open_paths(std::env::args_os().skip(1).map(std::path::PathBuf::from).collect(), cx);
+            view
+        })
     })?;
 
     Ok(())
+}
+
+fn follow_system_appearance(window: &mut Window, cx: &mut App) {
+    Theme::sync_system_appearance(Some(window), cx);
+    window
+        .observe_window_appearance(|window, cx| Theme::sync_system_appearance(Some(window), cx))
+        .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::TestAppContext;
+    use gpui_kit::component::{ActiveTheme, ThemeMode};
+
+    use super::*;
+
+    #[gpui_kit::test]
+    fn controls_start_with_the_system_appearance(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            Theme::change(ThemeMode::Dark, None, cx);
+        });
+        cx.add_window(|window, cx| {
+            follow_system_appearance(window, cx);
+            assert_eq!(cx.theme().mode, ThemeMode::from(window.appearance()));
+            gpui_kit::Empty
+        });
+    }
 }

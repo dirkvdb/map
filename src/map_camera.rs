@@ -25,6 +25,32 @@ impl Default for MapCamera {
 }
 
 impl MapCamera {
+    /// Convert a logical-pixel offset from the viewport center to WGS84.
+    pub fn coordinate_at(self, offset: (f64, f64)) -> geo::Coordinate {
+        let x = (self.x + offset.0 / self.world_size()).rem_euclid(1.0);
+        let y = (self.y + offset.1 / self.world_size()).clamp(0.0, 1.0);
+        geo::Coordinate::latlon((PI * (1.0 - 2.0 * y)).sinh().atan().to_degrees(), x * 360.0 - 180.0)
+    }
+
+    pub fn fit_bounds(bounds: [f64; 4], width: f64, height: f64) -> Self {
+        let [west, south, east, north] = bounds;
+        let project_y = |latitude: f64| (1.0 - latitude.clamp(-85.05112878, 85.05112878).to_radians().tan().asinh() / PI) / 2.0;
+        let left = (west + 180.0) / 360.0;
+        let mut right = (east + 180.0) / 360.0;
+        if right < left {
+            right += 1.0;
+        }
+        let top = project_y(north);
+        let bottom = project_y(south);
+        let zoom_x = (width.max(1.0) * 0.85 / (512.0 * (right - left).max(1e-12))).log2();
+        let zoom_y = (height.max(1.0) * 0.85 / (512.0 * (bottom - top).max(1e-12))).log2();
+        Self {
+            x: ((left + right) / 2.0).rem_euclid(1.0),
+            y: (top + bottom) / 2.0,
+            zoom: zoom_x.min(zoom_y).clamp(MIN_ZOOM, MAX_ZOOM),
+        }
+    }
+
     pub fn update(self) -> CameraUpdate {
         CameraUpdate::new()
             .center(LatLng {
@@ -73,6 +99,23 @@ mod tests {
     }
 
     #[test]
+    fn cursor_coordinates_follow_navigation_and_wrap_longitude() {
+        let mut camera = MapCamera { x: 0.5, y: 0.5, zoom: 0.0 };
+        assert_eq!(camera.coordinate_at((0.0, 0.0)), geo::Coordinate::latlon(0.0, 0.0));
+        assert_eq!(camera.coordinate_at((128.0, 0.0)).longitude, 90.0);
+        assert_eq!(camera.coordinate_at((384.0, 0.0)).longitude, -90.0);
+        assert!(camera.coordinate_at((0.0, -128.0)).latitude > 60.0);
+        let offset = (100.0, -70.0);
+        let before = camera.coordinate_at(offset);
+        camera.zoom_at(2.0, offset);
+        let after = camera.coordinate_at(offset);
+        assert!((before.latitude - after.latitude).abs() < 1e-12 && (before.longitude - after.longitude).abs() < 1e-12);
+        camera.pan(40.0, 20.0);
+        let moved = camera.coordinate_at((offset.0 + 40.0, offset.1 + 20.0));
+        assert!((before.latitude - moved.latitude).abs() < 1e-12 && (before.longitude - moved.longitude).abs() < 1e-12);
+    }
+
+    #[test]
     fn dragging_moves_a_geographic_point_with_the_pointer() {
         let mut camera = MapCamera::default();
         let before = coordinate_under_pointer(camera, (0.0, 0.0));
@@ -89,5 +132,24 @@ mod tests {
         assert!((0.0..1.0).contains(&camera.x) && camera.y == 0.0 && camera.zoom == MAX_ZOOM);
         camera.zoom_at(-100.0, (0.0, 0.0));
         assert_eq!(camera.zoom, MIN_ZOOM);
+    }
+
+    #[test]
+    fn fitting_bounds_keeps_the_extent_inside_the_viewport() {
+        let camera = MapCamera::fit_bounds([2.5, 50.5, 6.0, 51.5], 800.0, 600.0);
+        for (longitude, latitude) in [(2.5_f64, 50.5_f64), (6.0, 51.5)] {
+            let x = (longitude + 180.0) / 360.0;
+            let y = (1.0 - latitude.to_radians().tan().asinh() / PI) / 2.0;
+            assert!((x - camera.x).abs() * camera.world_size() < 400.0);
+            assert!((y - camera.y).abs() * camera.world_size() < 300.0);
+        }
+    }
+
+    #[test]
+    fn fitting_bounds_handles_polar_and_antimeridian_extents() {
+        let polar = MapCamera::fit_bounds([-180.0, -90.0, 180.0, 90.0], 800.0, 600.0);
+        assert!(polar.zoom.is_finite() && polar.y.is_finite());
+        let dateline = MapCamera::fit_bounds([170.0, -10.0, -170.0, 10.0], 800.0, 600.0);
+        assert!(dateline.x < 1e-10 && dateline.zoom > 3.0);
     }
 }

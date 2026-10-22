@@ -5,7 +5,25 @@
   config,
   ...
 }:
+let
+  # The geo overlay's CMake-built libcurl has no CA bundle in the Nix sandbox.
+  # Give the final executable a TLS-verifying static curl without rebuilding
+  # the entire GDAL dependency tree just to change curl's default trust store.
+  mapCurl = pkgs.pkg-mod-curl.overrideAttrs (old: {
+    cmakeFlags = old.cmakeFlags ++ [
+      "-DCURL_CA_BUNDLE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+    ];
+  });
+in
 {
+  cachix.pull = [ "geo-overlay" ];
+
+  overlays = [
+    (inputs.pkgs-mod.lib.mkOverlay {
+      static = true;
+    })
+  ];
+
   languages.rust = {
     enable = true;
     channel = "stable";
@@ -22,9 +40,14 @@
   packages =
     with pkgs;
     [
+      # Search this curl before the unconfigured copy propagated by GDAL.
+      mapCurl
       cargo-nextest
       sccache
       pkg-config
+      pkg-mod-gdal
+      pkg-mod-proj
+      pkg-mod-openssl
       fontconfig
       fontconfig.dev
       vulkan-headers
