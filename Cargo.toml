@@ -19,7 +19,7 @@ env_logger = "0.11"
 futures-lite = "2"
 gdal = "0.19"
 geo = { path = "infra-rs/crates/geo", default-features = false, features = ["gdal-static", "deflate"] }
-gpui-kit = { version = "0.7", features = ["gpui-fast"] }
+gpui-kit = { version = "0.8", features = ["gpui-fast"] }
 image = { version = "0.25", default-features = false }
 inf = { path = "infra-rs/crates/inf" }
 log = "0.4"
@@ -29,14 +29,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 tiler = { path = "infra-rs/crates/tiler" }
-wgpu = "29"
+wgpu = "30"
 
 [patch.crates-io]
 maplibre_native = { path = "vendor/maplibre_native" }
 webgpu-shim = { path = "vendor/webgpu-shim" }
 
 [dev-dependencies]
-gpui-kit = { version = "0.7", features = ["test-support"] }
+gpui-kit = { version = "0.8", features = ["test-support"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 sqlite = { path = "infra-rs/crates/sqlite" }
 

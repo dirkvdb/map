@@ -51,6 +51,9 @@ in
     ];
   };
 
+  # Replace devenv's default SDK instead of adding a second one to the profile.
+  apple.sdk = if pkgs.stdenv.isDarwin then pkgs.apple-sdk_15 else null;
+
   packages =
     with pkgs;
     [
@@ -83,7 +86,6 @@ in
       libglvnd.dev
     ]
     ++ lib.optionals pkgs.stdenv.isDarwin [
-      apple-sdk_15
       cargo-bundle
     ];
 
@@ -101,6 +103,8 @@ in
     CXX = "${pkgs.llvmPackages.clang}/bin/clang++";
   }
   // lib.optionalAttrs pkgs.stdenv.isDarwin {
+    # cc-rs uses macosx where Nix expects darwin for the same native target.
+    NIX_CC_WRAPPER_SUPPRESS_TARGET_WARNING = "1";
     MAP_PACKAGE_PKG_CONFIG_PATH = lib.makeSearchPathOutput "dev" "lib/pkgconfig" packageLibraries;
     MAP_PACKAGE_GDAL_HOME = "${pkgs.pkg-mod-gdal}";
     # getLib otherwise preserves an explicitly selected -dev output. Reselect
