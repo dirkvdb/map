@@ -1,21 +1,29 @@
 use gpui_kit::component::{
     ActiveTheme, ThemeMode, ThemeRegistry, WindowExt,
     button::Button,
+    dialog::{DialogEntrance, DialogFooter},
     label::Label,
     menu::{DropdownMenu, PopupMenuItem},
     notification::Notification,
 };
-use gpui_kit::{App, FontWeight, IntoElement, ParentElement, Styled, Window, div, rems};
+use gpui_kit::{App, FontWeight, IntoElement, ParentElement, Styled, Window, div, px, rems};
 
 use crate::appearance::{self, Appearance, AppearanceMode};
 
 gpui_kit::actions!(settings, [OpenSettings]);
 
 pub(crate) fn open(window: &mut Window, cx: &mut App) {
-    window.open_sheet(cx, |sheet, window, cx| {
-        sheet
+    window.open_dialog(cx, |dialog, window, cx| {
+        let margin = cx.theme().spacing_tokens().lg;
+        let height = rems(28.)
+            .to_pixels(window.rem_size())
+            .min((window.viewport_size().height - margin * 2.).max(px(0.)));
+        dialog
             .title("Settings")
-            .max_w_full()
+            .w(rems(32.).to_pixels(window.rem_size()))
+            .h(height)
+            .margin_top((window.viewport_size().height - height) / 2.)
+            .entrance(DialogEntrance::None)
             .child(
                 div()
                     .flex()
@@ -38,9 +46,7 @@ pub(crate) fn open(window: &mut Window, cx: &mut App) {
                             .child("Changes apply immediately. The basemap stays dark."),
                     ),
             )
-            .footer(Button::new("settings-done").label("Done").on_click(|_, window, cx| window.close_sheet(cx)))
-            // Sheet geometry is bounded by the current window, including UI zoom.
-            .size(rems(32.).to_pixels(window.rem_size()).min(window.viewport_size().width))
+            .footer(DialogFooter::new().child(Button::new("settings-done").label("Done").on_click(|_, window, cx| window.close_dialog(cx))))
     });
 }
 

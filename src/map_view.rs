@@ -811,6 +811,10 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
+            let bounds = window.find(0_usize).bounds();
+            let viewport = window.viewport_size();
+            assert!((bounds.center().x - viewport.width / 2.).abs() <= px(1.));
+            assert!((bounds.center().y - viewport.height / 2.).abs() <= px(1.));
             assert!(window.find("appearance-mode").visible());
             window.click("appearance-mode", cx);
             window.press("up", cx);
@@ -874,7 +878,7 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert!(window.find("appearance-mode").visible(), "Escape must dismiss the menu before the sheet");
+            assert!(window.find("appearance-mode").visible(), "Escape must dismiss the menu before the dialog");
             window.press("escape", cx);
         })
         .unwrap();
