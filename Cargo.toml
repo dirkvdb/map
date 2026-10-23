@@ -7,6 +7,7 @@ description = "A GPUI desktop raster viewer with a vector basemap"
 [package.metadata.bundle]
 name = "Map"
 identifier = "io.github.dirkvdb.map"
+icon = ["dist/icon_512x512.png", "dist/icon_512x512@2x.png"]
 category = "Utility"
 
 [dependencies]

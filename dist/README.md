@@ -59,3 +59,16 @@ restore it with `chmod +x <file>.AppImage` after downloading.
 Pushing a semantic version tag such as `v0.1.0` builds both packages and creates
 a GitHub release with the resulting files. Branch pushes, pull requests, and
 manual runs build artifacts without publishing a release.
+
+## Shared icons
+
+Both macOS and Linux packages use the prepared icons in `dist/`, configured in
+`Cargo.toml`. These are scaled from `data/icon.png` to 512×512 and 1024×1024
+pixels; the `@2x` filename identifies the high-density variant for macOS.
+
+After changing the source icon, regenerate both PNGs on macOS:
+
+```sh
+sips -z 512 512 data/icon.png --out dist/icon_512x512.png
+sips -z 1024 1024 data/icon.png --out dist/icon_512x512@2x.png
+```
