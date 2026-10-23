@@ -28,54 +28,33 @@ macos_path := env("HOME", env("USERPROFILE", "")) + "/.local/bin:/opt/homebrew/b
 setup-macos:
     /usr/bin/env -i HOME={{quote(env("HOME"))}} PATH={{quote(macos_path)}} MISE_DEFAULT_CONFIG_FILENAME=dist/mise.toml {{quote(mise_bin)}} install
 
+# Build static GDAL/PROJ dependencies and prepare MapLibre Native's locked source.
+package-dependencies:
+    [ -z "${VCPKG_BINARY_CACHE:-}" ] || mkdir -p "$VCPKG_BINARY_CACHE"
+    cargo vcpkg --verbose build --manifest-path dist/vcpkg/Cargo.toml --target "$(rustc -vV | sed -n 's/^host: //p')"
+    test -f "$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib/libgdal.a"
+    test -f "$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib/libproj.a"
+    rm -rf dist/build/vcpkg/buildtrees dist/build/vcpkg/downloads dist/build/vcpkg/packages
+    python3 scripts/prepare_maplibre.py dist/build/maplibre-native
+
 # Build with mise-managed Rust and Apple's tools, using separate Cargo artifacts.
 dmg:
-    /usr/bin/env -i HOME={{quote(env("HOME"))}} PATH={{quote(macos_path)}} MISE_DEFAULT_CONFIG_FILENAME=dist/mise.toml {{quote(mise_bin)}} exec -- cargo build --release --locked --bin topq
-
-    /usr/bin/env -i HOME={{quote(env("HOME"))}} PATH={{quote(macos_path)}} MISE_DEFAULT_CONFIG_FILENAME=dist/mise.toml {{quote(mise_bin)}} exec -- cargo bundle --release --format osx --binary-path dist/build/release/topq
-    /usr/bin/codesign --force --sign - dist/build/release/bundle/osx/TopQ.app
-    /usr/bin/codesign --verify --deep --strict --verbose=2 dist/build/release/bundle/osx/TopQ.app
+    just package-dependencies
+    GDAL_STATIC=1 GDAL_HOME="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET" PKG_CONFIG_PATH="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib/pkgconfig" cargo build --release --locked --bin map
+    cargo bundle --release --format osx --binary-path dist/build/release/map
+    /usr/bin/codesign --force --sign - dist/build/release/bundle/osx/Map.app
+    /usr/bin/codesign --verify --deep --strict --verbose=2 dist/build/release/bundle/osx/Map.app
     /bin/ln -sfn /Applications dist/build/release/bundle/osx/Applications
     /bin/mkdir -p dist/build/release/bundle/dmg
-    /usr/bin/hdiutil create -ov -volname TopQ -srcfolder dist/build/release/bundle/osx -format UDZO dist/build/release/bundle/dmg/TopQ.dmg
-    /usr/bin/hdiutil verify dist/build/release/bundle/dmg/TopQ.dmg
-
-# Windows: select dist/mise.windows.toml via MISE_DEFAULT_CONFIG_FILENAME.
-msi:
-    mise exec -- cargo build --release --locked --bin topq
-    mise exec -- cargo bundle --release --format wxsmsi --binary-path dist/build/release/topq.exe
+    /usr/bin/hdiutil create -ov -volname Map -srcfolder dist/build/release/bundle/osx -format UDZO dist/build/release/bundle/dmg/Map.dmg
+    /usr/bin/hdiutil verify dist/build/release/bundle/dmg/Map.dmg
 
 # Linux: select dist/mise.linux.toml via MISE_DEFAULT_CONFIG_FILENAME.
 # cargo-bundle 0.11 locates the binary via CARGO_TARGET_DIR (no --binary-path flag).
 appimage:
-    mise exec -- cargo build --release --locked --bin topq
-    CARGO_BUNDLE_SKIP_BUILD=1 mise exec -- cargo bundle --release --format appimage
-
-# Prepare locked dependencies for Flatpak's offline build sandbox.
-[linux]
-flatpak-vendor:
-    cargo vendor --locked --versioned-dirs dist/flatpak/vendor > dist/flatpak/cargo-config.toml
-
-# Check host tools before the potentially expensive dependency preparation.
-[linux]
-[private]
-flatpak-check:
-    @command -v flatpak >/dev/null 2>&1 || { echo "Missing flatpak. Install Flatpak or re-enter the Linux devenv shell; see dist/README.md." >&2; exit 1; }
-    @command -v flatpak-builder >/dev/null 2>&1 || { echo "Missing flatpak-builder. Install it or re-enter the Linux devenv shell; see dist/README.md." >&2; exit 1; }
-    @command -v appstreamcli >/dev/null 2>&1 || { echo "Missing appstreamcli. Install AppStream or re-enter the Linux devenv shell; see dist/README.md." >&2; exit 1; }
-    @appstreamcli compose --help >/dev/null 2>&1 || { echo "Missing AppStream compose support. Install appstream-compose or re-enter the Linux devenv shell; see dist/README.md." >&2; exit 1; }
-
-# Install the user-scoped runtime and SDK for the host architecture.
-[linux]
-setup-flatpak: flatpak-check
-    flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-    flatpak install --user --noninteractive flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08 org.freedesktop.Sdk.Extension.rust-stable//25.08 org.freedesktop.Sdk.Extension.llvm20//25.08
-
-# Build and export a local Flatpak bundle; run setup-flatpak first.
-[linux]
-flatpak: flatpak-check flatpak-vendor
-    flatpak-builder --user --force-clean --state-dir=dist/build/flatpak/state --repo=dist/build/flatpak/repo dist/build/flatpak/app dist/flatpak/io.github.dirkvdb.topq.json
-    flatpak build-bundle dist/build/flatpak/repo dist/build/flatpak/TopQ.flatpak io.github.dirkvdb.topq --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo
+    just package-dependencies
+    GDAL_STATIC=1 GDAL_HOME="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET" PKG_CONFIG_PATH="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib/pkgconfig" cargo build --release --locked --bin map
+    CARGO_BUNDLE_SKIP_BUILD=1 cargo bundle --release --format appimage
 
 # Refresh bundled themes from the source revision of gpui-kit in Cargo.lock.
 sync-themes:

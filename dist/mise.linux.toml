@@ -1,0 +1,25 @@
+# Native Linux packaging tools; native UI libraries come from the host distribution.
+[settings]
+cargo.binstall = true
+cargo.binstall_quickinstall = true
+
+[tools]
+cargo-binstall = "1.25.2"
+just = "1.56.0"
+python = "3.14.0"
+rust = { version = "1.95.0", profile = "minimal" }
+# 0.12.0's AppImage writer emits a SquashFS root with mode 000.
+"cargo:cargo-bundle" = { version = "0.11.0", locked = true }
+"cargo:cargo-vcpkg" = { version = "0.1.7", locked = true }
+
+[env]
+RUSTUP_HOME = "{{config_root}}/build/rustup-home"
+CARGO_HOME = "{{config_root}}/build/cargo-home"
+CARGO_TARGET_DIR = "{{config_root}}/build"
+VCPKG_ROOT = "{{config_root}}/build/vcpkg"
+VCPKG_OVERLAY_PORTS = "{{config_root}}/../infra-rs/vcpkg-overlay/ports"
+VCPKG_FORCE_DOWNLOADED_BINARIES = "1"
+VCPKG_DEFAULT_TRIPLET = "x64-linux-static-release"
+VCPKG_DEFAULT_HOST_TRIPLET = "x64-linux-static-release"
+MLN_PRECOMPILE = "0"
+MLN_LOCAL_REPOSITORY = "{{config_root}}/build/maplibre-native"

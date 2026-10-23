@@ -2,6 +2,12 @@
 name = "map"
 version = "0.1.0"
 edition = "2024"
+description = "A GPUI desktop raster viewer with a vector basemap"
+
+[package.metadata.bundle]
+name = "Map"
+identifier = "io.github.dirkvdb.map"
+category = "Utility"
 
 [dependencies]
 anyhow = "1"

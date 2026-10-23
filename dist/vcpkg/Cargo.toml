@@ -1,0 +1,39 @@
+[package]
+name = "map-vcpkg"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+# Keep release packaging independent of transitive package metadata. In
+# particular, tiler's metadata currently contains whitespace in an HDF5 feature
+# list that vcpkg rejects as an invalid package specification.
+[package.metadata.vcpkg]
+dependencies = [
+  "gdal[core,geos,sqlite3]",
+  "proj[core,embed-data]",
+  "tiff[core,lzma,zip]",
+  "hdf5[core,threadsafe]",
+]
+git = "https://github.com/microsoft/vcpkg"
+overlay-triplets-path = "dist/vcpkg/triplets"
+rev = "66c0373"
+
+[package.metadata.vcpkg.target.aarch64-apple-darwin]
+triplet = "arm64-osx-static-release"
+
+[package.metadata.vcpkg.target.x86_64-apple-darwin]
+triplet = "x64-osx-static-release"
+
+[package.metadata.vcpkg.target.x86_64-unknown-linux-gnu]
+triplet = "x64-linux-static-release"
+dependencies = [
+  "gdal[core,geos,iconv,sqlite3]",
+  "proj[core,embed-data]",
+  "tiff[core,lzma,zip]",
+  "hdf5[core,threadsafe]",
+]
+
+[workspace]

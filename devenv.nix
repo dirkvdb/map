@@ -73,6 +73,10 @@ in
     ];
 
   env = {
+    NIX_CONFIG = ''
+      max-jobs = auto
+      cores = 0
+    '';
     RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
     MLN_PRECOMPILE = "0";
     MLN_LOCAL_REPOSITORY = "${config.devenv.root}/.devenv/maplibre-native";
