@@ -20,15 +20,12 @@ run args='':
 [windows]
 set shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]
 
-# mise must be installed outside devenv; MISE_BIN can select an absolute executable.
+# Linux packaging still uses the mise/vcpkg toolchain.
 mise_bin := env("MISE_BIN", "mise")
-macos_path := env("HOME", env("USERPROFILE", "")) + "/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-# Install the pinned native packaging tools without inheriting devenv's environment.
-setup-macos:
-    /usr/bin/env -i HOME={{quote(env("HOME"))}} PATH={{quote(macos_path)}} MISE_DEFAULT_CONFIG_FILENAME=dist/mise.toml {{quote(mise_bin)}} install
 
-# Build static GDAL/PROJ dependencies and prepare MapLibre Native's locked source.
+# Linux: build static dependencies and prepare MapLibre Native's locked source.
+[linux]
 package-dependencies:
     [ -z "${VCPKG_BINARY_CACHE:-}" ] || mkdir -p "$VCPKG_BINARY_CACHE"
     cargo vcpkg --verbose build --manifest-path dist/vcpkg/Cargo.toml --target "$(rustc -vV | sed -n 's/^host: //p')"
@@ -37,23 +34,18 @@ package-dependencies:
     rm -rf dist/build/vcpkg/buildtrees dist/build/vcpkg/downloads dist/build/vcpkg/packages
     python3 scripts/prepare_maplibre.py dist/build/maplibre-native
 
-# Build with mise-managed Rust and Apple's tools, using separate Cargo artifacts.
+# Use devenv's static overlay libraries, not host or mise/vcpkg dependencies.
+[macos]
 dmg:
-    just generate-package-icons
-    just package-dependencies
-    GDAL_STATIC=1 GDAL_HOME="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET" PKG_CONFIG_PATH="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib/pkgconfig" cargo build --release --locked --bin map
-    cargo bundle --release --format osx --binary-path dist/build/release/map
-    python3 -c 'import pathlib, plistlib; app = pathlib.Path("dist/build/release/bundle/osx/Map.app/Contents"); icon = plistlib.loads((app / "Info.plist").read_bytes())["CFBundleIconFile"]; path = app / "Resources" / icon; path = path if path.suffix else path.with_suffix(".icns"); assert path.stat().st_size > 0, "App bundle icon is empty"'
-    /usr/bin/codesign --force --sign - dist/build/release/bundle/osx/Map.app
-    /usr/bin/codesign --verify --deep --strict --verbose=2 dist/build/release/bundle/osx/Map.app
-    /bin/ln -sfn /Applications dist/build/release/bundle/osx/Applications
-    /bin/mkdir -p dist/build/release/bundle/dmg
-    /usr/bin/hdiutil create -ov -volname Map -srcfolder dist/build/release/bundle/osx -format UDZO dist/build/release/bundle/dmg/Map.dmg
-    /usr/bin/hdiutil verify dist/build/release/bundle/dmg/Map.dmg
+    devenv shell -- python3 scripts/package_macos.py
 
-# Linux: select dist/mise.linux.toml via MISE_DEFAULT_CONFIG_FILENAME.
-# cargo-bundle 0.11 locates the binary via CARGO_TARGET_DIR (no --binary-path flag).
+[linux]
 appimage:
+    MISE_DEFAULT_CONFIG_FILENAME=dist/mise.linux.toml {{quote(mise_bin)}} exec -- just _appimage
+
+# cargo-bundle 0.11 locates the binary via CARGO_TARGET_DIR (no --binary-path flag).
+[linux]
+_appimage:
     just generate-package-icons
     just package-dependencies
     GDAL_STATIC=1 GDAL_HOME="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET" PKG_CONFIG_PATH="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib/pkgconfig" cargo build --release --locked --bin map

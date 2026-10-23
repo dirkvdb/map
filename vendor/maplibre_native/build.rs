@@ -10,6 +10,13 @@
 //!
 //! Set `MLN_SANITIZER` to an LLVM sanitizer (e.g. `address`) to instrument the C++ bridge and a from-source MapLibre Native build.
 //!
+
+//! Set `MLN_CMAKE_PYTHON_EXECUTABLE` to Python 3.10+ for the WebGPU wrapper generator.
+//!
+
+//! Set `MLN_STATIC_DEPS=1` for macOS packaging with static pkg-config dependencies.
+//! All non-system libraries, including transitive dependencies, must have archives.
+//!
 //! Required libraries:
 //! Fedora:
 //!     - `sudo dnf install libicu-devel libglslang-devel spirv-tools-devel libpng-devel libjpeg-turbo-devel libuv-devel libwebp-devel`
@@ -397,7 +404,6 @@ fn build_bridge(
 struct Info {
     lib_name: String,
     include_dirs: Vec<PathBuf>,
-    cpp_root: PathBuf,
 }
 
 fn bundle_precompiled() -> Info {
@@ -419,7 +425,7 @@ fn bundle_precompiled() -> Info {
         .replacen("lib", "", 1)
         .replace(".a", "");
 
-    Info { lib_name, include_dirs, cpp_root }
+    Info { lib_name, include_dirs }
 }
 
 fn clone_repository<P: AsRef<Path>>(
@@ -464,6 +470,7 @@ fn configure_local_build(
     api: GraphicsApi,
     amalgam_lib: bool,
     target_os: &str,
+    static_dependencies: Option<&StaticDependencies>,
 ) {
     // maplibre-native's platform/darwin/darwin.cmake calls enable_language(Swift),
     // which the default "Unix Makefiles" generator does not support. Switch to Ninja.
@@ -528,10 +535,26 @@ fn configure_local_build(
     // We only build the `mbgl-core` target, so skip configuring the GLFW demo app.
     config.configure_arg("-DMLN_WITH_GLFW=OFF");
 
+    if let Some(dependencies) = static_dependencies {
+        dependencies.configure_cmake(config);
+        println!("cargo:rerun-if-env-changed=SDKROOT");
+        if let Some(sdk) = env::var_os("SDKROOT").filter(|path| !path.is_empty()) {
+            // Override a cached Nix sysroot with the selected native Apple SDK.
+            config.define("CMAKE_OSX_SYSROOT", sdk);
+        }
+    }
+
     // Always pass a value; CMake caches variables between configure runs.
     let sanitizer = env::var("MLN_SANITIZER").unwrap_or_default();
     let sanitizer = sanitizer.trim();
     config.define("MLN_WITH_SANITIZER", if sanitizer.is_empty() { "OFF" } else { sanitizer });
+
+    println!("cargo:rerun-if-env-changed=MLN_CMAKE_PYTHON_EXECUTABLE");
+    if let Some(python) = env::var_os("MLN_CMAKE_PYTHON_EXECUTABLE").filter(|path| !path.is_empty())
+    {
+        // find_program() would otherwise reuse a cached Apple Python from PATH.
+        config.define("PYTHON_EXECUTABLE", python);
+    }
 
     // Forward an optional compiler launcher (sccache/ccache) so downstream CI can
     // cache the C++ objects without patching this crate.
@@ -549,6 +572,7 @@ fn build_local(
     name: &str,
     amalgam_lib: bool,
     target_os: &str,
+    static_dependencies: Option<&StaticDependencies>,
 ) -> Result<Info, Box<dyn std::error::Error>> {
     const TARGET_NAME: &str = "mbgl-core";
     let maplibre_native_dir = respository_dir.join(name);
@@ -640,7 +664,7 @@ fn build_local(
     let mut config = cmake::Config::new(maplibre_native_dir.clone());
     config.build_target(TARGET_NAME);
     let api = GraphicsApi::from_selected_features();
-    configure_local_build(&mut config, api, amalgam_lib, target_os);
+    configure_local_build(&mut config, api, amalgam_lib, target_os, static_dependencies);
 
     let dest = config.build();
     println!("cargo:rustc-link-search=native={}", dest.join("build").display());
@@ -686,8 +710,136 @@ fn build_local(
     Ok(Info {
         lib_name: format!("{TARGET_NAME}{}", if amalgam_lib { "-amalgam" } else { "" }),
         include_dirs,
-        cpp_root: maplibre_native_dir,
     })
+}
+
+struct StaticDependencies(Vec<(&'static str, pkg_config::Library)>);
+
+fn is_apple_system_library(name: &str) -> bool {
+    // libc++ is intentionally left to the application's packaging policy.
+    matches!(name, "c" | "m" | "pthread" | "dl" | "resolv" | "iconv" | "System" | "c++" | "c++abi")
+}
+
+fn static_archive(package: &str, library: &pkg_config::Library, name: &str) -> PathBuf {
+    library
+        .link_paths
+        .iter()
+        .map(|path| path.join(format!("lib{name}.a")))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "MLN_STATIC_DEPS=1: {package} requires lib{name}.a, not a dylib; searched {:?}. \
+                 Provide a static package through PKG_CONFIG_PATH.",
+                library.link_paths
+            )
+        })
+}
+
+impl StaticDependencies {
+    fn resolve() -> Self {
+        println!("cargo:rerun-if-env-changed=HOMEBREW_PREFIX");
+        let packages = ["libpng", "libjpeg", "libwebp", "libcurl", "zlib", "sqlite3"];
+        Self(
+            packages
+                .into_iter()
+                .map(|package| {
+                    // pkg-config-rs otherwise silently emits dynamic links for missing archives.
+                    let library = pkg_config::Config::new()
+                        .statik(true)
+                        .cargo_metadata(false)
+                        .probe(package)
+                        .unwrap_or_else(|error| panic!("MLN_STATIC_DEPS=1: {package}: {error}"));
+                    for path in library
+                        .link_paths
+                        .iter()
+                        .chain(&library.framework_paths)
+                        .chain(&library.link_files)
+                    {
+                        assert!(
+                            !path.starts_with("/opt/homebrew")
+                                && !path.starts_with("/usr/local")
+                                && env::var_os("HOMEBREW_PREFIX")
+                                    .filter(|prefix| !prefix.is_empty())
+                                    .is_none_or(|prefix| !path.starts_with(prefix)),
+                            "MLN_STATIC_DEPS=1: {package} contains a Homebrew search path: {}",
+                            path.display()
+                        );
+                    }
+                    for name in &library.libs {
+                        if !is_apple_system_library(name) {
+                            static_archive(package, &library, name);
+                        }
+                    }
+                    for path in &library.link_files {
+                        assert!(
+                            path.extension().is_some_and(|extension| extension == "a")
+                                && path.is_file(),
+                            "MLN_STATIC_DEPS=1: {package} requires a static archive, got {}",
+                            path.display()
+                        );
+                    }
+                    // Do not let opaque linker flags bypass archive validation (e.g. -Wl,-lfoo).
+                    assert!(
+                        library.ld_args.iter().all(Vec::is_empty),
+                        "MLN_STATIC_DEPS=1: {package} has unsupported linker options: {:?}",
+                        library.ld_args
+                    );
+                    (package, library)
+                })
+                .collect(),
+        )
+    }
+
+    fn configure_cmake(&self, config: &mut cmake::Config) {
+        for (package, prefix, include_variable, header) in [
+            ("libpng", "PNG", "PNG_PNG_INCLUDE_DIR", "png.h"),
+            ("libjpeg", "JPEG", "JPEG_INCLUDE_DIR", "jpeglib.h"),
+            ("zlib", "ZLIB", "ZLIB_INCLUDE_DIR", "zlib.h"),
+        ] {
+            let (_, library) = self.0.iter().find(|(name, _)| *name == package).unwrap();
+            let name = library.libs.first().expect("pkg-config package has no primary library");
+            let archive = static_archive(package, library, name);
+            // Find modules may prefer cached per-configuration paths over *_LIBRARY.
+            for suffix in ["LIBRARY", "LIBRARY_RELEASE", "LIBRARY_DEBUG"] {
+                config.define(format!("{prefix}_{suffix}"), &archive);
+            }
+            let include = library
+                .include_paths
+                .iter()
+                .find(|path| path.join(header).is_file())
+                .unwrap_or_else(|| {
+                    panic!("MLN_STATIC_DEPS=1: {package} has no {header} include path")
+                });
+            config.define(include_variable, include);
+        }
+    }
+
+    fn link(&self) {
+        for (_, library) in &self.0 {
+            for path in &library.link_paths {
+                println!("cargo:rustc-link-search=native={}", path.display());
+            }
+            for name in &library.libs {
+                let kind = if is_apple_system_library(name) { "dylib" } else { "static" };
+                println!("cargo:rustc-link-lib={kind}={name}");
+            }
+            for path in &library.link_files {
+                let name = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("lib"))
+                    .expect("pkg-config archive must be named lib<name>.a");
+                println!("cargo:rustc-link-search=native={}", path.parent().unwrap().display());
+                println!("cargo:rustc-link-lib=static={name}");
+            }
+            for path in &library.framework_paths {
+                println!("cargo:rustc-link-search=framework={}", path.display());
+            }
+            for framework in &library.frameworks {
+                println!("cargo:rustc-link-lib=framework={framework}");
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -696,6 +848,8 @@ fn build_mln() {
     println!("cargo:rerun-if-env-changed=MLN_PRECOMPILE");
     println!("cargo:rerun-if-env-changed=MLN_CORE_LIBRARY_USE_AMALGAM");
     println!("cargo:rerun-if-env-changed=MLN_LOCAL_REPOSITORY");
+    println!("cargo:rerun-if-env-changed=MLN_STATIC_DEPS");
+    let static_deps = env::var("MLN_STATIC_DEPS").as_deref() == Ok("1");
 
     let precompiled = !env::var("MLN_PRECOMPILE").unwrap_or("0".to_string()).eq("0");
     let amalgam_lib =
@@ -711,7 +865,11 @@ fn build_mln() {
     // Add system library search paths for macOS
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
     check_feature_combinations(&target_os, precompiled);
-    if target_os == "macos" {
+    let static_dependencies = static_deps.then(|| {
+        assert_eq!(target_os, "macos", "MLN_STATIC_DEPS=1 supports macOS packaging only");
+        StaticDependencies::resolve()
+    });
+    if target_os == "macos" && !static_deps {
         // Check for Homebrew installation paths
         if let Ok(homebrew_prefix) = env::var("HOMEBREW_PREFIX") {
             println!("cargo:rustc-link-search=native={homebrew_prefix}/lib");
@@ -721,14 +879,10 @@ fn build_mln() {
             println!("cargo:rustc-link-search=native=/usr/local/lib");
         }
 
-        // macOS system library paths
-        println!("cargo:rustc-link-search=native=/usr/lib");
-        println!("cargo:rustc-link-search=native=/System/Library/Frameworks");
-
         // Add pkg-config paths if available
         if let Ok(pkgconfig_path) = env::var("PKG_CONFIG_PATH") {
             for path in pkgconfig_path.split(':') {
-                let lib_path = Path::new(path).parent().map(|p| p.join("lib"));
+                let lib_path = Path::new(path).parent();
                 if let Some(lib_path) = lib_path {
                     if lib_path.exists() {
                         println!("cargo:rustc-link-search=native={}", lib_path.display());
@@ -757,7 +911,13 @@ fn build_mln() {
             PathBuf::from(local_repository.clone()).parent().unwrap().to_path_buf()
         };
 
-        match build_local(&respository_dir, MAPLIBRE_NATIVE_DIR_NAME, amalgam_lib, &target_os) {
+        match build_local(
+            &respository_dir,
+            MAPLIBRE_NATIVE_DIR_NAME,
+            amalgam_lib,
+            &target_os,
+            static_dependencies.as_ref(),
+        ) {
             Err(e) => {
                 if respository_dir.join(MAPLIBRE_NATIVE_DIR_NAME).exists()
                     && local_repository.is_empty()
@@ -785,17 +945,7 @@ fn build_mln() {
     let is_apple = target_os == "macos" || target_os == "ios";
     if !amalgam_lib {
         // The dependent libs are not bundled in the core lib, so we have to link manually
-        // Required for mlt-cpp. Cpp root link search was already added above
-        println!(
-            "cargo:rustc-link-search=native={}",
-            info.cpp_root
-                .parent()
-                .unwrap()
-                .join("vendor")
-                .join("maplibre-tile-spec")
-                .join("cpp")
-                .display()
-        );
+
         println!("cargo:rustc-link-lib=mbgl-harfbuzz");
         println!("cargo:rustc-link-lib=mbgl-freetype");
         println!("cargo:rustc-link-lib=mbgl-vendor-parsedate");
@@ -805,7 +955,7 @@ fn build_mln() {
         println!("cargo:rustc-link-lib=mlt-cpp");
         println!("cargo:rustc-link-lib=fastpfor-lib");
         if is_apple {
-            // darwin builds vendored ICU (system sqlite3 is linked below for all darwin builds)
+            // darwin builds vendored ICU.
             println!("cargo:rustc-link-lib=mbgl-vendor-icu");
         } else {
             println!("cargo:rustc-link-lib=mbgl-vendor-nunicode");
@@ -825,21 +975,29 @@ fn build_mln() {
             println!("cargo:rustc-link-lib=SPIRV-Tools-opt"); //sudo dnf install  spirv-tools-devel // Required by glslang spirv-tools-devel
             println!("cargo:rustc-link-lib=SPIRV-Tools"); //sudo dnf install  spirv-tools-devel // Required by glslang spirv-tools-devel
         }
-        println!("cargo:rustc-link-lib=png"); // sudo dnf install libpng-devel
-        println!("cargo:rustc-link-lib=jpeg"); // sudo dnf install libjpeg-turbo-devel
-        println!("cargo:rustc-link-lib=webp"); // sudo dnf install libwebp-devel
+        if !static_deps {
+            println!("cargo:rustc-link-lib=png"); // sudo dnf install libpng-devel
+            println!("cargo:rustc-link-lib=jpeg"); // sudo dnf install libjpeg-turbo-devel
+            println!("cargo:rustc-link-lib=webp"); // sudo dnf install libwebp-devel
+        }
     }
     if !is_apple {
         println!("cargo:rustc-link-lib=uv"); // sudo dnf install libuv-devel
     }
-    println!("cargo:rustc-link-lib=curl");
-    println!("cargo:rustc-link-lib=z");
+    if let Some(dependencies) = &static_dependencies {
+        dependencies.link();
+    } else {
+        println!("cargo:rustc-link-lib=curl");
+        println!("cargo:rustc-link-lib=z");
+    }
 
     if is_apple {
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
-        // darwin uses the system sqlite3 (both source and precompiled builds).
-        println!("cargo:rustc-link-lib=sqlite3");
+        if !static_deps {
+            // Development builds use the system sqlite3.
+            println!("cargo:rustc-link-lib=sqlite3");
+        }
     }
     match backend {
         GraphicsApi::Vulkan if is_apple => {
@@ -871,6 +1029,119 @@ fn build_mln() {
             println!("cargo:rustc-link-lib=framework=CoreLocation");
         }
         GraphicsApi::Vulkan | GraphicsApi::WGPU => {}
+    }
+}
+
+#[cfg(test)]
+mod static_dependency_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Compile build.rs with rustc --test and its cached build dependencies. The test
+    // harness does not call main(), CMake, or build_bridge(); only pkg-config runs.
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+            let root = env::temp_dir().join(format!(
+                "mln-static-deps-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(root.join("primary/lib")).unwrap();
+            fs::create_dir_all(root.join("transitive/lib")).unwrap();
+            Self(root)
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.0.join(relative)
+        }
+
+        fn library(&self) -> pkg_config::Library {
+            let metadata = self.path("fixture.pc");
+            fs::write(
+                &metadata,
+                format!(
+                    "Name: fixture\nDescription: static dependency fixture\nVersion: 1.0\n\
+                     Libs: -L\"{}\" -lwebp\n\
+                     Libs.private: -L\"{}\" -lsharpyuv\n",
+                    self.path("primary/lib").display(),
+                    self.path("transitive/lib").display()
+                ),
+            )
+            .unwrap();
+            // An absolute .pc filename avoids changing process-global PKG_CONFIG_PATH,
+            // so these tests can run in parallel and cannot resolve host packages.
+            pkg_config::Config::new()
+                .statik(true)
+                .cargo_metadata(false)
+                .env_metadata(false)
+                .probe(metadata.to_str().unwrap())
+                .unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn resolves_primary_archive() {
+        let fixture = Fixture::new();
+        let archive = fixture.path("primary/lib/libwebp.a");
+        fs::write(&archive, []).unwrap();
+        assert_eq!(static_archive("libwebp", &fixture.library(), "webp"), archive);
+    }
+
+    #[test]
+    fn resolves_static_private_dependency_from_another_prefix() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path("primary/lib/libwebp.a"), []).unwrap();
+        let archive = fixture.path("transitive/lib/libsharpyuv.a");
+        fs::write(&archive, []).unwrap();
+        let library = fixture.library();
+        assert!(library.libs.iter().any(|name| name == "sharpyuv"));
+        assert_eq!(static_archive("libwebp", &library, "sharpyuv"), archive);
+    }
+
+    #[test]
+    fn finds_archive_in_later_prefix_despite_earlier_dylib() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path("primary/lib/libwebp.dylib"), []).unwrap();
+        let archive = fixture.path("transitive/lib/libwebp.a");
+        fs::write(&archive, []).unwrap();
+        assert_eq!(static_archive("libwebp", &fixture.library(), "webp"), archive);
+    }
+
+    #[test]
+    #[should_panic(expected = "libwebp requires libwebp.a, not a dylib")]
+    fn rejects_dynamic_only_dependency() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path("primary/lib/libwebp.dylib"), []).unwrap();
+        static_archive("libwebp", &fixture.library(), "webp");
+    }
+
+    #[test]
+    #[should_panic(expected = "libwebp requires libsharpyuv.a, not a dylib")]
+    fn rejects_missing_transitive_archive() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path("primary/lib/libwebp.a"), []).unwrap();
+        static_archive("libwebp", &fixture.library(), "sharpyuv");
+    }
+
+    #[test]
+    #[should_panic(expected = "libwebp requires libwebp.a, not a dylib")]
+    fn rejects_directory_named_like_archive() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.path("primary/lib/libwebp.a")).unwrap();
+        static_archive("libwebp", &fixture.library(), "webp");
     }
 }
 
