@@ -111,7 +111,7 @@ pub struct MapView {
     viewport: Option<Viewport>,
     bounds: Option<Bounds<Pixels>>,
     camera: MapCamera,
-    requested: Option<(MapRequest, Option<u64>, f32)>,
+    requested: Option<(MapRequest, Option<u64>, f32, bool)>,
     raster_panel: Entity<RasterPanel>,
     pixel_info: Entity<PixelInfo>,
     pointer: Option<Point<Pixels>>,
@@ -228,7 +228,8 @@ impl MapView {
             return;
         };
         let request = MapRequest { viewport, camera: self.camera };
-        let key = (request, self.raster.as_ref().map(|source| source.id()), self.opacity);
+        let reduce_motion = cx.reduce_motion();
+        let key = (request, self.raster.as_ref().map(|source| source.id()), self.opacity, reduce_motion);
         if self.requested == Some(key) {
             return;
         }
@@ -237,7 +238,7 @@ impl MapView {
             return;
         };
         self.error = None;
-        if let Err(error) = renderer.render_raster(request, self.raster.clone(), self.opacity) {
+        if let Err(error) = renderer.render_raster(request, self.raster.clone(), self.opacity, reduce_motion) {
             self.error = Some(format!("Couldn’t load the map. {error}").into());
         }
         cx.notify();
@@ -613,6 +614,73 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn band_selection_preserves_the_camera_and_explicit_fit_restores_the_extent(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bands.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 2).unwrap();
+        let mut view = None;
+        let handle = cx.open_window(size(px(1200.0), px(760.0)), |window, cx| {
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("open-raster", cx);
+        })
+        .unwrap();
+        cx.simulate_path_prompt_response(|_| Some(vec![path]));
+        cx.run_until_parked();
+        let (fitted, navigated, original_band) = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let fitted = view.read(cx).camera;
+                assert_ne!(fitted, MapCamera::default(), "Opening a raster must still fit its extent");
+                let focus = view.read(cx).focus.clone();
+                window.focus(&focus, cx);
+                window.press("right", cx);
+                window.press("+", cx);
+                let navigated = view.read(cx).camera;
+                assert_ne!(navigated, fitted);
+                let band = view.read(cx).raster.as_ref().unwrap().metadata().id;
+                assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().band_nr, Some(1));
+                window.click("raster-band", cx);
+                window.press("down", cx);
+                window.press("enter", cx);
+                (fitted, navigated, band)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_ne!(view.read(cx).raster.as_ref().unwrap().metadata().id, original_band);
+            assert_eq!(view.read(cx).camera, navigated, "Changing bands must preserve pan and zoom");
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().id, original_band);
+            assert_eq!(view.read(cx).camera, navigated, "Scrolling the selector must not zoom the map");
+            window.press("secondary-0", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(view.read(cx).camera, fitted, "The explicit fit command must still fit the active band"));
+    }
+
+    #[gpui_kit::test]
     fn mouse_move_reads_the_active_band_and_hides_info_over_controls(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -657,11 +725,11 @@ mod tests {
                 let text = info.label().unwrap();
                 assert!(text.contains("Lat: 0.000000") && text.contains("Lon: 0.000000"), "{text}");
                 let value: f64 = text.split_whitespace().nth(4).unwrap().parse().unwrap();
-                assert!((value - 84.0).abs() <= 1.0, "Expected the second band's center value, got {value}");
+                assert!((value - 74.0).abs() <= 1.0, "Expected the first band's center value, got {value}");
                 window.hover("raster-layers-card", cx);
                 assert!(window.find("pixel-info").label().is_none(), "Controls must not sample the map underneath");
                 window.click("raster-band", cx);
-                window.press("up", cx);
+                window.press("down", cx);
                 window.press("enter", cx);
                 value
             })
@@ -673,7 +741,7 @@ mod tests {
             window.render_frame(cx);
             let info = window.find("pixel-info");
             let value: f64 = info.label().unwrap().split_whitespace().nth(4).unwrap().parse().unwrap();
-            assert_eq!(value, first_value - 10.0, "Band changes must invalidate the cached numeric tile");
+            assert_eq!(value, first_value + 10.0, "Band changes must invalidate the cached numeric tile");
             // Cached moves must render a value before any background work runs.
             let center = window.find("map-surface").bounds().center();
             window.dispatch_event(
@@ -704,7 +772,7 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.find("pixel-info").label().is_none(), "Late reads must not restore a hidden readout");
-            window.click("clear-rasters", cx);
+            view.read(cx).raster_panel.clone().update(cx, |panel, cx| panel.clear(window, cx));
         })
         .unwrap();
         cx.run_until_parked();
@@ -1007,7 +1075,7 @@ mod tests {
                 cx,
             );
             window.click("raster-band", cx);
-            window.press("up", cx);
+            window.press("down", cx);
             window.press("enter", cx);
         })
         .unwrap();

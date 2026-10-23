@@ -10,7 +10,7 @@ use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IndexPath, Sizable};
 use gpui_kit::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, ParentElement, PathPromptOptions, Render,
-    SharedString, Styled, Subscription, Task, TestSupportExt, Window, div, rgba,
+    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, Window, div, rgba,
 };
 use inf::colormap::ColorMapPreset;
 
@@ -55,6 +55,7 @@ impl SelectItem for BandChoice {
 pub struct RasterPanel {
     sources: Vec<Arc<RasterSource>>,
     selected: Option<tiler::LayerId>,
+    band_scroll: f32,
     bands: Entity<SelectState<Vec<BandChoice>>>,
     palette: Entity<SelectState<Vec<&'static str>>>,
     opacity: Entity<SliderState>,
@@ -86,7 +87,7 @@ impl RasterPanel {
         let subscriptions = vec![
             cx.subscribe_in(&bands, window, |this, _, event, window, cx| {
                 let SelectEvent::Confirm(id) = event;
-                this.select(*id, window, cx);
+                this.select(*id, false, window, cx);
             }),
             cx.subscribe_in(&palette, window, |this, _, _: &SelectEvent<Vec<&'static str>>, window, cx| {
                 this.apply_style(window, cx)
@@ -112,6 +113,7 @@ impl RasterPanel {
         Self {
             sources: Vec::new(),
             selected: None,
+            band_scroll: 0.0,
             bands,
             palette,
             opacity,
@@ -143,7 +145,7 @@ impl RasterPanel {
         cx.notify();
     }
 
-    fn select(&mut self, id: Option<tiler::LayerId>, window: &mut Window, cx: &mut Context<Self>) {
+    fn select(&mut self, id: Option<tiler::LayerId>, fit: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = id;
         self.error = None;
         self.collapsed = false;
@@ -162,7 +164,7 @@ impl RasterPanel {
         }
         self.sync_range_slider(window, cx);
         self.watch_tile_errors(cx);
-        self.emit(true, cx);
+        self.emit(fit, cx);
     }
 
     fn watch_tile_errors(&mut self, cx: &mut Context<Self>) {
@@ -182,6 +184,36 @@ impl RasterPanel {
                 }
             })
         });
+    }
+
+    fn scroll_bands(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.sources.iter().position(|source| Some(source.metadata().id) == self.selected) else {
+            return;
+        };
+        let delta = match event.delta {
+            ScrollDelta::Lines(delta) => delta.y,
+            // Accumulate precise device pixels so small trackpad events don't
+            // race through bands. This is an input threshold, not layout size.
+            ScrollDelta::Pixels(delta) => f32::from(delta.y) / 40.0,
+        };
+        if !delta.is_finite() || delta == 0.0 {
+            return;
+        }
+        cx.stop_propagation();
+        if self.band_scroll.signum() != delta.signum() {
+            self.band_scroll = 0.0;
+        }
+        self.band_scroll += delta;
+        // A wheel notch can report several lines; band navigation still moves
+        // by only one index. Keep only the fractional trackpad remainder.
+        let steps = self.band_scroll.trunc().clamp(-1.0, 1.0);
+        self.band_scroll = self.band_scroll.fract();
+        let next = (ix as f32 - steps).clamp(0.0, (self.sources.len() - 1) as f32) as usize;
+        if next != ix {
+            let id = self.sources[next].metadata().id;
+            self.bands.update(cx, |state, cx| state.set_selected_value(&id, window, cx));
+            self.select(Some(id), false, window, cx);
+        }
     }
 
     pub fn prompt(&mut self, cx: &mut Context<Self>) {
@@ -222,19 +254,22 @@ impl RasterPanel {
         let work = cx.background_spawn(async move {
             let mut sources = Vec::new();
             let mut errors = Vec::new();
+            let mut selected = None;
             for path in paths {
                 match RasterSource::open(&path) {
-                    Ok(opened) => sources.extend(opened),
+                    Ok(opened) => {
+                        selected = opened.first().map(|source| source.metadata().id);
+                        sources.extend(opened);
+                    }
                     Err(error) => errors.push(format!("{}: {error:#}", path.display())),
                 }
             }
-            (sources, errors)
+            (sources, errors, selected)
         });
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let (sources, errors) = work.await;
+            let (sources, errors, selected) = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.loading = false;
-                let latest = sources.last().map(|source| source.metadata().id);
                 this.sources.extend(sources);
                 let items = this
                     .sources
@@ -245,9 +280,9 @@ impl RasterPanel {
                     })
                     .collect();
                 this.bands.update(cx, |state, cx| state.set_items(items, window, cx));
-                if let Some(id) = latest {
+                if let Some(id) = selected {
                     this.bands.update(cx, |state, cx| state.set_selected_value(&id, window, cx));
-                    this.select(Some(id), window, cx);
+                    this.select(Some(id), true, window, cx);
                 }
                 this.error = (!errors.is_empty()).then(|| errors.join("\n").into());
                 cx.notify();
@@ -387,11 +422,21 @@ impl Render for RasterPanel {
         if !self.collapsed {
             layers = layers.child(
                 div().flex().flex_col().gap_1().child(field_label("Layer", cx)).child(
-                    Select::new(&self.bands)
-                        .id("raster-band")
-                        .accessibility_label("Raster band")
-                        .placeholder("Choose a raster band")
-                        .disabled(self.sources.is_empty()),
+                    div()
+                        .id("raster-band-scroll")
+                        .on_scroll_wheel(cx.listener(Self::scroll_bands))
+                        .on_hover(cx.listener(|this, hovered, _, _| {
+                            if !hovered {
+                                this.band_scroll = 0.0;
+                            }
+                        }))
+                        .child(
+                            Select::new(&self.bands)
+                                .id("raster-band")
+                                .accessibility_label("Raster band")
+                                .placeholder("Choose a raster band")
+                                .disabled(self.sources.is_empty()),
+                        ),
                 ),
             );
             if self.selected.is_some() {
@@ -421,29 +466,6 @@ impl Render for RasterPanel {
                         .child("Open a raster or drop files onto the map."),
                 );
             }
-            layers = layers.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("fit-raster")
-                            .small()
-                            .ghost()
-                            .label("Fit raster")
-                            .disabled(self.selected.is_none())
-                            .tooltip("Fit raster (Ctrl/⌘+0)")
-                            .on_click(cx.listener(|this, _, _, cx| this.fit(cx))),
-                    )
-                    .child(
-                        Button::new("clear-rasters")
-                            .small()
-                            .ghost()
-                            .label("Clear rasters")
-                            .disabled(self.sources.is_empty() && !self.loading)
-                            .on_click(cx.listener(|this, _, window, cx| this.clear(window, cx))),
-                    ),
-            );
             if let Some(error) = &self.error {
                 layers = layers.child(div().text_sm().text_color(cx.theme().danger).child(error.clone()));
             }
@@ -469,8 +491,8 @@ impl RasterPanel {
         let mut legend = div().id("raster-legend").test_support().flex().flex_col().gap_1();
         if let Some(source) = self.active() {
             let (min, max) = source.range();
-            let swatches = (0..64).map(|ix| {
-                let color = source.legend().color_for_value(min + (max - min) * ix as f32 / 63.0, None);
+            let swatches = (0..256).map(|ix| {
+                let color = source.legend().color_for_value(min + (max - min) * ix as f32 / 255.0, None);
                 // These colors encode raster data, not application chrome.
                 div().flex_1().h_3().bg(rgba(u32::from_be_bytes([color.r, color.g, color.b, color.a])))
             });
@@ -579,9 +601,46 @@ fn format_value(value: f32) -> String {
 #[cfg(test)]
 mod tests {
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{TestAppContext, px, size};
+    use gpui_kit::{TestAppContext, point, px, size};
 
     use super::*;
+
+    #[gpui_kit::test]
+    fn scrolling_changes_at_most_one_band_per_event(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bands.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 5).unwrap();
+        let mut panel = None;
+        let handle = cx.open_window(size(px(900.0), px(760.0)), |window, cx| {
+            let view = cx.new(|cx| RasterPanel::new(window, cx));
+            panel = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let panel = panel.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("open-raster", cx);
+        })
+        .unwrap();
+        cx.simulate_path_prompt_response(|_| Some(vec![path]));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            for (delta, expected_band) in [
+                (ScrollDelta::Lines(point(0.0, -3.0)), 2),
+                (ScrollDelta::Lines(point(0.0, -6.0)), 3),
+                (ScrollDelta::Lines(point(0.0, 3.0)), 2),
+                (ScrollDelta::Pixels(point(px(0.0), px(-240.0))), 3),
+                (ScrollDelta::Pixels(point(px(0.0), px(240.0))), 2),
+            ] {
+                window.scroll("raster-band", delta, cx);
+                assert_eq!(panel.read(cx).active().unwrap().metadata().band_nr, Some(expected_band));
+                assert_eq!(panel.read(cx).bands.read(cx).selected_value().copied(), panel.read(cx).selected);
+            }
+        })
+        .unwrap();
+    }
 
     #[gpui_kit::test]
     fn open_cancel_range_validation_and_clear_work_through_the_ui(cx: &mut TestAppContext) {
@@ -598,8 +657,11 @@ mod tests {
         let panel = panel.unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            window.click("fit-raster", cx);
+            assert!(window.try_find("fit-raster").is_none());
+            assert!(window.try_find("clear-rasters").is_none());
             assert!(panel.read(cx).selected.is_none());
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+            assert!(panel.read(cx).selected.is_none(), "An empty selector must ignore scroll");
             window.click("open-raster", cx);
         })
         .unwrap();
@@ -618,12 +680,43 @@ mod tests {
         cx.simulate_path_prompt_response(|_| Some(vec![path]));
         cx.run_until_parked();
         assert_eq!(cx.update(|cx| panel.read(cx).sources.len()), 2);
+        cx.update(|cx| {
+            let panel = panel.read(cx);
+            assert_eq!(panel.selected, Some(panel.sources[0].metadata().id));
+            assert_eq!(
+                panel.active().unwrap().metadata().band_nr,
+                Some(1),
+                "Opening a multiband raster must select its first band"
+            );
+        });
 
         let original_band = cx.update(|cx| panel.read(cx).selected);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            assert_eq!(panel.read(cx).selected, original_band, "Scrolling up at the first band must not wrap");
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+            let second = panel.read(cx).selected;
+            assert_ne!(second, original_band, "Scrolling down must select the next band");
+            assert_eq!(panel.read(cx).bands.read(cx).selected_value().copied(), second);
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+            assert_eq!(panel.read(cx).selected, second, "Scrolling down at the last band must not wrap");
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            assert_eq!(panel.read(cx).selected, original_band);
+            for _ in 0..3 {
+                window.scroll("raster-band", ScrollDelta::Pixels(point(px(0.0), px(-10.0))), cx);
+                assert_eq!(panel.read(cx).selected, original_band, "Small trackpad deltas must accumulate");
+            }
+            window.scroll("raster-band", ScrollDelta::Pixels(point(px(0.0), px(-10.0))), cx);
+            assert_eq!(panel.read(cx).selected, second);
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
             window.click("raster-band", cx);
-            window.press("up", cx);
+            window.press("down", cx);
             window.press("enter", cx);
         })
         .unwrap();
@@ -678,12 +771,13 @@ mod tests {
         assert_eq!(cx.update(|cx| panel.read(cx).active().unwrap().id()), applied_id);
 
         cx.update_window(handle.into(), |_, window, cx| {
-            window.click("clear-rasters", cx);
+            assert!(window.try_find("fit-raster").is_none());
+            assert!(window.try_find("clear-rasters").is_none());
+            panel.update(cx, |panel, cx| panel.clear(window, cx));
+            window.render_frame(cx);
             assert!(panel.read(cx).sources.is_empty());
             assert!(panel.read(cx).selected.is_none());
             assert!(window.try_find("raster-min").is_none());
-            window.click("fit-raster", cx);
-            assert!(panel.read(cx).selected.is_none());
         })
         .unwrap();
     }

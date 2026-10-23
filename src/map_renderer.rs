@@ -41,6 +41,7 @@ struct RenderRequest {
     map: MapRequest,
     raster: Option<Arc<RasterSource>>,
     opacity: f32,
+    reduce_motion: bool,
 }
 
 pub struct MapRenderer {
@@ -64,16 +65,21 @@ impl MapRenderer {
         Ok(Self { sender, frames })
     }
 
-    pub fn render_raster(&self, map: MapRequest, raster: Option<Arc<RasterSource>>, opacity: f32) -> Result<()> {
+    pub fn render_raster(&self, map: MapRequest, raster: Option<Arc<RasterSource>>, opacity: f32, reduce_motion: bool) -> Result<()> {
         self.sender
-            .send(RenderRequest { map, raster, opacity })
+            .send(RenderRequest {
+                map,
+                raster,
+                opacity,
+                reduce_motion,
+            })
             .context("Map rendering thread stopped")?;
         Ok(())
     }
 
     #[cfg(test)]
     pub fn render(&self, request: MapRequest) -> Result<()> {
-        self.render_raster(request, None, 1.0)
+        self.render_raster(request, None, 1.0, false)
     }
 
     pub fn frames(&self) -> async_channel::Receiver<MapFrame> {
@@ -149,6 +155,7 @@ fn poll_map_image(map: &mut Option<NativeMap>, request: &RenderRequest, mut requ
     }
     let map = map.as_mut().context("Map renderer unavailable")?;
     if request_changed {
+        map.numeric.borrow_mut().set_reduce_motion(request.reduce_motion);
         map.set_raster(request.raster.clone(), request.opacity)?;
         map.apply_request(request.map);
     }
@@ -245,12 +252,13 @@ impl NativeMap {
             return Ok(());
         }
         let changed = self.raster.as_ref().map(|source| source.metadata().id) != raster.as_ref().map(|source| source.metadata().id);
+        let retain_numeric = self.raster.as_ref().is_some_and(|source| source.is_numeric()) && raster.as_ref().is_some_and(|source| source.is_numeric());
         let dpi = (self.viewport.scale.ceil() as u8).clamp(1, 4);
         let numeric_source = raster.as_ref().filter(|source| source.is_numeric()).cloned();
         if let Some(source) = raster.as_ref().filter(|source| !source.is_numeric()) {
             RasterTiles::init()?.register(source)?;
         }
-        if changed {
+        if changed && !retain_numeric {
             self.renderer.style().remove_layer("local-raster-layer");
             self.renderer.style().remove_source("local-raster");
             if let Some(source) = &raster {
@@ -422,6 +430,189 @@ mod tests {
 
     #[test]
     #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
+    fn band_changes_keep_the_outgoing_band_visible_then_crossfade() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("bands.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 4)?;
+        let sources = RasterSource::open(&path)?;
+        let viewport = Viewport {
+            width: NonZeroU32::new(512).unwrap(),
+            height: NonZeroU32::new(512).unwrap(),
+            scale: 1.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::fit_bounds(sources[0].metadata().bounds, 512.0, 512.0),
+        };
+        let mut map = NativeMap::with_style(
+            viewport,
+            Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##),
+        )?;
+        let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
+        map.set_raster(Some(first), 1.0)?;
+        let first_image = map.render(request)?;
+
+        map.set_raster(Some(sources[1].clone()), 1.0)?;
+        map.apply_request(request);
+        // The first render schedules new tiles, but still draws the old slot.
+        let texture = map.poll_frame()?.context("The outgoing slot must remain renderable")?;
+        let loading = map.readback.read(&texture, &map.device, &map.queue)?;
+        assert_eq!(first_image.as_raw(), loading.as_raw(), "Loading a band must not expose missing tiles");
+
+        // Supersede in-flight work, then restyle only the incoming slot.
+        let third = sources[2].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
+        map.set_raster(Some(sources[2].clone()), 1.0)?;
+        map.set_raster(Some(third), 1.0)?;
+        map.apply_request(request);
+        let texture = map.poll_frame()?.context("Rapid band changes must keep drawing")?;
+        assert_eq!(first_image.as_raw(), map.readback.read(&texture, &map.device, &map.queue)?.as_raw());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut intermediate = false;
+        let mut queued = false;
+        let fourth = sources[3].restyled(inf::colormap::ColorMapPreset::Terrain, (20.0, 180.0))?;
+        let mut previous = *first_image.get_pixel(256, 256);
+        let replacement = loop {
+            ensure!(Instant::now() < deadline, "Replacement band did not become ready");
+            if let Some(texture) = map.poll_frame()? {
+                let image = map.readback.read(&texture, &map.device, &map.queue)?;
+                let pixel = *image.get_pixel(256, 256);
+                if !queued {
+                    assert!(pixel[0] >= previous[0], "Fading must not flash the basemap or reverse direction");
+                }
+                assert_eq!(pixel[3], 255, "Blending two opaque bands must stay opaque");
+                if !map.numeric.borrow().is_loading() {
+                    break image;
+                }
+                intermediate |= pixel != *first_image.get_pixel(256, 256);
+                previous = pixel;
+                if intermediate && !queued {
+                    map.set_raster(Some(sources[3].clone()), 1.0)?;
+                    map.set_raster(Some(fourth.clone()), 1.0)?;
+                    map.apply_request(request);
+                    queued = true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(intermediate, "The shader must produce intermediate band colors, not an atomic swap");
+        assert!(queued, "Exercise selection and styling during an active fade");
+        assert_ne!(first_image.as_raw(), replacement.as_raw(), "The new band must eventually replace the old image");
+        assert_eq!(replacement.as_raw(), map.render(request)?.as_raw());
+
+        // Clearing while a replacement is pending must immediately reveal the map.
+        map.set_raster(Some(sources[0].clone()), 1.0)?;
+        map.apply_request(request);
+        assert!(map.poll_frame()?.is_some());
+        map.set_raster(None, 1.0)?;
+        map.apply_request(request);
+        assert!(map.poll_frame()?.is_some(), "Clearing must not wait for cancelled band jobs");
+        assert!(!map.numeric.borrow().is_loading());
+
+        map.set_raster(Some(fourth), 1.0)?;
+        let reference = map.render(request)?;
+        assert_eq!(replacement.as_raw(), reference.as_raw(), "The latest queued band and style must win");
+        map.numeric.borrow_mut().set_reduce_motion(true);
+        let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
+        map.set_raster(Some(first), 1.0)?;
+        map.apply_request(request);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            ensure!(Instant::now() < deadline, "Reduced-motion band swap did not complete");
+            if let Some(texture) = map.poll_frame()? {
+                let image = map.readback.read(&texture, &map.device, &map.queue)?;
+                assert!(
+                    image.as_raw() == reference.as_raw() || image.as_raw() == first_image.as_raw(),
+                    "Reduced motion must display an endpoint, never an interpolated band"
+                );
+                if !map.numeric.borrow().is_loading() {
+                    assert_eq!(image.as_raw(), first_image.as_raw());
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
+    fn band_fades_blend_independent_nodata_masks_and_opacity() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("nodata-bands.tif");
+        let mut dataset = gdal::DriverManager::get_driver_by_name("GTiff")?.create_with_band_type::<f32, _>(&path, 64, 64, 2)?;
+        dataset.set_geo_transform(&[-10.0, 20.0 / 64.0, 0.0, 10.0, 0.0, -20.0 / 64.0])?;
+        dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(4326)?)?;
+        for nr in 1..=2 {
+            let mut band = dataset.rasterband(nr)?;
+            band.set_no_data_value(Some(-9999.0))?;
+            let values = (0..4096)
+                .map(|ix| match (nr, ix % 64) {
+                    (1, 0..16) | (2, 48..64) => -9999.0,
+                    (1, _) => 64.0,
+                    _ => 192.0,
+                })
+                .collect();
+            band.write((0, 0), (64, 64), &mut gdal::raster::Buffer::new((64, 64), values))?;
+        }
+        dataset.flush_cache()?;
+        drop(dataset);
+        let sources = RasterSource::open(&path)?;
+        let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
+        let second = sources[1].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
+        let viewport = Viewport {
+            width: NonZeroU32::new(256).unwrap(),
+            height: NonZeroU32::new(256).unwrap(),
+            scale: 1.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::fit_bounds(first.metadata().bounds, 256.0, 256.0),
+        };
+        let mut map = NativeMap::with_style(
+            viewport,
+            Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##),
+        )?;
+        map.numeric.borrow_mut().set_reduce_motion(true);
+        map.set_raster(Some(first.clone()), 0.6)?;
+        let outgoing = map.render(request)?;
+        map.set_raster(Some(second.clone()), 0.6)?;
+        let incoming = map.render(request)?;
+        map.set_raster(Some(first), 0.6)?;
+        map.render(request)?;
+        map.numeric.borrow_mut().set_reduce_motion(false);
+        map.set_raster(Some(second), 0.6)?;
+        map.apply_request(request);
+        let a = f32::from(outgoing.get_pixel(128, 128)[0]);
+        let b = f32::from(incoming.get_pixel(128, 128)[0]);
+        assert!(b - a > 50.0, "The fixture needs distinguishable endpoint colors");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut intermediate = false;
+        loop {
+            ensure!(Instant::now() < deadline, "Nodata band fade did not complete");
+            if let Some(texture) = map.poll_frame()? {
+                let image = map.readback.read(&texture, &map.device, &map.queue)?;
+                let blend = ((f32::from(image.get_pixel(128, 128)[0]) - a) / (b - a)).clamp(0.0, 1.0);
+                intermediate |= (0.1..0.9).contains(&blend);
+                for ((actual, old), new) in image.as_raw().iter().zip(outgoing.as_raw()).zip(incoming.as_raw()) {
+                    let expected = f32::from(*old) * (1.0 - blend) + f32::from(*new) * blend;
+                    assert!(
+                        (f32::from(*actual) - expected).abs() <= 3.0,
+                        "Nodata/opacity must blend endpoint colors without a dark dip: {actual} vs {expected}"
+                    );
+                }
+                if !map.numeric.borrow().is_loading() {
+                    assert_eq!(image.as_raw(), incoming.as_raw());
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(intermediate, "Exercise fractional shader blending, not only endpoints");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
     fn custom_raster_respects_native_layer_order_and_band_changes() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("bands.tif");
@@ -461,6 +652,12 @@ mod tests {
         )?)?;
         let covered = map.render(request)?;
         assert_eq!(*covered.get_pixel(128, 128), image::Rgba([0, 255, 0, 255]));
+        map.set_raster(Some(first.clone()), 1.0)?;
+        assert_eq!(
+            *map.render(request)?.get_pixel(128, 128),
+            image::Rgba([0, 255, 0, 255]),
+            "Band changes must preserve the custom layer's position below native layers"
+        );
 
         // The same host API supports explicit insertion before a native layer.
         map.set_raster(None, 1.0)?;

@@ -38,6 +38,13 @@ During continuous range/palette edits, completed frames for the active band are
 displayed even when a newer style is already requested. Intermediate requests
 are coalesced, not used to hide every in-flight frame until dragging stops;
 frames from a different band or viewport are still rejected.
+Numeric band changes retain the custom layer and use two shader inputs. The
+outgoing band's cached tiles stay visible while the incoming band loads, then
+their independently styled colors crossfade over 180 ms. Nodata masks are blended
+in premultiplied alpha, without a basemap flash between opaque pixels. Rapid
+selections replace the loading slot, or queue the latest band until an active
+fade finishes. Reduced motion swaps immediately once the new tiles are ready.
+Initial loads and ordinary navigation still display progressively.
 
 The continuous MapLibre renderer produces a wgpu texture. The current display
 bridge reads that texture through Rust's wgpu API and uploads its pixels through
@@ -57,9 +64,11 @@ devenv shell -- cargo run -- /path/to/elevation.tif /path/to/other.vrt
 
 GeoTIFF/COG, VRT, NetCDF, ASCII grids, and other GDAL-readable raster inputs are
 tiled on demand. PNG/JPEG raster MBTiles can also be opened. Each numeric band
-is selectable independently; the latest opened band becomes active and the map
-fits its geographic extent. **Fit raster** (`Ctrl+0` / `Cmd+0`) returns to that
-extent. **Clear rasters** removes the loaded sources without changing the basemap.
+is selectable independently; the first band of the latest opened raster becomes
+active and the map fits its geographic extent. Switching bands preserves the
+current pan and zoom. `Ctrl+0` / `Cmd+0` explicitly fits the active band's extent.
+Scroll over the band selector to move to the next or previous band without
+opening the dropdown or moving the camera. Selection stops at either end.
 
 Controls float over the top-right of the full-window map. The Layers panel holds
 the band and color-map selectors, legend, and opacity slider. The separate Value
@@ -107,9 +116,11 @@ tiles, scaled for display DPI. The layer selects tiles for the application's
 north-up, unpitched camera and projects them with MapLibre's own matrix. It
 supports wrapped world copies and cached parent-tile fallback during zooming.
 Queued work for obsolete viewports/bands is cancelled. The cache evicts unused
-tiles above 256 entries or 128 MiB, keeping the visible working set even if it
-exceeds that budget. GPU display values use float32 precision; the cursor-value
-inspector still retains the original numeric types at native maximum zoom.
+tiles above 256 entries or 128 MiB per slot, keeping the visible working set even
+if it exceeds that budget. During a band transition, the outgoing cache is
+retained until the fade finishes, then released. GPU display values use float32
+precision; the cursor-value inspector still retains the original numeric types
+at native maximum zoom.
 No tile pyramid, HTTP server, or Tauri runtime is needed.
 
 Image-only PNG/JPEG MBTiles continue through the in-process `raster://` file
