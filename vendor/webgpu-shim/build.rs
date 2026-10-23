@@ -4,12 +4,10 @@ use std::fs;
 use std::path::PathBuf;
 
 const WEBGPU_H_COMMIT_ID: &str = "673658bc2bd70ec39fc55ebe6bb0173cf6d0a603";
-const WEBGPU_H_SHA256_SUM: &str =
-    "a483031c3fed05ea5dd1c74082a71676c46c5b2b820ccca10da515c033efc997";
+const WEBGPU_H_SHA256_SUM: &str = "a483031c3fed05ea5dd1c74082a71676c46c5b2b820ccca10da515c033efc997";
 
 fn main() {
     println!("cargo:rerun-if-changed=wgpu.h");
-    println!("cargo:rerun-if-changed=dep/webgpu-headers/webgpu.h");
 
     let webgpu_h_download_dir = download_webgpu_header();
 
@@ -53,10 +51,7 @@ fn main() {
 
     for (old_name, new_name) in types_to_rename {
         let line = format!("pub type {old_name} = *const crate::{new_name};");
-        builder = builder
-            .blocklist_type(old_name)
-            .blocklist_type(format!("{old_name}Impl"))
-            .raw_line(line);
+        builder = builder.blocklist_type(old_name).blocklist_type(format!("{old_name}Impl")).raw_line(line);
     }
 
     let bindings = builder.generate().expect("Unable to generate bindings");

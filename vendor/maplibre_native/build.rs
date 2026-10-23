@@ -625,7 +625,14 @@ fn build_local(
         println!("cargo:warning=Cloning maplibre-native.");
         clone_repository(respository_dir, name, MLN_REPOSITORY_URL, MLN_COMMIT)?;
     }
-    println!("cargo:rerun-if-changed={}", maplibre_native_dir.as_os_str().to_str().unwrap());
+    // Watching the checkout root includes .git, which submodule updates mutate.
+    // Track the source entries instead so the build does not invalidate itself.
+    for entry in fs::read_dir(&maplibre_native_dir)? {
+        let entry = entry?;
+        if entry.file_name() != ".git" {
+            println!("cargo:rerun-if-changed={}", entry.path().display());
+        }
+    }
 
     // Update submodules
     submodule_update(&maplibre_native_dir)?;

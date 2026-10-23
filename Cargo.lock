@@ -4775,7 +4775,7 @@ dependencies = [
  "sqlite",
  "tempfile",
  "tiler",
- "wgpu 30.0.1",
+ "wgpu 29.0.4",
 ]
 
 [[package]]
