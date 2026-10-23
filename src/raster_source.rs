@@ -387,6 +387,63 @@ mod tests {
     }
 
     #[test]
+    fn mercator_tiles_keep_declared_nodata_transparent() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("nodata.tif");
+        super::test_support::write_raster(&path, 3857, 1)?;
+        let source = RasterSource::open(&path)?.remove(0);
+        let response = source.tile(TileAddress {
+            source: source.id(),
+            tile: Tile { z: 3, x: 3, y: 3 },
+            dpi: 1,
+        })?;
+        let image = image::load_from_memory(response.data.as_ref().context("Missing PNG tile")?)?.to_rgba8();
+        assert_eq!(image.get_pixel(0, 0)[3], 0, "Padding must be transparent");
+        assert_eq!(image.get_pixel(210, 250)[3], 0, "Declared nodata inside the raster must be transparent");
+        assert_eq!(image.get_pixel(250, 250)[3], 255, "Data must remain visible");
+        Ok(())
+    }
+
+    #[test]
+    fn mercator_tiles_without_declared_nodata_keep_padding_transparent_and_zero_opaque() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("no-nodata.tif");
+        let mut dataset = gdal::DriverManager::get_driver_by_name("GTiff")?.create_with_band_type::<f32, _>(&path, 64, 64, 1)?;
+        dataset.set_geo_transform(&[-1_000_000.0, 31_250.0, 0.0, 1_000_000.0, 0.0, -31_250.0])?;
+        dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(3857)?)?;
+        dataset.rasterband(1)?.fill(0.0, None)?;
+        dataset.flush_cache()?;
+        drop(dataset);
+
+        let source = RasterSource::open(&path)?.remove(0);
+        for (z, x, y) in [(3, 3, 3), (2, 1, 1)] {
+            let response = source.tile(TileAddress {
+                source: source.id(),
+                tile: Tile { z, x, y },
+                dpi: 1,
+            })?;
+            let image = image::load_from_memory(response.data.as_ref().context("Missing PNG tile")?)?.to_rgba8();
+            assert_eq!(image.get_pixel(0, 0)[3], 0, "Padding outside the raster must be transparent at zoom {z}");
+            assert_eq!(image.get_pixel(250, 250)[3], 255, "Valid zero pixels must remain opaque at zoom {z}");
+        }
+        let empty = source.tile(TileAddress {
+            source: source.id(),
+            tile: Tile { z: 3, x: 0, y: 0 },
+            dpi: 1,
+        })?;
+        if let Some(data) = empty.data {
+            let image = image::load_from_memory(&data)?.to_rgba8();
+            assert!(
+                image.pixels().all(|pixel| pixel[3] == 0),
+                "Tiles outside the raster must not contain colored padding"
+            );
+        } else {
+            assert!(empty.no_content);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn palette_and_range_changes_invalidate_tile_identity_and_pixels() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("mercator.tif");

@@ -1,3 +1,6 @@
+mod appearance;
+mod bundled_themes;
+mod config;
 mod map_camera;
 mod map_readback;
 mod map_renderer;
@@ -5,8 +8,8 @@ mod map_view;
 mod pixel_info;
 mod raster_panel;
 mod raster_source;
+mod settings;
 
-use gpui_kit::component::Theme;
 use gpui_kit::{App, AppContext, Bounds, QuitMode, Window, WindowBounds, WindowOptions, px, size};
 
 fn main() {
@@ -19,6 +22,7 @@ fn main() {
 
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
         gpui_kit::init(cx);
+        appearance::init(cx);
         map_view::init(cx);
 
         if let Err(error) = create_main_window(cx) {
@@ -55,16 +59,14 @@ fn create_main_window(cx: &mut App) -> anyhow::Result<()> {
 }
 
 fn follow_system_appearance(window: &mut Window, cx: &mut App) {
-    Theme::sync_system_appearance(Some(window), cx);
-    window
-        .observe_window_appearance(|window, cx| Theme::sync_system_appearance(Some(window), cx))
-        .detach();
+    appearance::apply(window, cx);
+    window.observe_window_appearance(appearance::sync_system).detach();
 }
 
 #[cfg(test)]
 mod tests {
     use gpui_kit::TestAppContext;
-    use gpui_kit::component::{ActiveTheme, ThemeMode};
+    use gpui_kit::component::{ActiveTheme, Theme, ThemeMode};
 
     use super::*;
 
@@ -72,6 +74,7 @@ mod tests {
     fn controls_start_with_the_system_appearance(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
+            appearance::setup_test(None, cx);
             Theme::change(ThemeMode::Dark, None, cx);
         });
         cx.add_window(|window, cx| {

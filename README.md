@@ -64,8 +64,17 @@ immediately while dragging or editing a valid range; invalid edits keep the last
 valid range on the map.
 **Reset** restores the band's data range. Collapse the controls with the header
 button or `Ctrl+L` / `Cmd+L` without changing the map viewport.
-Native controls follow the system light/dark appearance, including changes while
-the app is open; the Dark Matter basemap stays dark.
+Press `Ctrl+,` / `Cmd+,` to open Settings and choose System, Light, or Dark appearance
+and separate light and dark themes, using the same bundled themes as TopQ.
+Changes apply immediately and are saved in the platform configuration directory
+(`$XDG_CONFIG_HOME/map/config.json`, or `~/.config/map/config.json` on Linux).
+Like TopQ, saves merge into that JSON object and preserve unrelated settings.
+Read-only configuration (including Nix-managed symlinks) uses a writable override
+at `$XDG_STATE_HOME/map/config.json`, or `~/.local/state/map/config.json` when unset.
+An existing state override takes precedence for both reads and writes. Files are
+replaced atomically; malformed configuration is never overwritten.
+System mode follows appearance changes while the app is open. The Dark Matter
+basemap stays dark. Escape closes Settings and returns focus to the previous control.
 
 Change opacity to compare the raster with the basemap. The legend reflects the applied
 range; nodata is transparent. Initial ranges use GDAL's approximate band

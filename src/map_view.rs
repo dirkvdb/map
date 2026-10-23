@@ -21,6 +21,7 @@ gpui_kit::actions!(map, [ZoomIn, ZoomOut, PanLeft, PanRight, PanUp, PanDown]);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("secondary-,", crate::settings::OpenSettings, Some("RasterWorkspace")),
         KeyBinding::new("secondary-o", OpenRaster, Some("RasterWorkspace")),
         KeyBinding::new("secondary-0", FitRaster, Some("RasterWorkspace")),
         KeyBinding::new("secondary-l", ToggleRasterControls, Some("RasterWorkspace")),
@@ -460,6 +461,11 @@ impl Render for MapView {
         div()
             .id("raster-workspace")
             .key_context("RasterWorkspace")
+            .on_action(cx.listener(|view, _: &crate::settings::OpenSettings, window, cx| {
+                view.coast = None;
+                view.drag = None;
+                crate::settings::open(window, cx);
+            }))
             .on_action(cx.listener(|view, _: &OpenRaster, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx))))
             .on_action(cx.listener(|view, _: &FitRaster, _, cx| view.raster_panel.update(cx, |panel, cx| panel.fit(cx))))
             .on_action(cx.listener(|view, _: &ClearRasters, window, cx| view.raster_panel.update(cx, |panel, cx| panel.clear(window, cx))))
@@ -492,6 +498,116 @@ mod tests {
     use gpui_kit::{AppContext, InputEvent as _, TestAppContext, point, px, size};
 
     use super::*;
+
+    #[gpui_kit::test]
+    fn settings_shortcut_changes_appearance_and_escape_restores_map_focus(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::appearance::setup_test(Some(path.clone()), cx);
+            init(cx);
+        });
+        let mut view = None;
+        let handle = cx.open_window(size(px(640.), px(400.)), |window, cx| {
+            crate::appearance::apply(window, cx);
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("open-settings").is_none());
+            window.press("secondary-,", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("appearance-mode").visible());
+            window.click("appearance-mode", cx);
+            window.press("up", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(crate::appearance::Appearance::mode(cx), crate::appearance::AppearanceMode::Dark);
+            assert_eq!(cx.theme().mode, gpui_kit::component::ThemeMode::Dark);
+            assert_eq!(window.find("appearance-mode").label(), Some("Mode: Dark"));
+            assert!(window.find("dark-theme").visible());
+            assert!(window.find("light-theme").visible());
+            assert_eq!(window.find("dark-theme").bounds().left(), window.find("light-theme").bounds().left());
+            assert_eq!(window.find("dark-theme").bounds().right(), window.find("light-theme").bounds().right());
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["mode"],
+                "dark"
+            );
+            window.click("dark-theme", cx);
+            window.press("up", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let expected = gpui_kit::component::ThemeRegistry::global(cx)
+                .sorted_themes()
+                .into_iter()
+                .rfind(|theme| theme.mode.is_dark())
+                .unwrap()
+                .name
+                .clone();
+            assert_eq!(cx.theme().theme_name(), &expected);
+            window.click("light-theme", cx);
+            window.press("up", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let expected = gpui_kit::component::ThemeRegistry::global(cx)
+                .sorted_themes()
+                .into_iter()
+                .rfind(|theme| !theme.mode.is_dark())
+                .unwrap()
+                .name
+                .clone();
+            assert_eq!(
+                crate::appearance::Appearance::selected_theme(gpui_kit::component::ThemeMode::Light, cx),
+                expected.as_str()
+            );
+            assert!(cx.theme().mode.is_dark(), "Choosing an inactive theme must not switch appearance");
+            window.click("appearance-mode", cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("appearance-mode").visible(), "Escape must dismiss the menu before the sheet");
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("appearance-mode").is_none());
+            assert!(view.read(cx).focus.is_focused(window));
+            let before = view.read(cx).camera;
+            window.press("+", cx);
+            assert_ne!(view.read(cx).camera, before);
+        })
+        .unwrap();
+    }
 
     #[gpui_kit::test]
     fn mouse_move_reads_the_active_band_and_hides_info_over_controls(cx: &mut TestAppContext) {
