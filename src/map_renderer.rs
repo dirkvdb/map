@@ -8,14 +8,27 @@ use anyhow::{Context as _, Result, ensure};
 use gpui_kit::RenderImage;
 #[cfg(test)]
 use image::RgbaImage;
-use maplibre_native::{AnyLayer, AnySource, Continuous, ImageRenderer, ImageRendererBuilder, RunLoopHandle, Size};
+use maplibre_native::{AnyLayer, AnySource, Continuous, ImageRenderer, ImageRendererBuilder, RunLoopHandle, Size, WgpuCustomLayer, WgpuLayerParameters};
 
 use crate::map_camera::MapCamera;
 use crate::map_readback::GpuReadback;
 use crate::raster_layer::{RasterLayer, RasterLayerHost};
 use crate::raster_source::{RasterSource, RasterTiles};
 
-pub const STYLE_URL: &str = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasemapStyle {
+    Light,
+    Dark,
+}
+
+impl BasemapStyle {
+    pub fn style_url(self) -> &'static str {
+        match self {
+            Self::Light => "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+            Self::Dark => "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct Viewport {
@@ -32,6 +45,7 @@ pub struct MapRequest {
 
 pub struct MapFrame {
     pub viewport: Viewport,
+    pub basemap: BasemapStyle,
     pub raster_layer_id: Option<tiler::LayerId>,
     pub image: Result<Arc<RenderImage>>,
 }
@@ -42,6 +56,7 @@ struct RenderRequest {
     raster: Option<Arc<RasterSource>>,
     opacity: f32,
     reduce_motion: bool,
+    basemap: BasemapStyle,
 }
 
 pub struct MapRenderer {
@@ -65,13 +80,14 @@ impl MapRenderer {
         Ok(Self { sender, frames })
     }
 
-    pub fn render_raster(&self, map: MapRequest, raster: Option<Arc<RasterSource>>, opacity: f32, reduce_motion: bool) -> Result<()> {
+    pub fn render_raster(&self, map: MapRequest, raster: Option<Arc<RasterSource>>, opacity: f32, reduce_motion: bool, basemap: BasemapStyle) -> Result<()> {
         self.sender
             .send(RenderRequest {
                 map,
                 raster,
                 opacity,
                 reduce_motion,
+                basemap,
             })
             .context("Map rendering thread stopped")?;
         Ok(())
@@ -79,7 +95,7 @@ impl MapRenderer {
 
     #[cfg(test)]
     pub fn render(&self, request: MapRequest) -> Result<()> {
-        self.render_raster(request, None, 1.0, false)
+        self.render_raster(request, None, 1.0, false, BasemapStyle::Dark)
     }
 
     pub fn frames(&self) -> async_channel::Receiver<MapFrame> {
@@ -120,6 +136,7 @@ fn run_renderer(requests: mpsc::Receiver<RenderRequest>, frames: async_channel::
         };
         let frame = MapFrame {
             viewport: current_request.map.viewport,
+            basemap: current_request.basemap,
             raster_layer_id: current_request.raster.as_ref().map(|source| source.metadata().id),
             image,
         };
@@ -150,12 +167,13 @@ fn receive_latest_request(requests: &mpsc::Receiver<RenderRequest>, timeout: Opt
 
 fn poll_map_image(map: &mut Option<NativeMap>, request: &RenderRequest, mut request_changed: bool, next_frame: Instant) -> Result<Option<Arc<RenderImage>>> {
     if map.as_ref().is_none_or(|map| map.viewport.scale != request.map.viewport.scale) {
-        *map = Some(NativeMap::new(request.map.viewport)?);
+        *map = Some(NativeMap::with_basemap(request.map.viewport, request.basemap)?);
         request_changed = true;
     }
     let map = map.as_mut().context("Map renderer unavailable")?;
     if request_changed {
         map.numeric.borrow_mut().set_reduce_motion(request.reduce_motion);
+        map.set_basemap(request.basemap)?;
         map.set_raster(request.raster.clone(), request.opacity)?;
         map.apply_request(request.map);
     }
@@ -167,8 +185,20 @@ fn poll_map_image(map: &mut Option<NativeMap>, request: &RenderRequest, mut requ
     Ok(Some(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]))))
 }
 
+// Style reloads deinitialize native hosts, but this renderer keeps the same
+// device and owns the raster state. Let source changes or NativeMap's drop free
+// that state instead, retaining numeric tiles and in-flight jobs across reloads.
+struct RetainedRasterLayerHost(RasterLayerHost);
+
+impl WgpuCustomLayer for RetainedRasterLayerHost {
+    fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
+        self.0.render(pass, parameters);
+    }
+}
+
 struct NativeMap {
     renderer: ImageRenderer<Continuous>,
+    basemap: BasemapStyle,
     viewport: Viewport,
     camera: Option<MapCamera>,
     device: wgpu::Device,
@@ -185,11 +215,21 @@ struct NativeMap {
 }
 
 impl NativeMap {
+    #[cfg(test)]
     fn new(viewport: Viewport) -> Result<Self> {
-        Self::with_style(viewport, None)
+        Self::with_basemap(viewport, BasemapStyle::Dark)
     }
 
+    fn with_basemap(viewport: Viewport, basemap: BasemapStyle) -> Result<Self> {
+        Self::with_style_source(viewport, basemap, None)
+    }
+
+    #[cfg(test)]
     fn with_style(viewport: Viewport, json: Option<&str>) -> Result<Self> {
+        Self::with_style_source(viewport, BasemapStyle::Dark, json)
+    }
+
+    fn with_style_source(viewport: Viewport, basemap: BasemapStyle, json: Option<&str>) -> Result<Self> {
         RasterTiles::init()?;
         // The wgpu FFI backend requires a host-supplied device and queue. This
         // initialization can later accept GPUI's device instead of creating one.
@@ -220,16 +260,10 @@ impl NativeMap {
             let needs_frame = needs_frame.clone();
             move || needs_frame.set(true)
         });
-        let run_loop = RunLoopHandle::current();
-        let style = match json {
-            Some(json) => renderer.load_style_from_json_str(json),
-            None => renderer.load_style_from_url(&STYLE_URL.parse()?),
-        };
-        wait_until_ready(&run_loop, Instant::now() + Duration::from_secs(30), || style.is_ready())?;
-        style.finish().context("Could not load the vector map style")?;
         let numeric = Rc::new(RefCell::new(RasterLayer::new(device.clone(), queue.clone())?));
-        Ok(Self {
+        let mut map = Self {
             renderer,
+            basemap,
             viewport,
             camera: None,
             readback: GpuReadback::new(&device),
@@ -243,7 +277,37 @@ impl NativeMap {
             numeric,
             #[cfg(test)]
             camera_updates: 0,
-        })
+        };
+        map.load_style(basemap, json)?;
+        Ok(map)
+    }
+
+    fn set_basemap(&mut self, basemap: BasemapStyle) -> Result<()> {
+        if self.basemap != basemap {
+            self.load_style(basemap, None)?;
+        }
+        Ok(())
+    }
+
+    fn load_style(&mut self, basemap: BasemapStyle, json: Option<&str>) -> Result<()> {
+        self.idle.set(false);
+        let run_loop = RunLoopHandle::current();
+        let style = match json {
+            Some(json) => self.renderer.load_style_from_json_str(json),
+            None => self.renderer.load_style_from_url(&basemap.style_url().parse()?),
+        };
+        wait_until_ready(&run_loop, Instant::now() + Duration::from_secs(30), || style.is_ready())?;
+        style.finish().context("Could not load the vector map style")?;
+        self.basemap = basemap;
+        // Loading a style removes its sources and layers, not the native camera.
+        // Reset only attachment bookkeeping so set_raster reinstalls either kind
+        // of overlay without clearing the retained numeric state.
+        let raster = self.raster.take();
+        self.set_raster(raster, self.opacity)?;
+        self.idle.set(false);
+        self.needs_frame.set(true);
+        self.deadline = Instant::now() + Duration::from_secs(30);
+        Ok(())
     }
 
     fn set_raster(&mut self, raster: Option<Arc<RasterSource>>, opacity: f32) -> Result<()> {
@@ -263,9 +327,11 @@ impl NativeMap {
             self.renderer.style().remove_source("local-raster");
             if let Some(source) = &raster {
                 if source.is_numeric() {
-                    self.renderer
-                        .style()
-                        .add_wgpu_custom_layer("local-raster-layer", RasterLayerHost::new(self.numeric.clone()), None)?;
+                    self.renderer.style().add_wgpu_custom_layer(
+                        "local-raster-layer",
+                        RetainedRasterLayerHost(RasterLayerHost::new(self.numeric.clone())),
+                        None,
+                    )?;
                 } else {
                     self.renderer
                         .style()
@@ -357,6 +423,135 @@ fn wait_until_ready(run_loop: &RunLoopHandle, deadline: Instant, is_ready: impl 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DARK_STYLE: &str = r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##;
+    const LIGHT_STYLE: &str =
+        r##"{"version":8,"center":[120,45],"zoom":12,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#f0f0f0"}}]}"##;
+
+    #[test]
+    fn basemap_style_urls() {
+        assert_eq!(
+            [BasemapStyle::Light.style_url(), BasemapStyle::Dark.style_url()],
+            [
+                "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+                "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
+    fn basemap_reload_preserves_camera_and_cached_numeric_raster() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("raster.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 1)?;
+        let source = RasterSource::open(&path)?.remove(0);
+        let viewport = Viewport {
+            width: NonZeroU32::new(512).unwrap(),
+            height: NonZeroU32::new(512).unwrap(),
+            scale: 1.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::fit_bounds(source.metadata().bounds, 512.0, 512.0),
+        };
+        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
+        let dark_background = map.render(request)?;
+        map.set_raster(Some(source.clone()), 0.65)?;
+        let dark_raster = map.render(request)?;
+        let numeric = map.numeric.clone();
+        let device = map.device.clone();
+        let counts = numeric.borrow().tile_counts();
+        let camera_updates = map.camera_updates;
+        assert!(counts.0 > 0 && counts.1 > 0);
+        assert_ne!(dark_raster.as_raw(), dark_background.as_raw());
+        // A reload must reuse uploaded tiles even when their file is unavailable.
+        std::fs::rename(&path, path.with_extension("cached.tif"))?;
+
+        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
+        assert_eq!(map.basemap, BasemapStyle::Light);
+        assert!(map.camera == Some(request.camera));
+        assert_eq!(map.device, device);
+        assert!(Rc::ptr_eq(&map.numeric, &numeric));
+        let light_raster = map.render(request)?;
+        assert_ne!(
+            light_raster.as_raw(),
+            dark_raster.as_raw(),
+            "The new basemap must be visible through the overlay"
+        );
+        assert_eq!(numeric.borrow().tile_counts(), counts, "Reloading must not request or upload numeric tiles");
+
+        // Requesting the current basemap must not replace the offline style.
+        map.set_basemap(BasemapStyle::Light)?;
+        map.load_style(BasemapStyle::Dark, Some(DARK_STYLE))?;
+        assert_eq!(
+            map.render(request)?.as_raw(),
+            dark_raster.as_raw(),
+            "A round trip must preserve the native camera and overlay"
+        );
+        assert_eq!(map.camera_updates, camera_updates);
+        assert_eq!(numeric.borrow().tile_counts(), counts);
+
+        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
+        map.set_raster(None, 1.0)?;
+        let light_background = map.render(request)?;
+        assert!(light_background.pixels().all(|pixel| pixel.0 == [240, 240, 240, 255]));
+        let covered = light_raster.pixels().zip(light_background.pixels()).filter(|(a, b)| a != b).count();
+        assert!(
+            covered > 25_000,
+            "The numeric overlay must be reattached above the light basemap, got {covered} pixels"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
+    fn basemap_reload_reattaches_color_raster_source_and_layer() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("image.mbtiles");
+        let db = sqlite::Connection::new(&path, sqlite::AccessMode::Create)?;
+        db.execute_sql_statements(
+            "CREATE TABLE metadata (name TEXT, value TEXT);
+            INSERT INTO metadata VALUES ('format','png'), ('bounds','-180,-85,180,85'), ('minzoom','0'), ('maxzoom','0');
+            CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);",
+        )?;
+        let mut png = std::io::Cursor::new(Vec::new());
+        RgbaImage::from_pixel(256, 256, image::Rgba([0, 255, 0, 255])).write_to(&mut png, image::ImageFormat::Png)?;
+        let mut insert = db.prepare_statement("INSERT INTO tiles VALUES (0,0,0,?1) RETURNING zoom_level")?;
+        insert.bind_blob(1, png.get_ref())?;
+        ensure!(insert.next().is_some(), "Could not create fixture tile: {}", db.last_error());
+        drop(insert);
+        drop(db);
+        let source = RasterSource::open(&path)?.remove(0);
+        assert!(!source.is_numeric());
+        let viewport = Viewport {
+            width: NonZeroU32::new(256).unwrap(),
+            height: NonZeroU32::new(256).unwrap(),
+            scale: 1.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::default(),
+        };
+        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
+        map.set_raster(Some(source), 1.0)?;
+        let before = map.render(request)?;
+        assert_eq!(before.get_pixel(128, 128).0, [0, 255, 0, 255]);
+        let camera_updates = map.camera_updates;
+
+        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
+        let after = map.render(request)?;
+        assert_eq!(
+            after.as_raw(),
+            before.as_raw(),
+            "The color source and layer must survive a basemap change at the same camera"
+        );
+        assert_eq!(map.camera_updates, camera_updates);
+        map.set_raster(None, 1.0)?;
+        let cleared = map.render(request)?;
+        assert!(cleared.pixels().all(|pixel| pixel.0 == [240, 240, 240, 255]));
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]

@@ -22,9 +22,9 @@ This first build takes longer than subsequent cached builds. On macOS, a checked
 native-source patch removes MapLibre's unused Swift compiler probe; the core
 build uses devenv's Apple SDK and does not require a separate Swift toolchain.
 
-The app uses [CARTO Dark Matter](https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json),
-the same dark vector basemap as the `maplibre-raster-layer` playground. Internet
-access is required for the style, tiles, and fonts.
+The vector basemap follows the active appearance: [CARTO Positron](https://basemaps.cartocdn.com/gl/positron-gl-style/style.json)
+for light themes and [CARTO Dark Matter](https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json)
+for dark themes. Internet access is required for the styles, tiles, and fonts.
 
 The initial view shows a world map with mouse and keyboard navigation.
 Zooming keeps the geographic point under the pointer in place.
@@ -82,8 +82,11 @@ immediately while dragging or editing a valid range; invalid edits keep the last
 valid range on the map.
 **Reset** restores the band's data range. Collapse the controls with the header
 button or `Ctrl+L` / `Cmd+L` without changing the map viewport.
-Press `Ctrl+,` / `Cmd+,` to open Settings and choose System, Light, or Dark appearance
-and separate light and dark themes, using the same bundled themes as TopQ.
+Press `Ctrl+,` / `Cmd+,` to open the centered Settings dialog. Choose Light, Dark,
+or Follow system with visual mode previews, then choose from separate Light themes
+and Dark themes preview grids. Light and dark themes are remembered separately, using the
+same bundled themes as TopQ. Choosing a theme follows its light/dark appearance
+unless Follow system is selected.
 Changes apply immediately and are saved in the platform configuration directory
 (`$XDG_CONFIG_HOME/map/config.json`, or `~/.config/map/config.json` on Linux).
 Like TopQ, saves merge into that JSON object and preserve unrelated settings.
@@ -91,8 +94,9 @@ Read-only configuration (including Nix-managed symlinks) uses a writable overrid
 at `$XDG_STATE_HOME/map/config.json`, or `~/.local/state/map/config.json` when unset.
 An existing state override takes precedence for both reads and writes. Files are
 replaced atomically; malformed configuration is never overwritten.
-System mode follows appearance changes while the app is open. The Dark Matter
-basemap stays dark. Escape closes Settings and returns focus to the previous control.
+System mode follows appearance changes while the app is open, including the light/dark
+basemap. Switching basemaps preserves the camera and raster overlay.
+Escape closes Settings and returns focus to the previous control.
 
 Change opacity to compare the raster with the basemap. The legend reflects the applied
 range; nodata is transparent. Initial ranges use GDAL's approximate band
@@ -176,6 +180,7 @@ devenv shell -- cargo fmt --check
 devenv shell -- cargo clippy --all-targets --locked -- -D warnings
 devenv shell -- cargo test --locked
 devenv shell -- cargo test local_raster_tiles_render_restyle_and_clear_without_network -- --ignored --nocapture
+devenv shell -- cargo test basemap_reload -- --ignored --nocapture --test-threads=1
 devenv shell -- cargo test custom_raster_respects_native_layer_order_and_band_changes -- --ignored --nocapture
 devenv shell -- cargo test byte_values_render_opaque_including_173_and_174 -- --ignored --nocapture
 devenv shell -- cargo test landuse_water_values_render_opaque_over_the_basemap -- --ignored --nocapture
@@ -193,6 +198,8 @@ contains more than a flat background.
 The synthetic local-raster GPU tests are offline. They check nodata/footprint alignment,
 band switching, native layer ordering, palette/range updates with unchanged tile
 request/upload counts (even after moving the source file), opacity, and clearing.
+The basemap reload tests verify light/dark switching preserves the camera, cached
+numeric tiles, and both numeric and already-colored raster overlays.
 An additional test uses the land-use fixture and vector basemap to verify that
 valid water classes 173/174 are not hidden by the basemap's depth buffer.
 The headless UI integration tests also cover continuous slider dragging while

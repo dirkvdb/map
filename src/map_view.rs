@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::{ActiveTheme, Disableable, Sizable, TitleBar, alert::Alert};
+use gpui_kit::component::{ActiveTheme, Disableable, Sizable, Theme, TitleBar, alert::Alert};
 use gpui_kit::{
     App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, Entity, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyBinding, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
@@ -14,7 +14,7 @@ use gpui_kit::{
 };
 
 use crate::map_camera::MapCamera;
-use crate::map_renderer::{MapFrame, MapRenderer, MapRequest, Viewport};
+use crate::map_renderer::{BasemapStyle, MapFrame, MapRenderer, MapRequest, Viewport};
 use crate::pixel_info::PixelInfo;
 use crate::raster_panel::{ClearRasters, FitRaster, OpenRaster, RasterPanel, ToggleRasterControls};
 use crate::raster_source::RasterSource;
@@ -110,11 +110,15 @@ impl MapCoast {
     }
 }
 
+fn basemap_style(cx: &App) -> BasemapStyle {
+    if cx.theme().mode.is_dark() { BasemapStyle::Dark } else { BasemapStyle::Light }
+}
+
 pub struct MapView {
     viewport: Option<Viewport>,
     bounds: Option<Bounds<Pixels>>,
     camera: MapCamera,
-    requested: Option<(MapRequest, Option<u64>, f32, bool)>,
+    requested: Option<(MapRequest, Option<u64>, f32, bool, BasemapStyle)>,
     raster_panel: Entity<RasterPanel>,
     pixel_info: Entity<PixelInfo>,
     pointer: Option<Point<Pixels>>,
@@ -123,6 +127,7 @@ pub struct MapView {
     fit_pending: bool,
     _raster_subscription: Subscription,
     _raster_observation: Subscription,
+    _theme_observation: Subscription,
     renderer: Option<MapRenderer>,
     drag: Option<MapDrag>,
     coast: Option<MapCoast>,
@@ -140,6 +145,7 @@ impl MapView {
         let task = Self::watch_frames(&renderer, cx);
         let raster_panel = cx.new(|cx| RasterPanel::new(window, cx));
         let raster_observation = cx.observe(&raster_panel, |_, _, cx| cx.notify());
+        let theme_observation = cx.observe_global::<Theme>(|view, cx| view.request_render(cx));
         let raster_subscription = cx.subscribe(&raster_panel, |view, _, event: &crate::raster_panel::RasterEvent, cx| {
             view.raster = event.source();
             view.opacity = event.opacity();
@@ -170,6 +176,7 @@ impl MapView {
             fit_pending: false,
             _raster_subscription: raster_subscription,
             _raster_observation: raster_observation,
+            _theme_observation: theme_observation,
             renderer: Some(renderer),
             drag: None,
             coast: None,
@@ -209,7 +216,10 @@ impl MapView {
         // The worker completes frames in order. Show progress for this band
         // even if another range/palette update arrived while it was rendering;
         // requiring an exact style revision starves the display during dragging.
-        if self.viewport != Some(frame.viewport) || self.raster.as_ref().map(|source| source.metadata().id) != frame.raster_layer_id {
+        if self.viewport != Some(frame.viewport)
+            || frame.basemap != basemap_style(cx)
+            || self.raster.as_ref().map(|source| source.metadata().id) != frame.raster_layer_id
+        {
             return;
         }
         match frame.image {
@@ -235,7 +245,8 @@ impl MapView {
         };
         let request = MapRequest { viewport, camera: self.camera };
         let reduce_motion = cx.reduce_motion();
-        let key = (request, self.raster.as_ref().map(|source| source.id()), self.opacity, reduce_motion);
+        let basemap = basemap_style(cx);
+        let key = (request, self.raster.as_ref().map(|source| source.id()), self.opacity, reduce_motion, basemap);
         if self.requested == Some(key) {
             return;
         }
@@ -244,7 +255,7 @@ impl MapView {
             return;
         };
         self.error = None;
-        if let Err(error) = renderer.render_raster(request, self.raster.clone(), self.opacity, reduce_motion) {
+        if let Err(error) = renderer.render_raster(request, self.raster.clone(), self.opacity, reduce_motion, basemap) {
             self.error = Some(format!("Couldn’t load the map. {error}").into());
         }
         cx.notify();
@@ -560,6 +571,90 @@ mod tests {
     use super::*;
 
     #[gpui_kit::test]
+    fn appearance_changes_update_the_basemap_and_reject_obsolete_frames(cx: &mut TestAppContext) {
+        use crate::appearance::{self, AppearanceMode};
+
+        let directory = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            appearance::setup_test(Some(directory.path().join("appearance.json")), cx);
+        });
+        let mut view = None;
+        let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
+            appearance::select_mode(AppearanceMode::Dark, window, cx).unwrap();
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.run_until_parked();
+        let camera = cx.update(|cx| {
+            let map = view.read(cx);
+            assert_eq!(map.requested.unwrap().4, BasemapStyle::Dark);
+            map.camera
+        });
+
+        for mode in [AppearanceMode::Light, AppearanceMode::Dark, AppearanceMode::System] {
+            cx.update_window(handle.into(), |_, window, cx| {
+                appearance::select_mode(mode, window, cx).unwrap();
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                let expected = match mode {
+                    AppearanceMode::Light => BasemapStyle::Light,
+                    AppearanceMode::Dark => BasemapStyle::Dark,
+                    AppearanceMode::System => {
+                        if gpui_kit::component::ThemeMode::from(window.appearance()).is_dark() {
+                            BasemapStyle::Dark
+                        } else {
+                            BasemapStyle::Light
+                        }
+                    }
+                };
+                view.update(cx, |map, cx| {
+                    assert_eq!(map.requested.unwrap().4, expected);
+                    assert_eq!(map.camera, camera);
+                    let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
+                    map.apply_frame(
+                        MapFrame {
+                            viewport: map.viewport.unwrap(),
+                            basemap: expected,
+                            raster_layer_id: None,
+                            image: Ok(image.clone()),
+                        },
+                        window,
+                        cx,
+                    );
+                    map.apply_frame(
+                        MapFrame {
+                            viewport: map.viewport.unwrap(),
+                            basemap: if expected == BasemapStyle::Light {
+                                BasemapStyle::Dark
+                            } else {
+                                BasemapStyle::Light
+                            },
+                            raster_layer_id: None,
+                            image: Err(anyhow::anyhow!("Obsolete basemap failed")),
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(Arc::ptr_eq(map.image.as_ref().unwrap(), &image));
+                    assert!(map.error.is_none(), "Obsolete basemap errors must not replace the current map");
+                });
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
     fn closing_a_raster_error_does_not_drag_the_map(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let directory = tempfile::tempdir().unwrap();
@@ -626,6 +721,7 @@ mod tests {
                 view.apply_frame(
                     MapFrame {
                         viewport: view.viewport.unwrap(),
+                        basemap: basemap_style(cx),
                         raster_layer_id: None,
                         image: Err(anyhow::anyhow!("Network unavailable")),
                     },
@@ -646,6 +742,7 @@ mod tests {
                 view.apply_frame(
                     MapFrame {
                         viewport: view.viewport.unwrap(),
+                        basemap: basemap_style(cx),
                         raster_layer_id: None,
                         image: Ok(Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]))),
                     },
@@ -781,7 +878,218 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn settings_dialog_is_centered_and_dismissal_restores_map_focus(cx: &mut TestAppContext) {
+        use gpui_kit::ElementId;
+
+        fn assert_preview_layout(card: Bounds<Pixels>, preview: Bounds<Pixels>, label: Bounds<Pixels>, context: &str) {
+            for (part, bounds) in [("preview", preview), ("label", label)] {
+                assert!(
+                    bounds.size.width > px(0.) && bounds.size.height > px(0.),
+                    "{context}: {part} must have nonzero geometry, got {bounds:?}"
+                );
+                assert!(
+                    bounds.left() >= card.left() && bounds.right() <= card.right() && bounds.top() >= card.top() && bounds.bottom() <= card.bottom(),
+                    "{context}: {part} {bounds:?} must be contained in card {card:?}"
+                );
+            }
+            assert!(
+                preview.bottom() <= label.top(),
+                "{context}: preview {preview:?} must stack above label {label:?} without overlap"
+            );
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::appearance::setup_test(None, cx);
+            init(cx);
+        });
+        for (viewport, escape, font_size) in [
+            (size(px(640.), px(400.)), false, None),
+            (size(px(1000.), px(800.)), true, None),
+            (size(px(640.), px(400.)), true, Some(px(32.))),
+        ] {
+            let mut view = None;
+            let handle = cx.open_window(viewport, |window, cx| {
+                crate::appearance::apply(window, cx);
+                if let Some(font_size) = font_size {
+                    Theme::update(cx, |theme| theme.font_size = font_size);
+                }
+                let map = cx.new(|cx| {
+                    let mut map = MapView::new(window, cx);
+                    map.renderer = None;
+                    map._frames_task = None;
+                    map
+                });
+                view = Some(map.clone());
+                gpui_kit::base::Root::new(map, window, cx)
+            });
+            let view = view.unwrap();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.press("secondary-,", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let bounds = window.find(0_usize).bounds();
+                assert!((bounds.center().x - viewport.width / 2.).abs() <= px(1.));
+                assert!((bounds.center().y - viewport.height / 2.).abs() <= px(1.));
+                assert!(bounds.left() >= px(0.) && bounds.right() <= viewport.width);
+                assert!(bounds.top() >= px(0.) && bounds.bottom() <= viewport.height);
+                assert!(window.find("appearance-settings").visible());
+                let done = window.find("settings-done");
+                assert!(done.visible());
+                assert!(done.bounds().left() >= bounds.left() && done.bounds().right() <= bounds.right());
+                assert!(done.bounds().top() >= bounds.top() && done.bounds().bottom() <= bounds.bottom());
+                if let Some(font_size) = font_size {
+                    assert_eq!(cx.theme().font_size, font_size);
+                    assert_eq!(window.rem_size(), font_size, "The zoom case must exercise Root's rem scaling");
+                }
+                let layout = format!("viewport {viewport:?}, font {:?}", window.rem_size());
+                let mut mode_bounds = Vec::<Bounds<Pixels>>::new();
+                for id in ["mode-light", "mode-dark", "mode-system"] {
+                    let mode = window.find(id).bounds();
+                    assert!(
+                        mode.size.width > px(0.) && mode.size.height > px(0.),
+                        "Mode card {id} must have nonzero geometry"
+                    );
+                    assert!(mode.left() >= bounds.left() && mode.right() <= bounds.right());
+                    let scope = window.within(id);
+                    assert_preview_layout(
+                        mode,
+                        scope.find("mode-preview").bounds(),
+                        scope.find("mode-label").bounds(),
+                        &format!("Mode {id}, {layout}"),
+                    );
+                    for previous in &mode_bounds {
+                        assert!(
+                            mode.left() >= previous.right()
+                                || mode.right() <= previous.left()
+                                || mode.top() >= previous.bottom()
+                                || mode.bottom() <= previous.top(),
+                            "Mode cards must wrap without overlapping at {viewport:?}, font {font_size:?}"
+                        );
+                    }
+                    mode_bounds.push(mode);
+                }
+                let themes = gpui_kit::component::ThemeRegistry::global(cx).sorted_themes();
+                let light_themes = themes.iter().filter(|theme| !theme.mode.is_dark()).collect::<Vec<_>>();
+                let first = window.find((ElementId::from("theme"), light_themes[0].name.clone())).bounds();
+                let second = window.find((ElementId::from("theme"), light_themes[1].name.clone())).bounds();
+                let last_light = light_themes
+                    .iter()
+                    .map(|theme| window.find((ElementId::from("theme"), theme.name.clone())).bounds().bottom())
+                    .fold(first.bottom(), |bottom, next| bottom.max(next));
+                let first_dark = themes.iter().find(|theme| theme.mode.is_dark()).unwrap();
+                let first_dark = window.find((ElementId::from("theme"), first_dark.name.clone())).bounds();
+                assert!(first_dark.top() > last_light, "Dark themes must have their own section below all light themes");
+                for mode in &mode_bounds {
+                    assert!(first.top() >= mode.bottom(), "The theme grid must remain below the mode choices after wrapping");
+                }
+                if font_size.is_some() {
+                    assert!(second.top() >= first.bottom(), "At high zoom the narrow grid must reflow to a single column");
+                    assert!((first.left() - second.left()).abs() <= px(1.));
+                    assert!((first.right() - second.right()).abs() <= px(1.));
+                } else {
+                    assert!(
+                        (first.top() - second.top()).abs() <= px(1.),
+                        "At normal zoom theme cards should share a grid row"
+                    );
+                    assert!(first.right() <= second.left(), "Adjacent theme cards must not overlap");
+                }
+                let mut card_bounds = Vec::<Bounds<Pixels>>::new();
+                for theme in themes {
+                    let card = window.find((ElementId::from("theme"), theme.name.clone()));
+                    let label = format!("{}, {} theme", theme.name, if theme.mode.is_dark() { "Dark" } else { "Light" });
+                    assert_eq!(card.label(), Some(label.as_str()));
+                    assert_eq!(card.selected(), Some(&theme.name == cx.theme().theme_name()));
+                    let (section, other_section) = if theme.mode.is_dark() {
+                        ("dark-themes", "light-themes")
+                    } else {
+                        ("light-themes", "dark-themes")
+                    };
+                    let id = (ElementId::from("theme"), theme.name.clone());
+                    assert!(
+                        window.within(section).try_find(id.clone()).is_some(),
+                        "Each section must contain only its matching themes"
+                    );
+                    assert!(window.within(other_section).try_find(id).is_none());
+                    let card = card.bounds();
+                    assert!(
+                        card.size.width > px(0.) && card.size.height > px(0.),
+                        "Theme {} must have nonzero geometry",
+                        theme.name
+                    );
+                    assert!(card.left() >= bounds.left() && card.right() <= bounds.right());
+                    assert!((card.size.width - first.size.width).abs() <= px(1.));
+                    assert!((card.size.height - first.size.height).abs() <= px(1.));
+                    let scope = window.within((ElementId::from("theme"), theme.name.clone()));
+                    assert_preview_layout(
+                        card,
+                        scope.find("theme-swatch").bounds(),
+                        scope.find("theme-label").bounds(),
+                        &format!("Theme {}, {layout}", theme.name),
+                    );
+                    for previous in &card_bounds {
+                        assert!(
+                            card.left() >= previous.right()
+                                || card.right() <= previous.left()
+                                || card.top() >= previous.bottom()
+                                || card.bottom() <= previous.top(),
+                            "Theme cards must not overlap at {viewport:?}, font {font_size:?}"
+                        );
+                    }
+                    card_bounds.push(card);
+                }
+                if escape {
+                    window.press("escape", cx);
+                } else {
+                    window.click("settings-done", cx);
+                }
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.try_find("appearance-settings").is_none());
+                assert!(view.read(cx).focus.is_focused(window));
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
     fn settings_shortcut_changes_appearance_and_escape_restores_map_focus(cx: &mut TestAppContext) {
+        use crate::appearance::{Appearance, AppearanceMode};
+        use gpui_kit::ElementId;
+        use gpui_kit::component::{ThemeMode, ThemeRegistry};
+
+        fn reveal_theme(name: &SharedString, themes: &[SharedString], window: &mut Window, cx: &mut App) {
+            let id = (ElementId::from("theme"), name.clone());
+            for _ in 0..100 {
+                let card = window.find(id.clone());
+                let dialog = window.find(0_usize).bounds();
+                let top = dialog.top() + px(80.);
+                let bottom = window.find("settings-done").bounds().top() - px(8.);
+                if card.visible() && card.bounds().top() >= top && card.bounds().bottom() <= bottom {
+                    return;
+                }
+                // Wheel over a visible card so native hit testing reaches the
+                // scrolling body, even when the requested card is clipped.
+                let anchor = themes
+                    .iter()
+                    .find(|name| {
+                        let card = window.find((ElementId::from("theme"), (*name).clone()));
+                        card.visible() && card.bounds().center().y > top && card.bounds().center().y < bottom
+                    })
+                    .expect("The scrolling body must expose a theme card");
+                let delta = if card.bounds().center().y < dialog.center().y { 80. } else { -80. };
+                window.scroll((ElementId::from("theme"), anchor.clone()), ScrollDelta::Pixels(point(px(0.), px(delta))), cx);
+            }
+            panic!("Theme card {name} did not scroll into view");
+        }
+
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("appearance.json");
         cx.update(|cx| {
@@ -790,7 +1098,7 @@ mod tests {
             init(cx);
         });
         let mut view = None;
-        let handle = cx.open_window(size(px(640.), px(400.)), |window, cx| {
+        let handle = cx.open_window(size(px(1000.), px(800.)), |window, cx| {
             crate::appearance::apply(window, cx);
             let map = cx.new(|cx| {
                 let mut map = MapView::new(window, cx);
@@ -811,81 +1119,165 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            let bounds = window.find(0_usize).bounds();
-            let viewport = window.viewport_size();
-            assert!((bounds.center().x - viewport.width / 2.).abs() <= px(1.));
-            assert!((bounds.center().y - viewport.height / 2.).abs() <= px(1.));
-            assert!(window.find("appearance-mode").visible());
-            window.click("appearance-mode", cx);
-            window.press("up", cx);
-            window.press("enter", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            assert_eq!(crate::appearance::Appearance::mode(cx), crate::appearance::AppearanceMode::Dark);
-            assert_eq!(cx.theme().mode, gpui_kit::component::ThemeMode::Dark);
-            assert_eq!(window.find("appearance-mode").label(), Some("Mode: Dark"));
-            assert!(window.find("dark-theme").visible());
-            assert!(window.find("light-theme").visible());
-            assert_eq!(window.find("dark-theme").bounds().left(), window.find("light-theme").bounds().left());
-            assert_eq!(window.find("dark-theme").bounds().right(), window.find("light-theme").bounds().right());
+            assert!(window.find("appearance-settings").visible());
+            for (id, label, selected) in [
+                ("mode-light", "Light", false),
+                ("mode-dark", "Dark", false),
+                ("mode-system", "Follow system", true),
+            ] {
+                let mode = window.find(id);
+                assert_eq!(mode.label(), Some(label));
+                assert_eq!(mode.selected(), Some(selected));
+            }
+            window.click("mode-light", cx);
+            assert_eq!(Appearance::mode(cx), AppearanceMode::Light);
+            assert_eq!(cx.theme().mode, ThemeMode::Light);
+            assert_eq!(window.find("mode-light").selected(), Some(true));
+            window.press("tab", cx);
+            assert_eq!(window.find("mode-dark").focused(), Some(true));
+            assert_eq!(window.find("mode-dark").selected(), Some(false), "Focusing a mode must not select it");
+            window.press("space", cx);
+            assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
+            assert_eq!(cx.theme().mode, ThemeMode::Dark);
+            assert_eq!(window.find("mode-dark").selected(), Some(true));
+            assert_eq!(window.find("mode-light").selected(), Some(false));
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["mode"],
                 "dark"
             );
-            window.click("dark-theme", cx);
-            window.press("up", cx);
+            window.press("tab", cx);
+            assert_eq!(window.find("mode-system").focused(), Some(true));
             window.press("enter", cx);
+            assert_eq!(Appearance::mode(cx), AppearanceMode::System);
+            assert_eq!(cx.theme().mode, ThemeMode::from(window.appearance()));
+            assert_eq!(window.find("mode-system").selected(), Some(true));
+            window.click("mode-dark", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let themes = cx.update(|cx| {
+            ThemeRegistry::global(cx)
+                .sorted_themes()
+                .into_iter()
+                .map(|theme| theme.name.clone())
+                .collect::<Vec<_>>()
+        });
+        let mut selected_cards = Vec::<SharedString>::new();
+        for (mode, appearance_mode, slot, saved_mode) in [
+            (ThemeMode::Light, AppearanceMode::Light, "light_theme", "light"),
+            (ThemeMode::Dark, AppearanceMode::Dark, "dark_theme", "dark"),
+        ] {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let name = ThemeRegistry::global(cx)
+                    .sorted_themes()
+                    .into_iter()
+                    .find(|theme| theme.mode == mode && theme.name.as_str() != Appearance::selected_theme(mode, cx))
+                    .unwrap()
+                    .name
+                    .clone();
+                reveal_theme(&name, &themes, window, cx);
+                let id = (ElementId::from("theme"), name.clone());
+                assert_eq!(window.find(id.clone()).selected(), Some(false));
+                window.click(id.clone(), cx);
+                assert_eq!(
+                    Appearance::mode(cx),
+                    appearance_mode,
+                    "An explicit appearance must follow the clicked card's mode"
+                );
+                assert_eq!(cx.theme().mode, mode);
+                assert_eq!(cx.theme().theme_name(), &name);
+                assert_eq!(Appearance::selected_theme(mode, cx), name.as_str());
+                assert_eq!(window.find(id).selected(), Some(true));
+                for previous in &selected_cards {
+                    assert_eq!(window.find((ElementId::from("theme"), previous.clone())).selected(), Some(false));
+                }
+                let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert_eq!(saved["mode"], saved_mode);
+                assert_eq!(saved[slot], name.as_str());
+                selected_cards.push(name);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+        cx.update_window(handle.into(), |_, window, cx| window.press("escape", cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("appearance-settings").is_none());
+            assert!(view.read(cx).focus.is_focused(window));
+            window.press("secondary-,", cx);
         })
         .unwrap();
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            let expected = gpui_kit::component::ThemeRegistry::global(cx)
+            window.click("mode-system", cx);
+            let before = cx.theme().clone();
+            let inactive = if before.mode.is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
+            let name = ThemeRegistry::global(cx)
                 .sorted_themes()
                 .into_iter()
-                .rfind(|theme| theme.mode.is_dark())
+                .find(|theme| theme.mode == inactive && theme.name.as_str() != Appearance::selected_theme(inactive, cx))
                 .unwrap()
                 .name
                 .clone();
-            assert_eq!(cx.theme().theme_name(), &expected);
-            window.click("light-theme", cx);
-            window.press("up", cx);
-            window.press("enter", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            let expected = gpui_kit::component::ThemeRegistry::global(cx)
-                .sorted_themes()
-                .into_iter()
-                .rfind(|theme| !theme.mode.is_dark())
-                .unwrap()
-                .name
-                .clone();
+            reveal_theme(&name, &themes, window, cx);
+            let id = (ElementId::from("theme"), name.clone());
+            assert_eq!(window.find(id.clone()).selected(), Some(false));
+            // Reach the card without clicking it: Enter must activate the real Radio.
+            for _ in 0..themes.len() + 8 {
+                if window.find(id.clone()).focused() == Some(true) {
+                    break;
+                }
+                window.press("tab", cx);
+            }
+            assert_eq!(window.find(id.clone()).focused(), Some(true));
             assert_eq!(
-                crate::appearance::Appearance::selected_theme(gpui_kit::component::ThemeMode::Light, cx),
-                expected.as_str()
+                Appearance::selected_theme(inactive, cx),
+                if inactive.is_dark() {
+                    selected_cards[1].as_str()
+                } else {
+                    selected_cards[0].as_str()
+                }
             );
-            assert!(cx.theme().mode.is_dark(), "Choosing an inactive theme must not switch appearance");
-            window.click("appearance-mode", cx);
+            window.press("enter", cx);
+            assert_eq!(Appearance::mode(cx), AppearanceMode::System);
+            assert_eq!(Appearance::selected_theme(inactive, cx), name.as_str());
+            assert_eq!(cx.theme().mode, before.mode);
+            assert_eq!(cx.theme().theme_name(), before.theme_name());
+            assert_eq!(cx.theme().colors, before.colors, "An inactive System-mode choice must not change the palette");
+            assert_eq!(cx.theme().tokens, before.tokens);
+            assert_eq!(
+                window.find(id).selected(),
+                Some(false),
+                "Only the active theme card is selected, not both saved slots"
+            );
+            let active = SharedString::from(cx.theme().theme_name().to_string());
+            assert_eq!(window.find((ElementId::from("theme"), active)).selected(), Some(true));
+            assert_eq!(window.find("mode-system").selected(), Some(true));
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["mode"], "system");
+            assert_eq!(saved[if inactive.is_dark() { "dark_theme" } else { "light_theme" }], name.as_str());
+            assert_eq!(
+                saved[if inactive.is_dark() { "light_theme" } else { "dark_theme" }],
+                Appearance::selected_theme(before.mode, cx)
+            );
+            reveal_theme(&name, &themes, window, cx);
+            window.click((ElementId::from("theme"), name), cx);
+            assert_eq!(Appearance::mode(cx), AppearanceMode::System);
+            assert_eq!(
+                cx.theme().colors,
+                before.colors,
+                "Clicking an inactive System-mode card must also preserve the palette"
+            );
             window.press("escape", cx);
         })
         .unwrap();
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert!(window.find("appearance-mode").visible(), "Escape must dismiss the menu before the dialog");
-            window.press("escape", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            assert!(window.try_find("appearance-mode").is_none());
+            assert!(window.try_find("appearance-settings").is_none());
             assert!(view.read(cx).focus.is_focused(window));
             let before = view.read(cx).camera;
             window.press("+", cx);
@@ -1362,6 +1754,7 @@ mod tests {
                     view.apply_frame(
                         MapFrame {
                             viewport: view.viewport.unwrap(),
+                            basemap: basemap_style(cx),
                             raster_layer_id: Some(source.metadata().id),
                             image: Ok(image.clone()),
                         },
@@ -1404,6 +1797,7 @@ mod tests {
                 view.apply_frame(
                     MapFrame {
                         viewport: view.viewport.unwrap(),
+                        basemap: basemap_style(cx),
                         raster_layer_id: Some(obsolete_source.metadata().id),
                         image: Ok(obsolete),
                     },
@@ -1447,6 +1841,7 @@ mod tests {
                         view.apply_frame(
                             MapFrame {
                                 viewport,
+                                basemap: basemap_style(cx),
                                 raster_layer_id: None,
                                 image: Ok(image.clone()),
                             },
