@@ -340,13 +340,16 @@ fn build_bridge(
     build
         .includes(&bridge_include_dirs)
         .includes(include_dirs)
-        .flag_if_supported("-std=c++20")
-        // mbgl-core defaults to no RTTI (CMake `MLN_WITH_RTTI=OFF` adds `-fno-rtti` on GCC/Clang).
-        // The bridge uses no `dynamic_cast`/`typeid`, so `-fno-rtti` is safe.
-        // (MSVC keeps RTTI on both sides)
-        .flag_if_supported("-fno-rtti")
+        // Required flags must not depend on probes: Nix's target-wrapper warning
+        // on stderr makes cc-rs report supported flags as unsupported.
+        .std("c++20")
         .warnings(true)
         .warnings_into_errors(true);
+
+    // Match mbgl-core's default RTTI setting; MSVC keeps RTTI on both sides.
+    if !build.get_compiler().is_like_msvc() {
+        build.flag("-fno-rtti");
+    }
 
     // Some public MLN types (notably RunLoop) have NDEBUG-dependent layouts.
     // Compile inline bridge code with the same ABI layout as the linked core.
@@ -367,8 +370,8 @@ fn build_bridge(
         build.define("MLN_RENDER_BACKEND_OPENGL", Some("1"));
     }
     if matches!(backend, GraphicsApi::WGPU) {
-        build.flag_if_supported("-DMLN_WEBGPU_IMPL_FFI=1");
-        build.flag_if_supported("-DMLN_WEBGPU_IMPL_WGPU=1");
+        build.define("MLN_WEBGPU_IMPL_FFI", Some("1"));
+        build.define("MLN_WEBGPU_IMPL_WGPU", Some("1"));
     }
 
     // Watch the Rust side of the cxx bridge.
@@ -472,8 +475,7 @@ fn configure_local_build(
     target_os: &str,
     static_dependencies: Option<&StaticDependencies>,
 ) {
-    // maplibre-native's platform/darwin/darwin.cmake calls enable_language(Swift),
-    // which the default "Unix Makefiles" generator does not support. Switch to Ninja.
+    // Keep using Ninja for Darwin source builds, including existing build caches.
     if target_os == "macos" || target_os == "ios" {
         config.generator("Ninja");
     }
@@ -628,11 +630,16 @@ fn build_local(
     // Update submodules
     submodule_update(&maplibre_native_dir)?;
 
-    // Keep the backend extension reproducible without editing a global Cargo
-    // registry or requiring a manually modified native checkout.
-    if cfg!(feature = "wgpu") {
-        let patch =
-            PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("webgpu-custom-layer.patch");
+    // Keep native fixes reproducible without editing a global Cargo registry
+    // or requiring a manually modified native checkout.
+    for (name, enabled) in [
+        ("darwin-no-swift.patch", matches!(target_os, "macos" | "ios")),
+        ("webgpu-custom-layer.patch", cfg!(feature = "wgpu")),
+    ] {
+        if !enabled {
+            continue;
+        }
+        let patch = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join(name);
         println!("cargo:rerun-if-changed={}", patch.display());
         let applied = Command::new("git")
             .current_dir(&maplibre_native_dir)
@@ -648,7 +655,7 @@ fn build_local(
                 .arg(&patch)
                 .status()?;
             if !status.success() {
-                return Err("Native WebGPU custom-layer patch conflicts with the checkout".into());
+                return Err(format!("Native patch {name} conflicts with the checkout").into());
             }
             let status = Command::new("git")
                 .current_dir(&maplibre_native_dir)
@@ -656,7 +663,7 @@ fn build_local(
                 .arg(&patch)
                 .status()?;
             if !status.success() {
-                return Err("Could not apply native WebGPU custom-layer patch".into());
+                return Err(format!("Could not apply native patch {name}").into());
             }
         }
     }

@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::{ActiveTheme, alert::Alert, button::Button};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::{ActiveTheme, Disableable, Sizable, TitleBar, alert::Alert};
 use gpui_kit::{
     App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, Entity, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyBinding, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
@@ -466,26 +468,25 @@ impl Render for MapView {
                     .flex()
                     .items_center()
                     .child(
-                        Alert::error("map-error", error.clone()).banner().flex_1().min_w_0().on_close(cx.listener(|view, _, _, cx| {
-                            view.error = None;
-                            cx.notify();
-                        })),
+                        Alert::error("map-error", error.clone())
+                            .banner()
+                            .flex_1()
+                            .min_w_0()
+                            .on_close(cx.listener(|view, _, _, cx| {
+                                view.error = None;
+                                cx.notify();
+                            })),
                     )
                     .child(Button::new("retry-map").label("Retry").on_click(cx.listener(|view, _, _, cx| view.retry(cx)))),
             );
         }
         if let Some(error) = load_error {
-            alerts = alerts.child(
-                div()
-                    .id("raster-error-banner")
-                    .test_support()
-                    .bg(cx.theme().background)
-                    .occlude()
-                    .child(Alert::error("raster-error", error).banner().on_close(cx.listener(|view, _, _, cx| {
-                        view.raster_panel.update(cx, |panel, cx| panel.dismiss_load_error(cx));
-                        cx.notify();
-                    }))),
-            );
+            alerts = alerts.child(div().id("raster-error-banner").test_support().bg(cx.theme().background).occlude().child(
+                Alert::error("raster-error", error).banner().on_close(cx.listener(|view, _, _, cx| {
+                    view.raster_panel.update(cx, |panel, cx| panel.dismiss_load_error(cx));
+                    cx.notify();
+                })),
+            ));
         }
 
         div()
@@ -512,6 +513,21 @@ impl Render for MapView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .child(
+                TitleBar::new().child("Map").child(
+                    div().pr_2().child(
+                        Button::new("open-raster")
+                            .small()
+                            .ghost()
+                            .icon(IconName::FolderOpen)
+                            .label("Open…")
+                            .tooltip("Open raster (Ctrl/⌘+O)")
+                            .loading(self.raster_panel.read(cx).is_loading())
+                            .disabled(self.raster_panel.read(cx).is_loading())
+                            .on_click(cx.listener(|view, _, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx)))),
+                    ),
+                ),
+            )
             .child(
                 div()
                     .relative()
@@ -602,7 +618,7 @@ mod tests {
             assert_eq!(banner.bounds().right(), px(640.0) - inset);
             assert_eq!(banner.bounds().bottom(), px(400.0) - inset);
             let map_bounds = window.find("map-surface").bounds();
-            assert_eq!(map_bounds.top(), px(0.0));
+            assert_eq!(map_bounds.top(), window.find("title-bar").bounds().bottom());
             assert_eq!(map_bounds.bottom(), px(400.0));
             assert!(banner.bounds().top() > map_bounds.top());
 
@@ -1026,26 +1042,55 @@ mod tests {
             window.click("open-raster", cx);
         })
         .unwrap();
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|options| {
+            assert!(options.files && options.multiple && !options.directories);
+            None
+        });
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(!view.read(cx).raster_panel.read(cx).is_loading());
+            assert!(view.read(cx).raster.is_none());
+            window.within("title-bar").click("open-raster", cx);
+            assert!(view.read(cx).drag.is_none(), "Opening a raster must not start a map gesture");
+        })
+        .unwrap();
         cx.simulate_path_prompt_response(|_| Some(vec![path]));
         cx.run_until_parked();
         assert!(
             cx.update(|cx| view.read(cx).raster.is_some()),
-            "Opening through the floating control must select the raster"
+            "Opening through the title bar must select the raster"
         );
 
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
+            let title_bar = window.find("title-bar").bounds();
+            let open = window.within("title-bar").find("open-raster").bounds();
             let map = window.find("map-surface").bounds();
             let layers = window.find("raster-layers-card").bounds();
             let range = window.find("raster-range-card").bounds();
-            assert_eq!(map.origin, point(px(0.0), px(0.0)), "Controls must not reserve a toolbar above the map");
-            assert_eq!(map.size, size(px(1200.0), px(760.0)));
+            assert!(open.left() > title_bar.center().x);
+            assert!(open.top() >= title_bar.top() && open.bottom() <= title_bar.bottom());
+            assert_eq!(title_bar.right() - open.right(), window.rem_size() * 0.5);
+            assert!(window.within("raster-layers-card").try_find("open-raster").is_none());
+            assert_eq!(title_bar.origin, point(px(0.0), px(0.0)));
+            assert_eq!(title_bar.size.width, px(1200.0));
+            assert!(title_bar.size.height > px(0.0));
+            assert_eq!(
+                map.origin,
+                point(px(0.0), title_bar.bottom()),
+                "Only window chrome may reserve space above the map"
+            );
+            assert_eq!(map.size, size(px(1200.0), px(760.0) - title_bar.size.height));
             assert!(layers.left() > map.center().x && layers.right() < map.right());
             assert_eq!(layers.left(), range.left());
             assert_eq!(layers.right(), range.right());
             assert!(range.top() > layers.bottom() && range.bottom() < map.bottom());
 
             let before = view.read(cx).camera;
+            window.click("title-bar", cx);
+            assert_eq!(view.read(cx).camera, before, "Title bar input must not pan the map");
+            assert!(view.read(cx).drag.is_none());
             window.scroll("raster-layers-card", ScrollDelta::Lines(point(0.0, 2.0)), cx);
             let from = point(layers.left() + px(20.0), layers.top() + px(20.0));
             window.drag(from, from + point(px(40.0), px(20.0)), cx);
@@ -1153,7 +1198,9 @@ mod tests {
             window.click("toggle-raster-controls", cx);
             assert!(window.try_find("raster-range-card").is_none());
             assert!(window.try_find("raster-band").is_none());
-            assert_eq!(window.find("map-surface").bounds().size, size(px(1200.0), px(760.0)));
+            assert!(window.within("title-bar").find("open-raster").visible());
+            let title_bar = window.find("title-bar").bounds();
+            assert_eq!(window.find("map-surface").bounds().size, size(px(1200.0), px(760.0) - title_bar.size.height));
             window.press("secondary-l", cx);
         })
         .unwrap();
@@ -1171,7 +1218,11 @@ mod tests {
             window.render_frame(cx);
             let map = window.find("map-surface").bounds();
             let layers = window.find("raster-layers-card").bounds();
-            assert_eq!(map.size, size(px(640.0), px(400.0)));
+            let title_bar = window.find("title-bar").bounds();
+            let open = window.within("title-bar").find("open-raster");
+            assert!(open.visible());
+            assert!(open.bounds().left() > title_bar.center().x && open.bounds().right() < title_bar.right());
+            assert_eq!(map.size, size(px(640.0), px(400.0) - title_bar.size.height));
             assert!(layers.right() < map.right() && layers.left() > map.left());
             window.scroll("raster-layers-card", ScrollDelta::Lines(point(0.0, -30.0)), cx);
             assert!(

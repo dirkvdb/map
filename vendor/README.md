@@ -9,7 +9,7 @@ These are source snapshots of the crates.io packages, patched through the root
 | `webgpu-shim` | 0.1.2 | `9d3e8dc5f42062286a3166e0dbee0f33bd407aff` | MIT OR Apache-2.0 |
 
 The native core stays at `core-a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b`.
-`maplibre_native/webgpu-custom-layer.patch` contains the only native changes:
+`maplibre_native/webgpu-custom-layer.patch` contains the native rendering changes:
 
 - Enable `CustomLayerFactory` in the default WebGPU layer manager.
 - Pass the current WebGPU encoder and attachment formats to custom hosts.
@@ -20,10 +20,21 @@ index. The callback also carries the native depth-test mode. Mixing those indice
 can let opaque basemap polygons hide an otherwise opaque custom raster (notably
 water classes in the land-use fixture).
 
-`maplibre_native/build.rs` checks/applies that patch for source builds, including
+`maplibre_native/darwin-no-swift.patch` removes the unused Swift language probe
+from Darwin's CMake configuration. The CMake targets have no Swift sources, so
+the core can build with devenv's Apple SDK without resolving a native Swift
+toolchain through Nix's SDK-only `DEVELOPER_DIR`. Objective-C and Objective-C++
+remain enabled.
+
+`maplibre_native/build.rs` checks/applies these patches for source builds, including
 the configured `.devenv/maplibre-native` checkout. It refuses conflicts; it does
 not reset or overwrite checkout changes. The custom-layer extension requires
 a source-built WebGPU core, not an upstream precompiled core.
+
+The C++ bridge requires C++20, the core's RTTI configuration, and the WebGPU
+implementation defines explicitly. They must not use optional flag probes:
+Nix's compiler-wrapper warning on stderr makes cc-rs reject otherwise supported
+flags, silently dropping settings required by the native headers and ABI.
 
 The Rust additions are `WgpuCustomLayer`, `WgpuLayerParameters`, and
 `StyleRef::add_wgpu_custom_layer(id, host, before)`, plus their CXX adapter in

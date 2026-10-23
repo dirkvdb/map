@@ -13,6 +13,7 @@ mod raster_tiles;
 mod settings;
 mod shortcuts;
 
+use gpui_kit::component::TitleBar;
 use gpui_kit::{App, AppContext, Bounds, QuitMode, Window, WindowBounds, WindowOptions, px, size};
 
 fn main() {
@@ -45,7 +46,7 @@ fn create_main_window(cx: &mut App) -> anyhow::Result<()> {
         window_bounds: Some(WindowBounds::Windowed(window_bounds)),
         // Platform window constraints are physical geometry, not UI spacing.
         window_min_size: Some(size(px(640.), px(400.))),
-        ..Default::default()
+        ..TitleBar::window_options()
     };
 
     gpui_kit::open_window(window_options, cx, |window, cx| {

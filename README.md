@@ -18,7 +18,9 @@ publish a precompiled wgpu core for this release. The first build fetches the
 pinned MapLibre Native source and its submodules into `.devenv/maplibre-native`,
 then compiles its wgpu backend. `scripts/prepare_maplibre.py` derives the required
 native revision from the locked crate and verifies the cached checkout.
-This first build takes longer than subsequent cached builds.
+This first build takes longer than subsequent cached builds. On macOS, a checked
+native-source patch removes MapLibre's unused Swift compiler probe; the core
+build uses devenv's Apple SDK and does not require a separate Swift toolchain.
 
 The app uses [CARTO Dark Matter](https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json),
 the same dark vector basemap as the `maplibre-raster-layer` playground. Internet
@@ -57,8 +59,8 @@ share GPUI's device or queue.
 
 ## Raster sources
 
-Use **Open…** (`Ctrl+O` / `Cmd+O`), drop files onto the map, or pass paths
-at startup:
+Use **Open…** at the right of the title bar (`Ctrl+O` / `Cmd+O`), drop files
+onto the map, or pass paths at startup:
 
 ```sh
 devenv shell -- cargo run -- /path/to/elevation.tif /path/to/other.vrt

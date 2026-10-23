@@ -7,7 +7,7 @@ use gpui_kit::component::input::{InputEvent, InputState, NumberInput};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
-use gpui_kit::component::{ActiveTheme, Disableable, Icon, IndexPath, Sizable};
+use gpui_kit::component::{ActiveTheme, Icon, IndexPath, Sizable};
 use gpui_kit::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, ParentElement, PathPromptOptions, Render,
     ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, Window, div, rgba,
@@ -135,6 +135,10 @@ impl RasterPanel {
 
     fn active(&self) -> Option<&Arc<RasterSource>> {
         self.sources.iter().find(|source| Some(source.metadata().id) == self.selected)
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading
     }
 
     pub fn load_error(&self) -> Option<SharedString> {
@@ -413,17 +417,6 @@ impl Render for RasterPanel {
                 .child(Icon::new(IconName::Layers).small())
                 .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child("Layers"))
                 .child(
-                    Button::new("open-raster")
-                        .small()
-                        .ghost()
-                        .icon(IconName::FolderOpen)
-                        .label("Open…")
-                        .tooltip("Open raster (Ctrl/⌘+O)")
-                        .loading(self.loading)
-                        .disabled(self.loading)
-                        .on_click(cx.listener(|this, _, _, cx| this.prompt(cx))),
-                )
-                .child(
                     Button::new("toggle-raster-controls")
                         .small()
                         .ghost()
@@ -472,13 +465,6 @@ impl Render for RasterPanel {
                             .child(field_label("Opacity", cx))
                             .child(div().id("raster-opacity").test_support().px_2().child(Slider::new(&self.opacity))),
                     );
-            } else {
-                layers = layers.child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Open a raster or drop files onto the map."),
-                );
             }
             if let Some(error) = &self.error {
                 layers = layers.child(div().text_sm().text_color(cx.theme().danger).child(error.clone()));
@@ -634,7 +620,7 @@ mod tests {
         let panel = panel.unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            window.click("open-raster", cx);
+            panel.update(cx, |panel, cx| panel.prompt(cx));
         })
         .unwrap();
         cx.simulate_path_prompt_response(|_| Some(vec![path]));
@@ -657,7 +643,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn open_cancel_range_validation_and_clear_work_through_the_ui(cx: &mut TestAppContext) {
+    fn prompt_cancel_and_open_then_range_validation_and_clear_work_through_the_ui(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("raster.tif");
@@ -676,7 +662,7 @@ mod tests {
             assert!(panel.read(cx).selected.is_none());
             window.scroll("raster-band", ScrollDelta::Lines(point(0.0, -1.0)), cx);
             assert!(panel.read(cx).selected.is_none(), "An empty selector must ignore scroll");
-            window.click("open-raster", cx);
+            panel.update(cx, |panel, cx| panel.prompt(cx));
         })
         .unwrap();
         assert!(cx.did_prompt_for_paths());
@@ -687,8 +673,8 @@ mod tests {
         cx.run_until_parked();
         assert!(!cx.update(|cx| panel.read(cx).loading));
 
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.click("open-raster", cx);
+        cx.update_window(handle.into(), |_, _, cx| {
+            panel.update(cx, |panel, cx| panel.prompt(cx));
         })
         .unwrap();
         cx.simulate_path_prompt_response(|_| Some(vec![path]));

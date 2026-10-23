@@ -1,0 +1,11 @@
+diff --git a/platform/darwin/darwin.cmake b/platform/darwin/darwin.cmake
+--- a/platform/darwin/darwin.cmake
++++ b/platform/darwin/darwin.cmake
+@@ -1,4 +1,6 @@
+-enable_language(OBJC OBJCXX Swift)
++# CMake targets have no Swift sources; the Swift SDK sources are built by Xcode.
++# Keep mbgl-core usable with an SDK-only development environment.
++enable_language(OBJC OBJCXX)
+ 
+ target_link_libraries(
+     mbgl-core
