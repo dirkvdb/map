@@ -451,24 +451,40 @@ impl Render for MapView {
             );
         }
 
-        let mut alerts = div().flex().flex_col().w_full().flex_shrink_0();
+        let load_error = self.raster_panel.read(cx).load_error();
+        let mut alerts = div().absolute().bottom_0().left_0().flex().flex_col().gap_3().w_full();
+        if self.error.is_some() || load_error.is_some() {
+            alerts = alerts.p_3();
+        }
         if let Some(error) = &self.error {
             alerts = alerts.child(
                 div()
                     .id("map-error-banner")
                     .test_support()
+                    .bg(cx.theme().background)
+                    .occlude()
                     .flex()
                     .items_center()
-                    .child(Alert::error("map-error", error.clone()).banner().flex_1().min_w_0())
+                    .child(
+                        Alert::error("map-error", error.clone()).banner().flex_1().min_w_0().on_close(cx.listener(|view, _, _, cx| {
+                            view.error = None;
+                            cx.notify();
+                        })),
+                    )
                     .child(Button::new("retry-map").label("Retry").on_click(cx.listener(|view, _, _, cx| view.retry(cx)))),
             );
         }
-        if let Some(error) = self.raster_panel.read(cx).load_error() {
+        if let Some(error) = load_error {
             alerts = alerts.child(
                 div()
                     .id("raster-error-banner")
                     .test_support()
-                    .child(Alert::error("raster-error", error).banner()),
+                    .bg(cx.theme().background)
+                    .occlude()
+                    .child(Alert::error("raster-error", error).banner().on_close(cx.listener(|view, _, _, cx| {
+                        view.raster_panel.update(cx, |panel, cx| panel.dismiss_load_error(cx));
+                        cx.notify();
+                    }))),
             );
         }
 
@@ -528,7 +544,38 @@ mod tests {
     use super::*;
 
     #[gpui_kit::test]
-    fn loading_errors_appear_below_the_map_even_with_collapsed_controls(cx: &mut TestAppContext) {
+    fn closing_a_raster_error_does_not_drag_the_map(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let mut view = None;
+        let handle = cx.open_window(size(px(640.0), px(400.0)), |window, cx| {
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map.open_paths(vec![directory.path().join("missing.tif")], cx);
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let camera = view.read(cx).camera;
+            let banner = window.find("raster-error-banner").bounds();
+            window.click_at("raster-error-banner", point(banner.size.width - px(24.0), banner.size.height * 0.5), cx);
+            window.render_frame(cx);
+            assert!(window.try_find("raster-error-banner").is_none());
+            assert!(view.read(cx).drag.is_none());
+            assert_eq!(view.read(cx).camera, camera);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn loading_errors_overlay_the_map_even_with_collapsed_controls(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let directory = tempfile::tempdir().unwrap();
         let mut view = None;
@@ -550,8 +597,14 @@ mod tests {
             window.click("toggle-raster-controls", cx);
             let banner = window.find("raster-error-banner");
             assert!(banner.visible());
-            assert_eq!(banner.bounds().bottom(), px(400.0));
-            assert_eq!(banner.bounds().top(), window.find("map-surface").bounds().bottom());
+            let inset = window.rem_size() * 0.75;
+            assert_eq!(banner.bounds().left(), inset);
+            assert_eq!(banner.bounds().right(), px(640.0) - inset);
+            assert_eq!(banner.bounds().bottom(), px(400.0) - inset);
+            let map_bounds = window.find("map-surface").bounds();
+            assert_eq!(map_bounds.top(), px(0.0));
+            assert_eq!(map_bounds.bottom(), px(400.0));
+            assert!(banner.bounds().top() > map_bounds.top());
 
             view.update(cx, |view, cx| {
                 view.apply_frame(
@@ -567,7 +620,9 @@ mod tests {
             window.render_frame(cx);
             let banner = window.find("map-error-banner");
             assert!(banner.visible());
-            assert_eq!(banner.bounds().top(), window.find("map-surface").bounds().bottom());
+            assert_eq!(window.find("map-surface").bounds(), map_bounds);
+            assert!(banner.bounds().top() > map_bounds.top());
+            assert_eq!(window.find("raster-error-banner").bounds().top(), banner.bounds().bottom() + inset);
             assert!(window.find("retry-map").visible());
 
             view.read(cx).raster_panel.clone().update(cx, |panel, cx| panel.clear(window, cx));
@@ -589,6 +644,7 @@ mod tests {
             window.render_frame(cx);
             assert!(window.try_find("raster-error-banner").is_none());
             assert!(window.try_find("map-error-banner").is_none());
+            assert_eq!(window.find("map-surface").bounds().bottom(), px(400.0));
         })
         .unwrap();
     }

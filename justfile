@@ -14,8 +14,8 @@ test_release test_name='':
 
 test: test_release
 
-run:
-    cargo run --release
+run args='':
+    cargo run --release -- {{ args }}
 
 [windows]
 set shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]

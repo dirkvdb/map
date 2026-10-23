@@ -141,6 +141,11 @@ impl RasterPanel {
         self.load_error.clone()
     }
 
+    pub fn dismiss_load_error(&mut self, cx: &mut Context<Self>) {
+        self.load_error = None;
+        cx.notify();
+    }
+
     fn emit(&self, fit: bool, cx: &mut Context<Self>) {
         let opacity = self.opacity.read(cx).value().end() / 100.0;
         cx.emit(RasterEvent {
