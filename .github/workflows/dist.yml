@@ -82,7 +82,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends build-essential clang cmake ninja-build libclang-dev pkg-config autoconf automake libtool bison flex squashfs-tools libssl-dev libcurl4-openssl-dev zlib1g-dev libuv1-dev libicu-dev libpng-dev libjpeg-dev libwebp-dev libfontconfig1-dev libfreetype6-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-randr0-dev libxcb-sync-dev libwayland-dev libvulkan-dev libglvnd-dev
+          sudo apt-get install --yes --no-install-recommends build-essential clang cmake ninja-build libclang-dev pkg-config autoconf automake libtool bison flex imagemagick squashfs-tools libssl-dev libcurl4-openssl-dev zlib1g-dev libuv1-dev libicu-dev libpng-dev libjpeg-dev libwebp-dev libfontconfig1-dev libfreetype6-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-randr0-dev libxcb-sync-dev libwayland-dev libvulkan-dev libglvnd-dev
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.11

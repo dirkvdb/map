@@ -39,7 +39,7 @@ package-dependencies:
 
 # Build with mise-managed Rust and Apple's tools, using separate Cargo artifacts.
 dmg:
-    just check-package-icons
+    just generate-package-icons
     just package-dependencies
     GDAL_STATIC=1 GDAL_HOME="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET" PKG_CONFIG_PATH="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib/pkgconfig" cargo build --release --locked --bin map
     cargo bundle --release --format osx --binary-path dist/build/release/map
@@ -54,15 +54,21 @@ dmg:
 # Linux: select dist/mise.linux.toml via MISE_DEFAULT_CONFIG_FILENAME.
 # cargo-bundle 0.11 locates the binary via CARGO_TARGET_DIR (no --binary-path flag).
 appimage:
-    just check-package-icons
+    just generate-package-icons
     just package-dependencies
     GDAL_STATIC=1 GDAL_HOME="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET" PKG_CONFIG_PATH="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib/pkgconfig" cargo build --release --locked --bin map
     CARGO_BUNDLE_SKIP_BUILD=1 cargo bundle --release --format appimage
 
-# Fail before the expensive native build if bundle icon assets are missing.
-check-package-icons:
-    test -s dist/icon_512x512.png
-    test -s dist/icon_512x512@2x.png
+# Regenerate bundle icons before every package build so they match the source.
+[macos]
+generate-package-icons:
+    sips -z 512 512 data/icon.png --out dist/icon_512x512.png
+    sips -z 1024 1024 data/icon.png --out dist/icon_512x512@2x.png
+
+[linux]
+generate-package-icons:
+    convert data/icon.png -resize '512x512!' dist/icon_512x512.png
+    convert data/icon.png -resize '1024x1024!' dist/icon_512x512@2x.png
 
 # Refresh bundled themes from the source revision of gpui-kit in Cargo.lock.
 sync-themes:

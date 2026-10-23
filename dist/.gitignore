@@ -1,3 +1,5 @@
 /build/
 /vcpkg-cache/
+/icon_512x512.png
+/icon_512x512@2x.png
 /*.dmg
