@@ -39,9 +39,11 @@ package-dependencies:
 
 # Build with mise-managed Rust and Apple's tools, using separate Cargo artifacts.
 dmg:
+    just check-package-icons
     just package-dependencies
     GDAL_STATIC=1 GDAL_HOME="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET" PKG_CONFIG_PATH="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib/pkgconfig" cargo build --release --locked --bin map
     cargo bundle --release --format osx --binary-path dist/build/release/map
+    python3 -c 'import pathlib, plistlib; app = pathlib.Path("dist/build/release/bundle/osx/Map.app/Contents"); icon = plistlib.loads((app / "Info.plist").read_bytes())["CFBundleIconFile"]; path = app / "Resources" / icon; path = path if path.suffix else path.with_suffix(".icns"); assert path.stat().st_size > 0, "App bundle icon is empty"'
     /usr/bin/codesign --force --sign - dist/build/release/bundle/osx/Map.app
     /usr/bin/codesign --verify --deep --strict --verbose=2 dist/build/release/bundle/osx/Map.app
     /bin/ln -sfn /Applications dist/build/release/bundle/osx/Applications
@@ -52,9 +54,15 @@ dmg:
 # Linux: select dist/mise.linux.toml via MISE_DEFAULT_CONFIG_FILENAME.
 # cargo-bundle 0.11 locates the binary via CARGO_TARGET_DIR (no --binary-path flag).
 appimage:
+    just check-package-icons
     just package-dependencies
     GDAL_STATIC=1 GDAL_HOME="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET" PKG_CONFIG_PATH="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib/pkgconfig" cargo build --release --locked --bin map
     CARGO_BUNDLE_SKIP_BUILD=1 cargo bundle --release --format appimage
+
+# Fail before the expensive native build if bundle icon assets are missing.
+check-package-icons:
+    test -s dist/icon_512x512.png
+    test -s dist/icon_512x512@2x.png
 
 # Refresh bundled themes from the source revision of gpui-kit in Cargo.lock.
 sync-themes:

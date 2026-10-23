@@ -65,6 +65,9 @@ manual runs build artifacts without publishing a release.
 Both macOS and Linux packages use the prepared icons in `dist/`, configured in
 `Cargo.toml`. These are scaled from `data/icon.png` to 512×512 and 1024×1024
 pixels; the `@2x` filename identifies the high-density variant for macOS.
+Both PNGs are checked into the repository. Packaging checks for them before
+building, and the macOS build verifies that the app's `CFBundleIconFile` points
+to a nonempty icon resource before signing and creating the DMG.
 
 After changing the source icon, regenerate both PNGs on macOS:
 
@@ -72,3 +75,5 @@ After changing the source icon, regenerate both PNGs on macOS:
 sips -z 512 512 data/icon.png --out dist/icon_512x512.png
 sips -z 1024 1024 data/icon.png --out dist/icon_512x512@2x.png
 ```
+
+Commit both regenerated PNGs along with the source icon.
