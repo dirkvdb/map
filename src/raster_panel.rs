@@ -64,6 +64,7 @@ pub struct RasterPanel {
     min: Entity<InputState>,
     max: Entity<InputState>,
     error: Option<SharedString>,
+    load_error: Option<SharedString>,
     loading: bool,
     collapsed: bool,
     focus: FocusHandle,
@@ -122,6 +123,7 @@ impl RasterPanel {
             min,
             max,
             error: None,
+            load_error: None,
             loading: false,
             collapsed: false,
             focus: cx.focus_handle(),
@@ -133,6 +135,10 @@ impl RasterPanel {
 
     fn active(&self) -> Option<&Arc<RasterSource>> {
         self.sources.iter().find(|source| Some(source.metadata().id) == self.selected)
+    }
+
+    pub fn load_error(&self) -> Option<SharedString> {
+        self.load_error.clone()
     }
 
     fn emit(&self, fit: bool, cx: &mut Context<Self>) {
@@ -148,6 +154,7 @@ impl RasterPanel {
     fn select(&mut self, id: Option<tiler::LayerId>, fit: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = id;
         self.error = None;
+        self.load_error = None;
         self.collapsed = false;
         if let Some(source) = self.active() {
             let range = source.range();
@@ -174,7 +181,7 @@ impl RasterPanel {
                 while let Ok(error) = errors.recv().await {
                     if this
                         .update(cx, |this, cx| {
-                            this.error = Some(error.into());
+                            this.load_error = Some(error.into());
                             cx.notify();
                         })
                         .is_err()
@@ -236,7 +243,7 @@ impl RasterPanel {
                     Ok(Ok(Some(paths))) => this.open_paths(paths, cx),
                     Ok(Ok(None)) => cx.notify(),
                     error => {
-                        this.error = Some(format!("Couldn’t open the file picker: {error:?}").into());
+                        this.load_error = Some(format!("Couldn’t open the file picker: {error:?}").into());
                         cx.notify();
                     }
                 }
@@ -250,6 +257,7 @@ impl RasterPanel {
         }
         self.loading = true;
         self.error = None;
+        self.load_error = None;
         cx.notify();
         let work = cx.background_spawn(async move {
             let mut sources = Vec::new();
@@ -284,7 +292,7 @@ impl RasterPanel {
                     this.bands.update(cx, |state, cx| state.set_selected_value(&id, window, cx));
                     this.select(Some(id), true, window, cx);
                 }
-                this.error = (!errors.is_empty()).then(|| errors.join("\n").into());
+                this.load_error = (!errors.is_empty()).then(|| errors.join("\n").into());
                 cx.notify();
             });
         }));
@@ -343,6 +351,7 @@ impl RasterPanel {
         self.sources.clear();
         self.selected = None;
         self.error = None;
+        self.load_error = None;
         self.bands.update(cx, |state, cx| {
             state.set_items(Vec::new(), window, cx);
             state.set_selected_index(None, window, cx);

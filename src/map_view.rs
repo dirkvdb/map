@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::{ActiveTheme, button::Button};
+use gpui_kit::component::{ActiveTheme, alert::Alert, button::Button};
 use gpui_kit::{
     App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, Entity, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyBinding, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
@@ -120,6 +120,7 @@ pub struct MapView {
     opacity: f32,
     fit_pending: bool,
     _raster_subscription: Subscription,
+    _raster_observation: Subscription,
     renderer: Option<MapRenderer>,
     drag: Option<MapDrag>,
     coast: Option<MapCoast>,
@@ -136,6 +137,7 @@ impl MapView {
 
         let task = Self::watch_frames(&renderer, cx);
         let raster_panel = cx.new(|cx| RasterPanel::new(window, cx));
+        let raster_observation = cx.observe(&raster_panel, |_, _, cx| cx.notify());
         let raster_subscription = cx.subscribe(&raster_panel, |view, _, event: &crate::raster_panel::RasterEvent, cx| {
             view.raster = event.source();
             view.opacity = event.opacity();
@@ -165,6 +167,7 @@ impl MapView {
             opacity: 1.0,
             fit_pending: false,
             _raster_subscription: raster_subscription,
+            _raster_observation: raster_observation,
             renderer: Some(renderer),
             drag: None,
             coast: None,
@@ -435,22 +438,7 @@ impl Render for MapView {
         if let Some(image) = &self.image {
             surface = surface.child(img(image.clone()).absolute().size_full().object_fit(ObjectFit::Fill));
         }
-        if let Some(error) = &self.error {
-            surface = surface.child(
-                div()
-                    .absolute()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
-                    .p_4()
-                    .bg(cx.theme().background)
-                    .child(error.clone())
-                    .child(Button::new("retry-map").label("Retry").on_click(cx.listener(|view, _, _, cx| view.retry(cx)))),
-            );
-        } else if self.image.is_none() {
+        if self.error.is_none() && self.image.is_none() {
             surface = surface.child(
                 div()
                     .absolute()
@@ -460,6 +448,27 @@ impl Render for MapView {
                     .justify_center()
                     .text_color(cx.theme().muted_foreground)
                     .child("Loading map…"),
+            );
+        }
+
+        let mut alerts = div().flex().flex_col().w_full().flex_shrink_0();
+        if let Some(error) = &self.error {
+            alerts = alerts.child(
+                div()
+                    .id("map-error-banner")
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .child(Alert::error("map-error", error.clone()).banner().flex_1().min_w_0())
+                    .child(Button::new("retry-map").label("Retry").on_click(cx.listener(|view, _, _, cx| view.retry(cx)))),
+            );
+        }
+        if let Some(error) = self.raster_panel.read(cx).load_error() {
+            alerts = alerts.child(
+                div()
+                    .id("raster-error-banner")
+                    .test_support()
+                    .child(Alert::error("raster-error", error).banner()),
             );
         }
 
@@ -487,18 +496,27 @@ impl Render for MapView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(surface)
-            .child(div().absolute().bottom_3().left_3().max_w_full().child(self.pixel_info.clone()))
             .child(
                 div()
-                    .absolute()
-                    .top_3()
-                    .right_3()
-                    .bottom_3()
-                    .w_80()
-                    .max_w_full()
-                    .child(self.raster_panel.clone()),
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(surface)
+                    .child(div().absolute().bottom_3().left_3().max_w_full().child(self.pixel_info.clone()))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_3()
+                            .right_3()
+                            .bottom_3()
+                            .w_80()
+                            .max_w_full()
+                            .child(self.raster_panel.clone()),
+                    ),
             )
+            .child(alerts)
     }
 }
 
@@ -508,6 +526,72 @@ mod tests {
     use gpui_kit::{AppContext, InputEvent as _, TestAppContext, point, px, size};
 
     use super::*;
+
+    #[gpui_kit::test]
+    fn loading_errors_appear_below_the_map_even_with_collapsed_controls(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let mut view = None;
+        let handle = cx.open_window(size(px(640.0), px(400.0)), |window, cx| {
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map.open_paths(vec![directory.path().join("missing.tif")], cx);
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("toggle-raster-controls", cx);
+            let banner = window.find("raster-error-banner");
+            assert!(banner.visible());
+            assert_eq!(banner.bounds().bottom(), px(400.0));
+            assert_eq!(banner.bounds().top(), window.find("map-surface").bounds().bottom());
+
+            view.update(cx, |view, cx| {
+                view.apply_frame(
+                    MapFrame {
+                        viewport: view.viewport.unwrap(),
+                        raster_layer_id: None,
+                        image: Err(anyhow::anyhow!("Network unavailable")),
+                    },
+                    window,
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            let banner = window.find("map-error-banner");
+            assert!(banner.visible());
+            assert_eq!(banner.bounds().top(), window.find("map-surface").bounds().bottom());
+            assert!(window.find("retry-map").visible());
+
+            view.read(cx).raster_panel.clone().update(cx, |panel, cx| panel.clear(window, cx));
+            view.update(cx, |view, cx| {
+                view.apply_frame(
+                    MapFrame {
+                        viewport: view.viewport.unwrap(),
+                        raster_layer_id: None,
+                        image: Ok(Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]))),
+                    },
+                    window,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("raster-error-banner").is_none());
+            assert!(window.try_find("map-error-banner").is_none());
+        })
+        .unwrap();
+    }
 
     #[gpui_kit::test]
     fn question_mark_shows_shortcuts_and_dismissal_restores_focus(cx: &mut TestAppContext) {
