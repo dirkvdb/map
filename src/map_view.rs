@@ -21,6 +21,7 @@ gpui_kit::actions!(map, [ZoomIn, ZoomOut, PanLeft, PanRight, PanUp, PanDown]);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("?", crate::shortcuts::ShowShortcuts, Some("RasterWorkspace")),
         KeyBinding::new("secondary-,", crate::settings::OpenSettings, Some("RasterWorkspace")),
         KeyBinding::new("secondary-o", OpenRaster, Some("RasterWorkspace")),
         KeyBinding::new("secondary-0", FitRaster, Some("RasterWorkspace")),
@@ -465,6 +466,11 @@ impl Render for MapView {
         div()
             .id("raster-workspace")
             .key_context("RasterWorkspace")
+            .on_action(cx.listener(|view, _: &crate::shortcuts::ShowShortcuts, window, cx| {
+                view.coast = None;
+                view.drag = None;
+                crate::shortcuts::open(window, cx);
+            }))
             .on_action(cx.listener(|view, _: &crate::settings::OpenSettings, window, cx| {
                 view.coast = None;
                 view.drag = None;
@@ -502,6 +508,74 @@ mod tests {
     use gpui_kit::{AppContext, InputEvent as _, TestAppContext, point, px, size};
 
     use super::*;
+
+    #[gpui_kit::test]
+    fn question_mark_shows_shortcuts_and_dismissal_restores_focus(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut view = None;
+        let handle = cx.open_window(size(px(640.0), px(400.0)), |window, cx| {
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("keyboard-shortcuts").is_none());
+            window.press("?", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("keyboard-shortcuts").visible());
+            assert!(window.find("shortcut-open").visible());
+            assert_eq!(
+                window.find("shortcuts-title").bounds().center().x,
+                px(320.0),
+                "The dialog title must be centered"
+            );
+            assert!(window.try_find("shortcuts-done").is_none());
+            let close = window.find("close");
+            assert!(close.visible());
+            assert!(close.bounds().bottom() <= px(400.0), "The close button must fit in a small window");
+            let camera = view.read(cx).camera;
+            window.press("right", cx);
+            assert_eq!(view.read(cx).camera, camera, "The dialog must own keyboard input");
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("keyboard-shortcuts").is_none());
+            assert!(view.read(cx).focus.is_focused(window));
+            window.press("?", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("close", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("keyboard-shortcuts").is_none());
+            assert!(view.read(cx).focus.is_focused(window));
+        })
+        .unwrap();
+    }
 
     #[gpui_kit::test]
     fn settings_shortcut_changes_appearance_and_escape_restores_map_focus(cx: &mut TestAppContext) {

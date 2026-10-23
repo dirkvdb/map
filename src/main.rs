@@ -11,6 +11,7 @@ mod raster_panel;
 mod raster_source;
 mod raster_tiles;
 mod settings;
+mod shortcuts;
 
 use gpui_kit::{App, AppContext, Bounds, QuitMode, Window, WindowBounds, WindowOptions, px, size};
 
