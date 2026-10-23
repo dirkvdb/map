@@ -27,10 +27,11 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
 
-      - name: Configure geo-overlay cache (read only)
-        uses: cachix/cachix-action@v16
+      - name: Configure Nix binary caches (read only)
+        uses: cachix/cachix-action@v17
         with:
           name: geo-overlay
+          extraPullNames: devenv,cachix
           skipPush: true
 
       - name: Install devenv
