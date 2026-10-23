@@ -975,9 +975,10 @@ fn build_mln() {
             println!("cargo:rustc-link-lib=mbgl-vendor-nunicode");
             println!("cargo:rustc-link-lib=mbgl-vendor-sqlite");
             // println!("cargo:rustc-link-lib=utf8proc"); // sudo dnf install utf8proc-devel
+            // Static archives must follow their consumers: i18n -> uc -> data.
+            println!("cargo:rustc-link-lib=icui18n"); //sudo dnf install libicu-devel
             println!("cargo:rustc-link-lib=icuuc"); //sudo dnf install libicu-devel
             println!("cargo:rustc-link-lib=icudata"); //sudo dnf install libicu-devel
-            println!("cargo:rustc-link-lib=icui18n"); //sudo dnf install libicu-devel
         }
         // Vulkan translates GLSL to SPIR-V at runtime via glslang; OpenGL/Metal don't.
         if backend == GraphicsApi::Vulkan {
