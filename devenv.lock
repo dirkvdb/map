@@ -54,11 +54,11 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1792756474,
-        "narHash": "sha256-x6RvHUMZ8EXK6sTgMjSIiQpvhLVX6UOyDyI2QkxhMs8=",
+        "lastModified": 1792764333,
+        "narHash": "sha256-Wf2oWtKRPMV5wSPEhAh3XL85RGW65qnMznq8MuiCOPw=",
         "owner": "VITO-RMA",
         "repo": "nix-pkgs",
-        "rev": "80fc4d511aca6de00590dc9c757f6a949e0f1afe",
+        "rev": "91d58386de3eef6b42d38a6524a152a6456fd0eb",
         "type": "github"
       },
       "original": {

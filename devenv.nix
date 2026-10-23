@@ -48,7 +48,6 @@ in
       pkg-mod-gdal
       pkg-mod-proj
       pkg-mod-openssl
-      pkg-mod-maplibre-native
       fontconfig
       fontconfig.dev
       vulkan-headers
