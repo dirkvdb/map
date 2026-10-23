@@ -30,6 +30,7 @@ The initial view shows a world map with mouse and keyboard navigation.
 Zooming keeps the geographic point under the pointer in place.
 Press `?` to show keyboard shortcuts with platform-native keycaps. Escape or
 the close button dismisses the overlay and returns focus to the previous control.
+Press `Ctrl+Q` / `Cmd+Q` to quit the application, including when a dialog is open.
 
 MapLibre keeps a native renderer on a dedicated thread and reuses the loaded
 style and tiles between frames. GPUI displays each available frame immediately,

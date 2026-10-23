@@ -14,7 +14,9 @@ mod settings;
 mod shortcuts;
 
 use gpui_kit::component::TitleBar;
-use gpui_kit::{App, AppContext, Bounds, QuitMode, Window, WindowBounds, WindowOptions, px, size};
+use gpui_kit::{App, AppContext, Bounds, KeyBinding, QuitMode, Window, WindowBounds, WindowOptions, px, size};
+
+gpui_kit::actions!(app, [Quit]);
 
 fn main() {
     env_logger::init();
@@ -26,6 +28,7 @@ fn main() {
 
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
         gpui_kit::init(cx);
+        init_actions(cx);
         appearance::init(cx);
         map_view::init(cx);
 
@@ -38,6 +41,11 @@ fn main() {
         cx.set_quit_mode(QuitMode::LastWindowClosed);
         cx.activate(true);
     });
+}
+
+fn init_actions(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
+    cx.on_action(|_: &Quit, cx| cx.quit());
 }
 
 fn create_main_window(cx: &mut App) -> anyhow::Result<()> {

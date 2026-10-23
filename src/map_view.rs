@@ -666,6 +666,53 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn quit_shortcut_dispatches_globally_from_the_map_and_a_dialog(cx: &mut TestAppContext) {
+        let dispatches = std::rc::Rc::new(std::cell::Cell::new(0));
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::init_actions(cx);
+            init(cx);
+            cx.set_reduce_motion(true);
+            // The headless platform's quit is a no-op. Observe dispatch while
+            // allowing the production app handler to run.
+            let dispatches = dispatches.clone();
+            cx.on_action(move |_: &crate::Quit, cx| {
+                dispatches.set(dispatches.get() + 1);
+                cx.propagate();
+            });
+        });
+        let handle = cx.open_window(size(px(640.), px(400.)), |window, cx| {
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map
+            });
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("q", cx);
+            assert_eq!(dispatches.get(), 0, "An unmodified Q must not quit");
+            window.press("secondary-q", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(dispatches.get(), 1);
+
+        cx.update_window(handle.into(), |_, window, cx| window.press("?", cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("keyboard-shortcuts").visible());
+            window.press("secondary-q", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(dispatches.get(), 2, "The quit shortcut must remain available inside a dialog");
+    }
+
+    #[gpui_kit::test]
     fn question_mark_shows_shortcuts_and_dismissal_restores_focus(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
