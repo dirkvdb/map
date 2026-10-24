@@ -81,7 +81,7 @@ in
       vulkan-headers
       libxkbcommon
       xorg.libxcb
-      libuv
+      pkg-mod-libuv
       libglvnd
       libglvnd.dev
     ]
