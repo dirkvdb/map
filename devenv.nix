@@ -6,19 +6,8 @@
   ...
 }:
 let
-  # Linux still needs an explicit CA bundle; macOS uses the OS certificates.
-  mapCurl =
-    if pkgs.stdenv.isLinux then
-      pkgs.pkg-mod-curl.overrideAttrs (old: {
-        cmakeFlags = old.cmakeFlags ++ [
-          "-DCURL_CA_BUNDLE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-        ];
-      })
-    else
-      pkgs.pkg-mod-curl;
-
   packageLibraries = lib.closePropagation [
-    mapCurl
+    pkgs.pkg-mod-curl
     pkgs.pkg-mod-libwebp
     pkgs.pkg-mod-gdal
     pkgs.pkg-mod-proj
@@ -57,8 +46,7 @@ in
   packages =
     with pkgs;
     [
-      # Search this curl before the unconfigured copy propagated by GDAL.
-      mapCurl
+      pkg-mod-curl
       cargo-nextest
       sccache
       pkg-config
@@ -121,6 +109,14 @@ in
       pkgs.xorg.libxcb
       pkgs.vulkan-loader
     ];
+  };
+
+  outputs = lib.optionalAttrs pkgs.stdenv.isLinux {
+    linux-package = import ./dist/linux-package.nix { inherit inputs pkgs lib; };
+    linux-ui = pkgs.linkFarm "map-linux-ui" (
+      lib.mapAttrsToList (name: path: { inherit name path; })
+        (import ./dist/linux-ui.nix { inherit inputs pkgs lib; }).libraries
+    );
   };
 
   tasks."ci:checks" = {

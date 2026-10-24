@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Map
+Comment=Explore maps and geospatial data
+Exec=map %U
+Icon=map
+Terminal=false
+Categories=Education;Geography;

@@ -164,6 +164,14 @@ copy propagated by GDAL. MapLibre and GDAL therefore retain HTTPS certificate
 verification when linked together; no certificate-verification bypass or manual
 SSL environment variables are required.
 
+On Linux, both MapLibre and GDAL also support a runtime CA-bundle override through
+`CURL_CA_BUNDLE` (or `SSL_CERT_FILE` as a fallback). MapLibre explicitly passes the
+selected path to libcurl; libcurl does not read `CURL_CA_BUNDLE` itself. This lets
+a portable launcher select a host or bundled PEM file without relying on a
+compiled-in Nix path. Invalid explicit paths fail HTTPS verification rather than
+falling back. Set these variables before launching the application; no override
+is needed for ordinary devenv builds. macOS continues to use its native trust store.
+
 To inspect the available GDAL version and static linker flags:
 
 ```sh

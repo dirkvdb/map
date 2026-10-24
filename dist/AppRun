@@ -1,0 +1,24 @@
+#!/bin/sh
+appdir=$(CDPATH= cd -P "$(dirname "$0")" && pwd) || exit 1
+
+# libxkbcommon's compiled-in data paths point into the Nix store.
+export XKB_CONFIG_ROOT="$appdir/usr/share/X11/xkb"
+export XLOCALEDIR="$appdir/usr/share/X11/locale"
+
+# Respect explicit trust settings, otherwise prefer host trust over our fallback.
+if [ -z "${CURL_CA_BUNDLE:-${SSL_CERT_FILE:-}}" ]; then
+    for bundle in /etc/ssl/certs/ca-certificates.crt \
+        /etc/pki/tls/certs/ca-bundle.crt \
+        /etc/ssl/ca-bundle.pem \
+        /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+        /etc/ssl/cert.pem; do
+        if [ -f "$bundle" ] && [ -r "$bundle" ]; then
+            SSL_CERT_FILE=$bundle
+            break
+        fi
+    done
+fi
+# libcurl uses OpenSSL's defaults; retain CURL_CA_BUNDLE compatibility for GDAL.
+export SSL_CERT_FILE="${CURL_CA_BUNDLE:-${SSL_CERT_FILE:-$appdir/usr/share/map/certs/ca-bundle.crt}}"
+
+exec "$appdir/usr/bin/map" "$@"

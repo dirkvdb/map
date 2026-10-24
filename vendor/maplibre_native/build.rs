@@ -14,7 +14,7 @@
 //! Set `MLN_CMAKE_PYTHON_EXECUTABLE` to Python 3.10+ for the WebGPU wrapper generator.
 //!
 
-//! Set `MLN_STATIC_DEPS=1` for macOS packaging with static pkg-config dependencies.
+//! Set `MLN_STATIC_DEPS=1` for macOS/Linux packaging with static pkg-config dependencies.
 //! All non-system libraries, including transitive dependencies, must have archives.
 //!
 //! Required libraries:
@@ -805,7 +805,10 @@ impl StaticDependencies {
     }
 
     fn configure_cmake(&self, config: &mut cmake::Config) {
+        // Do not let an installed CURLConfig.cmake select a different ABI/sysroot.
+        config.define("CURL_NO_CURL_CMAKE", "ON");
         for (package, prefix, include_variable, header) in [
+            ("libcurl", "CURL", "CURL_INCLUDE_DIR", "curl/curl.h"),
             ("libpng", "PNG", "PNG_PNG_INCLUDE_DIR", "png.h"),
             ("libjpeg", "JPEG", "JPEG_INCLUDE_DIR", "jpeglib.h"),
             ("zlib", "ZLIB", "ZLIB_INCLUDE_DIR", "zlib.h"),
@@ -880,7 +883,10 @@ fn build_mln() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
     check_feature_combinations(&target_os, precompiled);
     let static_dependencies = static_deps.then(|| {
-        assert_eq!(target_os, "macos", "MLN_STATIC_DEPS=1 supports macOS packaging only");
+        assert!(
+            matches!(target_os.as_str(), "macos" | "linux"),
+            "MLN_STATIC_DEPS=1 supports macOS and Linux packaging only"
+        );
         StaticDependencies::resolve()
     });
     if target_os == "macos" && !static_deps {
@@ -957,28 +963,29 @@ fn build_mln() {
         precompiled || source_core_uses_ndebug,
     );
     let is_apple = target_os == "macos" || target_os == "ios";
+    let native_link_kind = if static_deps { "static=" } else { "" };
     if !amalgam_lib {
         // The dependent libs are not bundled in the core lib, so we have to link manually
 
-        println!("cargo:rustc-link-lib=mbgl-harfbuzz");
-        println!("cargo:rustc-link-lib=mbgl-freetype");
-        println!("cargo:rustc-link-lib=mbgl-vendor-parsedate");
-        println!("cargo:rustc-link-lib=mbgl-vendor-csscolorparser");
+        println!("cargo:rustc-link-lib={native_link_kind}mbgl-harfbuzz");
+        println!("cargo:rustc-link-lib={native_link_kind}mbgl-freetype");
+        println!("cargo:rustc-link-lib={native_link_kind}mbgl-vendor-parsedate");
+        println!("cargo:rustc-link-lib={native_link_kind}mbgl-vendor-csscolorparser");
         // provided with maplibre-native; `mlt-cpp` calls into FastPFor, so
         // `fastpfor-lib` must follow it on the link line.
-        println!("cargo:rustc-link-lib=mlt-cpp");
-        println!("cargo:rustc-link-lib=fastpfor-lib");
+        println!("cargo:rustc-link-lib={native_link_kind}mlt-cpp");
+        println!("cargo:rustc-link-lib={native_link_kind}fastpfor-lib");
         if is_apple {
             // darwin builds vendored ICU.
-            println!("cargo:rustc-link-lib=mbgl-vendor-icu");
+            println!("cargo:rustc-link-lib={native_link_kind}mbgl-vendor-icu");
         } else {
-            println!("cargo:rustc-link-lib=mbgl-vendor-nunicode");
-            println!("cargo:rustc-link-lib=mbgl-vendor-sqlite");
+            println!("cargo:rustc-link-lib={native_link_kind}mbgl-vendor-nunicode");
+            println!("cargo:rustc-link-lib={native_link_kind}mbgl-vendor-sqlite");
             // println!("cargo:rustc-link-lib=utf8proc"); // sudo dnf install utf8proc-devel
             // Static archives must follow their consumers: i18n -> uc -> data.
-            println!("cargo:rustc-link-lib=icui18n"); //sudo dnf install libicu-devel
-            println!("cargo:rustc-link-lib=icuuc"); //sudo dnf install libicu-devel
-            println!("cargo:rustc-link-lib=icudata"); //sudo dnf install libicu-devel
+            println!("cargo:rustc-link-lib={native_link_kind}icui18n"); //sudo dnf install libicu-devel
+            println!("cargo:rustc-link-lib={native_link_kind}icuuc"); //sudo dnf install libicu-devel
+            println!("cargo:rustc-link-lib={native_link_kind}icudata"); //sudo dnf install libicu-devel
         }
         // Vulkan translates GLSL to SPIR-V at runtime via glslang; OpenGL/Metal don't.
         if backend == GraphicsApi::Vulkan {
@@ -997,7 +1004,7 @@ fn build_mln() {
         }
     }
     if !is_apple {
-        println!("cargo:rustc-link-lib=uv"); // sudo dnf install libuv-devel
+        println!("cargo:rustc-link-lib={native_link_kind}uv"); // sudo dnf install libuv-devel
     }
     if let Some(dependencies) = &static_dependencies {
         dependencies.link();

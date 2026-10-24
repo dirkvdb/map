@@ -20,19 +20,6 @@ run args='':
 [windows]
 set shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]
 
-# Linux packaging still uses the mise/vcpkg toolchain.
-mise_bin := env("MISE_BIN", "mise")
-
-
-# Linux: build static dependencies and prepare MapLibre Native's locked source.
-[linux]
-package-dependencies:
-    [ -z "${VCPKG_BINARY_CACHE:-}" ] || mkdir -p "$VCPKG_BINARY_CACHE"
-    cargo vcpkg --verbose build --manifest-path dist/vcpkg/Cargo.toml --target "$(rustc -vV | sed -n 's/^host: //p')"
-    test -f "$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib/libgdal.a"
-    test -f "$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib/libproj.a"
-    rm -rf dist/build/vcpkg/buildtrees dist/build/vcpkg/downloads dist/build/vcpkg/packages
-    python3 scripts/prepare_maplibre.py dist/build/maplibre-native
 
 # Use devenv's static overlay libraries, not host or mise/vcpkg dependencies.
 [macos]
@@ -41,15 +28,7 @@ dmg:
 
 [linux]
 appimage:
-    MISE_DEFAULT_CONFIG_FILENAME=dist/mise.linux.toml {{quote(mise_bin)}} exec -- just _appimage
-
-# cargo-bundle 0.11 locates the binary via CARGO_TARGET_DIR (no --binary-path flag).
-[linux]
-_appimage:
-    just generate-package-icons
-    just package-dependencies
-    GDAL_STATIC=1 GDAL_HOME="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET" PKG_CONFIG_PATH="$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib/pkgconfig" cargo build --release --locked --bin map
-    CARGO_BUNDLE_SKIP_BUILD=1 cargo bundle --release --format appimage
+    devenv shell -- python3 scripts/package_linux.py
 
 # Regenerate bundle icons before every package build so they match the source.
 [macos]

@@ -26,6 +26,10 @@ the core can build with devenv's Apple SDK without resolving a native Swift
 toolchain through Nix's SDK-only `DEVELOPER_DIR`. Objective-C and Objective-C++
 remain enabled.
 
+Linux CA trust needs no MapLibre patch: pkgs-mod's libcurl uses OpenSSL's
+standard trust paths and `SSL_CERT_FILE` / `SSL_CERT_DIR`. The AppImage launcher
+selects the runtime CA bundle. macOS keeps its native trust-store handling.
+
 `maplibre_native/build.rs` checks/applies these patches for source builds, including
 the configured `.devenv/maplibre-native` checkout. It refuses conflicts; it does
 not reset or overwrite checkout changes. The custom-layer extension requires

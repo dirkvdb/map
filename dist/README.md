@@ -1,19 +1,26 @@
 # Packaging
 
-The distribution workflow produces native macOS and Linux packages:
+Packaging uses devenv and the static `pkg-mod-*` dependencies from the geo
+overlay, building MapLibre Native from its locked source revision.
 
-- macOS: `dist/build/devenv/release/bundle/osx/Map.app`
-- macOS: `dist/build/devenv/release/bundle/dmg/Map.dmg`
-- Linux: `dist/build/release/bundle/appimage/*.AppImage`
+- macOS app: `dist/build/devenv/release/bundle/osx/Map.app`
+- macOS DMG: `dist/build/devenv/release/bundle/dmg/Map.dmg`
+- Linux AppImage output: `dist/build/devenv/release/bundle/appimage/Map-x86_64.AppImage`
 
-macOS packaging uses devenv and the static `pkg-mod-*` dependencies from the
-geo overlay, without mise or vcpkg. Linux packaging retains the pinned
-mise/cargo-vcpkg toolchain. Both build MapLibre Native from its locked source
-revision. A first package build can take significantly longer than incremental
-builds.
-GitHub Actions retains its cache-backed sccache service for Rust and native
-C/C++ compilation. macOS also reads the `geo-overlay` Cachix cache without
-pushing to it; Linux persists vcpkg binary packages with `actions/cache`.
+Both CI jobs install Nix and devenv pinned to `v2.4.0`, and pull from the
+`geo-overlay`, `devenv`, and `cachix` binary caches without pushing. Linux CI
+and local `just appimage` use the same `scripts/package_linux.py` pipeline;
+neither uses mise or vcpkg. A first package build can take significantly longer
+than incremental builds.
+
+**Linux build and loader validation passed locally:** `just appimage` created
+the image, which extracted and resolved its shared libraries in an offline
+Debian/glibc-2.28 container without a Nix store. Full graphical application launch
+and rendering have not yet been validated.
+
+macOS CI retains sccache. AppImage builds explicitly disable Rust compiler
+wrappers and C/C++ compiler launchers; they do not use sccache. Nix binary-cache
+substitution and ordinary incremental Cargo/Ninja builds remain available.
 
 ## Local macOS build
 
@@ -79,51 +86,151 @@ dependencies. GitHub Actions and Intel macOS builds still require validation.
 
 ## Local Linux build
 
-The Linux toolchain is pinned with mise. `cargo-vcpkg` builds static GDAL,
-PROJ, and their native dependencies using `dist/vcpkg/Cargo.toml` and the static
-triplets in `dist/vcpkg/triplets/`. Intermediate vcpkg build trees and downloads
-are removed before the Rust build to fit GitHub-hosted runner disk limits;
-installed libraries are kept. The vcpkg GDAL and `PKG_CONFIG_PATH` settings
-apply only while compiling Map, allowing host `pkg-config` to discover
-MapLibre's system WebP, libuv, and ICU dependencies and mise to install Cargo
-tools with the host's OpenSSL. The application still uses dynamic system
-runtime and UI libraries.
-
-Linux CI caches vcpkg binary packages with OS/architecture keys derived from
-the vcpkg manifest, triplets, and overlay ports. Cache misses compile normally
-and populate the cache for later runs. Local Linux builds do not require
-sccache. `MISE_BIN` can select an absolute mise executable.
-
-Install mise and the native packages listed in `.github/workflows/dist.yml`,
-then run:
+Requires x86_64 Linux, Nix, devenv, and `just`:
 
 ```sh
-mise trust dist/mise.linux.toml
-MISE_DEFAULT_CONFIG_FILENAME=dist/mise.linux.toml mise install
 just appimage
 ```
 
-`just appimage` activates the pinned Linux mise environment automatically.
-The AppImage is unsigned. GitHub's artifact ZIP may remove its executable bit;
-restore it with `chmod +x <file>.AppImage` after downloading.
+The recipe uses the same command as CI:
 
-Pushing a semantic version tag such as `v0.1.0` builds both packages and creates
-a GitHub release with the resulting files. Branch pushes, pull requests, and
-manual runs build artifacts without publishing a release.
+```sh
+devenv shell -- python3 scripts/package_linux.py
+```
+
+Release inputs are declared in `dist/linux-package.nix`; they are isolated from the native
+libraries used by normal development builds. To realize/check the inputs
+without compiling Map:
+
+```sh
+devenv shell -- python3 scripts/package_linux.py --check
+```
+
+The build uses stock Rust with pkgs-mod's Zig linker targeting glibc 2.28 and
+static geospatial dependencies, in `dist/build/appimage/target`. The pkgs-mod pin
+`90cb6215` fixes the old PROJ/GDAL pkg-config metadata blocker involving temporary
+Zig-cache paths and host glibc paths. Release-only pkg-config metadata retains
+GDAL's private `libcurl` dependency so static linking includes curl's transitive
+dependencies and Brotli search paths. These adjustments do not affect ordinary
+development builds.
+
+Compiler wrappers and MLN/CMake launchers are explicitly cleared, including
+Cargo user-config wrappers; no sccache or cache workaround is used. Native
+dependencies use explicit static link mode. MapLibre selects static dependencies
+and the target curl archive instead of a host CMake package. No host development
+packages are needed for this pipeline.
+
+After linking, `scripts/appimage_bundle.py` uses linuxdeploy and hash-pinned
+AppImageKit 12 to create the AppDir and image. A separate hash-pinned **static
+type2 runtime `20251108`** is supplied with `--runtime-file`, avoiding the old
+AppImageKit bootstrap's dependency on host zlib. The AppDir includes UI loaders,
+keyboard/Compose data and a fallback CA bundle; no external GDAL/PROJ data is shipped. ELF guards reject newer
+glibc requirements, Nix interpreter/dependency paths, unresolved shared libraries,
+and bundled host glibc or GPU drivers. Host GPU drivers remain external.
+
+Rebuilding an existing AppDir restores directory write permissions before
+removal, including directories copied read-only from Nix outputs or left by a
+failed build. The AppDir root is explicitly mode `755`.
+
+### CI loader/bootstrap smoke test
+
+After packaging, CI pulls `debian:buster-slim` (glibc 2.28) and runs the test
+with `--network none`, mounting only the artifact directory read-only. The
+AppImage's own bootstrap extracts it under `/tmp` without FUSE. The test checks
+that the extracted root is mode `755`, then runs `ldd` on `usr/bin/map` using
+only its relative RPATHs, without `LD_LIBRARY_PATH`. A failed loader check,
+`not found`, or `/nix/store` in the output fails the job. No host development
+packages or Nix store are mounted into the container.
+
+The local `just appimage` build and this clean non-Nix **loader/bootstrap test**
+have both passed. The application and bundled libraries meet the glibc 2.28 ELF
+checks; the bootstrap is statically linked. This is not a full graphical launch
+or UI-rendering test, which still requires validation with suitable host GPU
+drivers and an X11 or Wayland session.
+
+### Portable devenv UI builds
+
+The repository-local `dist/linux-ui.nix` builds `libxkbcommon`, `libxcb`,
+Wayland, the Vulkan loader, and libglvnd with pkgs-mod's Zig/glibc-2.28
+package set. Its small UI overrides stay in this repository; pkgs-mod is
+unchanged. Build these libraries independently with:
+
+```sh
+devenv build outputs.linux-ui
+```
+
+The output contains a named link to each library package. Ordinary development
+builds are unchanged. The UI overrides and runtime dependency selection remain
+in this repository, not in pkgs-mod.
+
+On x86_64 Linux, all five packages built successfully, and the shared libraries
+in those package outputs had no GLIBC symbol requirements newer than 2.28.
+The full application also links using devenv's stock Rust compiler and the
+portable linker. The generated AppImage passed extraction and loader checks
+on glibc 2.28 without a Nix store; graphical rendering remains unvalidated.
+
+
+#### Runtime CA trust
+
+Linux libcurl is built with `CURL_CA_BUNDLE=none`, `CURL_CA_PATH=none`, and
+`CURL_CA_FALLBACK=ON`. It uses OpenSSL's standard `SSL_CERT_FILE` and
+`SSL_CERT_DIR` handling, so MapLibre needs no CA patch. GDAL also supports
+`SSL_CERT_FILE`. Certificate-chain and hostname verification remain enabled.
+OpenSSL may also trust certificates from `SSL_CERT_DIR` (or its default CA
+directory); an invalid CA file does not disable verification.
+
+`dist/AppRun` only sets `XKB_CONFIG_ROOT`, `XLOCALEDIR`, and `SSL_CERT_FILE`.
+The keyboard paths replace libxkbcommon's compiled-in Nix data paths. Relative
+ELF RPATHs handle shared libraries, so the launcher does not modify library,
+executable, or XDG search paths. It does not set GDAL data/plugin variables.
+
+PROJ embeds its database; GDAL's enabled raster paths do not require the copied
+GDAL data directory. These are separate resource mechanisms. The image ships
+built-in GDAL format drivers, not plugins; the launcher leaves plugin policy
+to GDAL rather than configuring a path for plugins we do not package.
+
+An offline glibc-2.28 check loaded the bundled Wayland, EGL, and Vulkan libraries
+without `LD_LIBRARY_PATH`. GDAL from the same package also reprojected an ASCII
+grid to GeoTIFF in that container without external GDAL/PROJ data directories.
+
+The launcher uses an explicit `SSL_CERT_FILE`, or selects a readable standard
+host bundle, falling back to the PEM packaged under
+`usr/share/map/certs/ca-bundle.crt`. For compatibility, a nonempty
+`CURL_CA_BUNDLE` takes precedence and is copied into `SSL_CERT_FILE`, keeping
+GDAL and MapLibre on the same bundle. `SSL_CERT_DIR` is left unchanged.
+The fallback bundle must be updated with application releases. Ordinary
+devenv builds use the same unmodified pkgs-mod curl and OpenSSL trust handling.
+
+The offline regression tests compile an unpatched libcurl client and exercise
+it against a local HTTPS server, including handle resets and rejection cases:
+
+```sh
+devenv shell -- env MAP_RUN_NATIVE_TESTS=1 python3 -B -m unittest discover -s scripts/tests -p test_ca_bundle.py -v
+```
+
+Packaging/launcher regression tests do not require an application build:
+
+```sh
+python3 -B -m unittest discover -s scripts/tests -v
+```
+
+The AppImage is unsigned. Direct mounting requires host FUSE support;
+an extracted AppDir can instead be run through its `AppRun` launcher. GitHub's
+artifact ZIP may remove the executable bit; restore it with
+`chmod +x Map-x86_64.AppImage` after downloading.
 
 ## Shared icons
 
 `data/icon.png` is the source icon and the only icon asset checked into the
-repository. Both `just dmg` and `just appimage` regenerate the icons configured
-in `Cargo.toml` before building:
+repository. `just dmg` regenerates the icons configured in `Cargo.toml`:
 
 - `dist/icon_512x512.png` (512×512)
 - `dist/icon_512x512@2x.png` (1024×1024; the high-density variant for macOS)
 
 These generated PNGs are ignored by Git. Generation uses Apple's `sips` on
-macOS and ImageMagick's `convert` on Linux (provided by the `imagemagick`
-package listed in the workflow). To generate only the icons, run
-`just generate-package-icons`.
+macOS and ImageMagick's `convert` on Linux. To generate only these icons, run
+`just generate-package-icons`. The AppImage packager instead generates its
+256×256 desktop icon inside the AppDir with devenv's ImageMagick.
 
 The macOS build also verifies that the app's `CFBundleIconFile` points to a
 nonempty icon resource before signing and creating the DMG.

@@ -56,60 +56,59 @@ jobs:
   linux:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
-    env:
-      MISE_DEFAULT_CONFIG_FILENAME: dist/mise.linux.toml
-      SCCACHE_GHA_ENABLED: 'true'
-      RUSTC_WRAPPER: sccache
-      MLN_CMAKE_CXX_LAUNCHER: sccache
-      CMAKE_C_COMPILER_LAUNCHER: sccache
-      CMAKE_CXX_COMPILER_LAUNCHER: sccache
-      VCPKG_BINARY_CACHE: ${{ github.workspace }}/dist/vcpkg-cache
-      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/dist/vcpkg-cache,readwrite
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
         with:
           submodules: recursive
 
-      - name: Install native build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends build-essential clang cmake ninja-build libclang-dev pkg-config autoconf automake libtool bison flex imagemagick squashfs-tools libssl-dev libcurl4-openssl-dev zlib1g-dev libuv1-dev libicu-dev libpng-dev libjpeg-dev libwebp-dev libfontconfig1-dev libfreetype6-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-randr0-dev libxcb-sync-dev libwayland-dev libvulkan-dev libglvnd-dev
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
 
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-
-      - name: Restore vcpkg binary packages
-        uses: actions/cache@v6
+      - name: Configure Nix binary caches (read only)
+        uses: cachix/cachix-action@v17
         with:
-          path: dist/vcpkg-cache
-          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dist/vcpkg/Cargo.toml', 'dist/vcpkg/triplets/**', 'infra-rs/vcpkg-overlay/ports/**') }}
-          restore-keys: |
-            vcpkg-${{ runner.os }}-${{ runner.arch }}-
+          name: geo-overlay
+          extraPullNames: devenv,cachix
+          skipPush: true
 
-      - name: Set up mise and packaging tools
-        uses: jdx/mise-action@v4
-        with:
-          version: 2026.10.4
-          cache: false
+      - name: Install devenv
+        run: nix profile add github:cachix/devenv/v2.4.0
 
       - name: Build Linux AppImage
-        run: mise exec -- just appimage
+        run: devenv shell -- python3 scripts/package_linux.py
 
-      - name: Verify AppImage root permissions
+      - name: Smoke-test AppImage bootstrap and loader on glibc 2.28
         run: |
-          for image in dist/build/release/bundle/appimage/*.AppImage; do
-            test -f "$image"
-            offset=$("$image" --appimage-offset)
-            root=$(unsquashfs -ll -offset "$offset" "$image" | sed -n '1p')
-            [[ "$root" == "drwxr-xr-x "*" squashfs-root" ]] || { echo "Invalid AppImage root permissions: $root" >&2; exit 1; }
-          done
+          docker pull debian:buster-slim
+          docker run --rm --network none \
+            --mount "type=bind,source=${{ github.workspace }}/dist/build/devenv/release/bundle/appimage,target=/artifacts,readonly" \
+            --workdir /tmp debian:buster-slim sh -eu -c '
+              /artifacts/Map-x86_64.AppImage --appimage-extract > /tmp/extract.log 2>&1 || {
+                cat /tmp/extract.log
+                exit 1
+              }
+              mode=$(stat -c %a squashfs-root)
+              test "$mode" = 755 || {
+                echo "Invalid AppImage root permissions: $mode" >&2
+                exit 1
+              }
+              ldd /tmp/squashfs-root/usr/bin/map > /tmp/map-ldd.log 2>&1 || {
+                  cat /tmp/map-ldd.log
+                  exit 1
+                }
+              cat /tmp/map-ldd.log
+              if grep -E "not found|/nix/store" /tmp/map-ldd.log; then
+                echo "AppImage has unresolved or Nix-store loader dependencies" >&2
+                exit 1
+              fi
+            '
 
       - name: Upload Linux AppImage
         uses: actions/upload-artifact@v6
         with:
           name: Map-Linux-${{ runner.arch }}
-          path: dist/build/release/bundle/appimage/*.AppImage
+          path: dist/build/devenv/release/bundle/appimage/Map-x86_64.AppImage
           if-no-files-found: error
 
   release:
