@@ -6,6 +6,11 @@
   ...
 }:
 let
+  linuxHostLinker = pkgs.writeShellScript "map-linux-host-linker" ''
+    # Override rustc's x86_64 LLD default: the bundled Nix wrapper contains
+    # unresolved @mktemp@/@rm@ placeholders. Keep host code on Nix's binutils.
+    exec ${pkgs.stdenv.cc}/bin/cc "$@" -fuse-ld=bfd
+  '';
   packageLibraries = lib.closePropagation [
     pkgs.pkg-mod-curl
     pkgs.pkg-mod-libwebp
@@ -102,6 +107,7 @@ in
     );
   }
   // lib.optionalAttrs pkgs.stdenv.isLinux {
+    MAP_PACKAGE_HOST_LINKER = "${linuxHostLinker}";
     BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
     LD_LIBRARY_PATH = lib.makeLibraryPath [
       pkgs.wayland
@@ -112,7 +118,10 @@ in
   };
 
   outputs = lib.optionalAttrs pkgs.stdenv.isLinux {
-    linux-package = import ./dist/linux-package.nix { inherit inputs pkgs lib; };
+    linux-package = import ./dist/linux-package.nix {
+      inherit inputs pkgs lib;
+      hostLinker = linuxHostLinker;
+    };
     windows-package = import ./dist/windows-package.nix { inherit inputs pkgs lib; };
     linux-ui = pkgs.linkFarm "map-linux-ui" (
       lib.mapAttrsToList (name: path: { inherit name path; })

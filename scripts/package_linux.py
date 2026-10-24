@@ -26,7 +26,7 @@ def load_config(root, env):
 def package_environment(config, environ, root):
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise ValueError("AppImage packaging currently requires x86_64 Linux")
-    required = ("target", "cc", "cxx", "ar", "pkgConfigPath", "libraryPath", "gdal", "glibc", "cmakePrefixPath")
+    required = ("target", "hostCc", "cc", "cxx", "ar", "pkgConfigPath", "libraryPath", "gdal", "glibc", "cmakePrefixPath")
     missing = [key for key in required if not isinstance(config.get(key), str) or not config[key]]
     if missing:
         raise ValueError("Missing Linux package configuration: " + ", ".join(missing))
@@ -61,7 +61,9 @@ def package_environment(config, environ, root):
         "CFLAGS": native_flags,
         "CXXFLAGS": native_flags,
         "CMAKE_PREFIX_PATH": config["cmakePrefixPath"],
-        f"CARGO_TARGET_{target_key}_LINKER": config["cc"],
+        # Cargo also uses this linker for host build scripts with the same triple.
+        # They must use Nix's libc to load the Nix-provided libclang via bindgen.
+        f"CARGO_TARGET_{target_key}_LINKER": config["hostCc"],
         "PKG_CONFIG_PATH": config["pkgConfigPath"],
         "PKG_CONFIG_LIBDIR": config["pkgConfigPath"],
         "PKG_CONFIG_ALL_STATIC": "1",
@@ -84,6 +86,9 @@ def package_environment(config, environ, root):
     flags = (environ["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
              if environ.get("CARGO_ENCODED_RUSTFLAGS") else shlex.split(environ.get("RUSTFLAGS", "")))
     flags.extend(f"-Lnative={path}" for path in config["libraryPath"].split(":") if path)
+    # With explicit --target, rustflags apply only to target code. Cargo appends
+    # them after its configured linker, so this overrides it only for that code.
+    flags.append(f"-Clinker={config['cc']}")
     env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
     env.pop("RUSTFLAGS", None)
     return env

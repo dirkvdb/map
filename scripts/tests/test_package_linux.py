@@ -7,11 +7,11 @@ import contextlib
 import io
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -21,6 +21,7 @@ ROOT = Path("/tmp/Map Project").resolve()
 TARGET = "x86_64-unknown-linux-gnu"
 CONFIG = {
     "target": TARGET,
+    "hostCc": "/nix/store/native-toolchain/bin/cc",
     "cc": "/nix/store/portable-toolchain/bin/cc",
     "cxx": "/nix/store/portable-toolchain/bin/c++",
     "ar": "/nix/store/portable-toolchain/bin/ar",
@@ -48,7 +49,7 @@ class PackageEnvironmentTests(unittest.TestCase):
             "CFLAGS": "-target x86_64-linux-gnu.2.28",
             "CXXFLAGS": "-target x86_64-linux-gnu.2.28",
             "CMAKE_PREFIX_PATH": CONFIG["cmakePrefixPath"],
-            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": CONFIG["cc"],
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": CONFIG["hostCc"],
             "PKG_CONFIG_PATH": CONFIG["pkgConfigPath"],
             "PKG_CONFIG_LIBDIR": CONFIG["pkgConfigPath"],
             "PKG_CONFIG_ALL_STATIC": "1",
@@ -62,8 +63,10 @@ class PackageEnvironmentTests(unittest.TestCase):
             "TMPDIR": str(work / "tmp"),
             "CMAKE_GENERATOR": "Ninja",
             "CMAKE_TOOLCHAIN_FILE": str(work / "toolchain.cmake"),
-            "CARGO_ENCODED_RUSTFLAGS": "\x1f".join(
-                f"-Lnative={path}" for path in CONFIG["libraryPath"].split(":")),
+            "CARGO_ENCODED_RUSTFLAGS": "\x1f".join([
+                *(f"-Lnative={path}" for path in CONFIG["libraryPath"].split(":")),
+                f"-Clinker={CONFIG['cc']}",
+            ]),
         }
         for name, value in expected.items():
             with self.subTest(name=name):
@@ -204,6 +207,7 @@ class PackageEnvironmentTests(unittest.TestCase):
         self.assertEqual(env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f"), [
             "-C", "opt-level=2", "--cfg", 'feature="portable build"',
             "-Lnative=/portable libraries/lib", "-Lnative=/portable/ui/lib",
+            f"-Clinker={CONFIG['cc']}",
         ])
         self.assertNotIn("RUSTFLAGS", env)
         self.assertIn("RUSTFLAGS", inherited)
@@ -213,9 +217,18 @@ class PackageEnvironmentTests(unittest.TestCase):
         inherited = {"CARGO_ENCODED_RUSTFLAGS": "\x1f".join(flags), "RUSTFLAGS": "--ignored"}
         env = packaging.package_environment(CONFIG, inherited, ROOT)
         self.assertEqual(env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f"), flags + [
-            f"-Lnative={path}" for path in CONFIG["libraryPath"].split(":")
+            *(f"-Lnative={path}" for path in CONFIG["libraryPath"].split(":")),
+            f"-Clinker={CONFIG['cc']}",
         ])
         self.assertNotIn("RUSTFLAGS", env)
+
+    def test_portable_linker_overrides_inherited_target_linker_flags(self):
+        inherited = {"RUSTFLAGS": "-Clinker=/host/cc",
+                     "LIBCLANG_PATH": "/nix/store/native-clang/lib"}
+        env = packaging.package_environment(CONFIG, inherited, ROOT)
+        self.assertEqual(env["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"], CONFIG["hostCc"])
+        self.assertEqual(env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")[-1], f"-Clinker={CONFIG['cc']}")
+        self.assertEqual(env["LIBCLANG_PATH"], inherited["LIBCLANG_PATH"])
 
     def test_rejects_unsupported_hosts_before_preparing_environment(self):
         for system, machine in (("Darwin", "x86_64"), ("Linux", "aarch64")):
@@ -367,6 +380,69 @@ class MainTests(unittest.TestCase):
         self.prepare.assert_not_called()
         self.run.assert_not_called()
         self.bundle.assert_not_called()
+
+
+@unittest.skipUnless(os.environ.get("MAP_RUN_NATIVE_TESTS") == "1", "requires Nix native tools")
+class NativeLinkerTests(unittest.TestCase):
+    def test_same_triple_build_scripts_use_native_linker_and_target_uses_override(self):
+        compiler = os.environ.get("MAP_PACKAGE_HOST_LINKER")
+        self.assertIsNotNone(compiler, "run native tests inside devenv shell")
+        version = subprocess.run(["rustc", "-vV"], check=True, capture_output=True, text=True)
+        host = next(line.removeprefix("host: ") for line in version.stdout.splitlines()
+                    if line.startswith("host: "))
+        with tempfile.TemporaryDirectory(prefix="map linker probe ") as temporary:
+            root = Path(temporary)
+            (root / "src").mkdir()
+            (root / "Cargo.toml").write_text(
+                '[package]\nname = "linker-probe"\nversion = "0.0.0"\nedition = "2024"\n'
+            )
+            (root / "build.rs").write_text("fn main() {}\n")
+            (root / "src/main.rs").write_text("fn main() {}\n")
+            # Reproduce x86_64 rustc's bundled-LLD preference even on ARM64.
+            # The production host linker must override it, not execute this stub.
+            bundled = root / "gcc-ld"
+            bundled.mkdir()
+            lld = bundled / "ld.lld"
+            lld.write_text("#!/bin/sh\necho 'unexpected bundled LLD' >&2\nexit 99\n")
+            lld.chmod(0o755)
+            linkers = {}
+            for name in ("native", "portable"):
+                wrapper = root / name
+                log = root / f"{name}.json"
+                wrapper.write_text(
+                    f"#!{os.path.realpath(sys.executable)}\n"
+                    "import json, os, sys\n"
+                    f"with open({str(log)!r}, 'w') as output:\n"
+                    "    json.dump(sys.argv[1:], output)\n"
+                    f"os.execv({compiler!r}, [{compiler!r}, '-B{bundled}', "
+                    "'-fuse-ld=lld', *sys.argv[1:]])\n"
+                )
+                wrapper.chmod(0o755)
+                linkers[name] = str(wrapper)
+            config = {**CONFIG, "target": host, "hostCc": linkers["native"],
+                      "cc": linkers["portable"]}
+            inherited = dict(os.environ)
+            for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
+                inherited.pop(name, None)
+            # Exercise same-triple Cargo behavior on any Linux developer machine;
+            # the stand-in target linker forwards to the native linker, not Zig.
+            with patch.object(packaging.platform, "machine", return_value="x86_64"):
+                env = packaging.package_environment(config, inherited, root)
+            Path(env["TMPDIR"]).mkdir(parents=True)
+            result = subprocess.run(
+                ["cargo", "build", "--release", "--offline", "--target", host],
+                cwd=root, env=env, capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            native_args = json.loads((root / "native.json").read_text())
+            target_args = json.loads((root / "portable.json").read_text())
+            self.assertTrue(any("build_script_build" in arg for arg in native_args), native_args)
+            self.assertFalse(any("build_script_build" in arg for arg in target_args), target_args)
+            self.assertTrue(any("linker_probe" in arg for arg in target_args), target_args)
+            build_script, = Path(env["CARGO_TARGET_DIR"]).glob("release/build/*/build-script-build")
+            elf = subprocess.run(["readelf", "-l", str(build_script)], env=env,
+                                 check=True, capture_output=True, text=True)
+            self.assertRegex(elf.stdout, r"Requesting program interpreter: /nix/store/[^\s\]]+")
 
 
 if __name__ == "__main__":

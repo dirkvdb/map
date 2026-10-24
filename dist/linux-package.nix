@@ -3,6 +3,7 @@
   inputs,
   pkgs,
   lib,
+  hostLinker,
 }:
 let
   ui = import ./linux-ui.nix { inherit inputs pkgs lib; };
@@ -64,6 +65,7 @@ pkgs.writeText "map-linux-package.json" (
     target = "x86_64-unknown-linux-gnu";
     arch = "x86_64";
     glibc = "2.28";
+    hostCc = "${hostLinker}";
     cc = "${compiler}/bin/${prefix}cc";
     cxx = "${compiler}/bin/${prefix}c++";
     ar = "${compiler}/bin/${prefix}ar";
