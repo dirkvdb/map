@@ -179,6 +179,11 @@ devenv shell -- pkg-config --modversion gdal
 devenv shell -- pkg-config --static --libs gdal
 ```
 
+MapLibre uses its bundled ICU consistently on macOS, Linux, and Windows; it
+does not select the shell's external ICU. The bundled implementation uses
+MapLibre's basic number-formatting fallback instead of external ICU's
+locale/currency formatting.
+
 These dependencies do not make the entire GPUI application a fully static binary.
 
 ## Verify

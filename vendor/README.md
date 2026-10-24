@@ -26,6 +26,43 @@ the core can build with devenv's Apple SDK without resolving a native Swift
 toolchain through Nix's SDK-only `DEVELOPER_DIR`. Objective-C and Objective-C++
 remain enabled.
 
+`maplibre_native/windows-mingw.patch` is a local portability patch against the
+same pinned native core. It selects the GNU Windows path with CMake's `MINGW`
+instead of requiring an MSYS shell, preserves an explicitly supplied toolchain,
+and limits WGL sources/OpenGL discovery to `MLN_WITH_OPENGL`. It also corrects
+`thread.h`'s Windows SDK header casing for Linux-hosted MinGW builds. The build
+script checks/applies it only for Windows source builds; no native revision or
+Cargo package provenance changes.
+
+`maplibre_native/bundled-icu.patch` applies to every source build of the same
+pinned core. It exposes `U_STATIC_IMPLEMENTATION` from the shared bundled ICU
+target, skips Linux's unused external ICU probes, and includes the bundled
+archive in Linux amalgamations.
+
+`MLN_STATIC_DEPS=1` now supports MinGW as well as macOS/Linux. Third-party
+libraries still require real static archives, including transitive pkg-config
+dependencies; Windows system libraries are linked by name using an explicit
+allowlist. Explicit archive paths must be static; `.dll.a` import archives are
+rejected rather than handled as a separate linking mode. Linux and Windows include libuv's static dependency
+closure; macOS's package selection is unchanged. Every source build, development
+or release, forces `MLN_USE_BUILTIN_ICU=ON` and links `mbgl-vendor-icu`. The C++
+bridge always uses bundled ICU headers and `U_STATIC_IMPLEMENTATION` as well.
+MapLibre no longer needs external ICU on Linux, Windows, or Apple platforms;
+unrelated dependencies may still need it transitively. Linux and Windows retain
+their nunicode/sqlite links. The bundled implementation uses MapLibre's
+`std::to_string` number-format fallback: locale, currency, and fraction-digit
+formatting options are not applied, unlike the external ICU implementation.
+Static libuv metadata using `-l:libuv.a` is supported. Supply target-only
+pkg-config metadata and CMake prefixes (including libuv's CMake config), and
+correct any malformed package metadata in the release configuration rather than
+editing the Nix store. These changes do not provide or select the cross-toolchain.
+
+The Windows distribution separately patches GPUI through
+`dist/gpui-windows-shaders.patch`, selected by a command-local Cargo source
+override. It embeds HLSL inputs for runtime compilation instead of depending on
+build-machine paths or Windows-hosted FXC. See `dist/README.md`; ordinary GPUI
+development builds are unchanged.
+
 Linux CA trust needs no MapLibre patch: pkgs-mod's libcurl uses OpenSSL's
 standard trust paths and `SSL_CERT_FILE` / `SSL_CERT_DIR`. The AppImage launcher
 selects the runtime CA bundle. macOS keeps its native trust-store handling.
@@ -39,6 +76,8 @@ The C++ bridge requires C++20, the core's RTTI configuration, and the WebGPU
 implementation defines explicitly. They must not use optional flag probes:
 Nix's compiler-wrapper warning on stderr makes cc-rs reject otherwise supported
 flags, silently dropping settings required by the native headers and ABI.
+On Windows, the bridge also matches the core's `_USE_MATH_DEFINES` definition
+so public headers can use `M_PI` under MinGW's strict C++20 mode.
 
 The Rust additions are `WgpuCustomLayer`, `WgpuLayerParameters`, and
 `StyleRef::add_wgpu_custom_layer(id, host, before)`, plus their CXX adapter in

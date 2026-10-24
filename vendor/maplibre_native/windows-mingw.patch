@@ -1,0 +1,73 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -29,7 +29,7 @@
+     set(CMAKE_OSX_DEPLOYMENT_TARGET 13.0)
+ endif()
+ 
+-if(WIN32 AND NOT DEFINED ENV{MSYSTEM} AND NOT MLN_WITH_QT AND NOT CMAKE_SYSTEM_NAME STREQUAL Android)
++if(WIN32 AND NOT CMAKE_TOOLCHAIN_FILE AND NOT DEFINED ENV{MSYSTEM} AND NOT MLN_WITH_QT AND NOT CMAKE_SYSTEM_NAME STREQUAL Android)
+     set(CMAKE_TOOLCHAIN_FILE ${CMAKE_CURRENT_LIST_DIR}/platform/windows/custom-toolchain.cmake)
+ endif()
+ 
+diff --git a/platform/windows/windows.cmake b/platform/windows/windows.cmake
+--- a/platform/windows/windows.cmake
++++ b/platform/windows/windows.cmake
+@@ -29,8 +29,7 @@
+     find_package(PNG REQUIRED)
+     find_package(WebP REQUIRED)
+     find_path(LIBUV_INCLUDE_DIRS uv.h)
+-elseif(DEFINED ENV{MSYSTEM})
+-    set(MSYS 1)
++elseif(MINGW)
+     set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+     set(BUILD_SHARED_LIBS OFF)
+     set(CMAKE_EXE_LINKER_FLAGS "-static")
+@@ -118,7 +117,7 @@
+                 unofficial::angle::libEGL
+                 unofficial::angle::libGLESv2
+         )
+-    elseif(MSYS)
++    elseif(MINGW)
+         pkg_search_module(EGL angleproject REQUIRED)
+ 
+         target_link_libraries(
+@@ -150,7 +149,7 @@
+         PRIVATE
+             ${PROJECT_SOURCE_DIR}/platform/default/src/mln/vulkan/headless_backend.cpp
+     )
+-else()
++elseif(MLN_WITH_OPENGL)
+     find_package(OpenGL REQUIRED)
+     target_sources(
+         mbgl-core
+@@ -232,7 +231,7 @@
+         PRIVATE
+             ${CURL_LIBRARIES}
+     )
+-elseif(MSYS)
++elseif(MINGW)
+     target_link_libraries(
+         mbgl-core
+         PRIVATE
+@@ -267,7 +266,7 @@
+         PRIVATE
+             $<IF:$<TARGET_EXISTS:libuv::uv_a>,libuv::uv_a,libuv::uv>
+     )
+-elseif(MSYS)
++elseif(MINGW)
+     target_link_libraries(
+         mbgl-core
+         PRIVATE
+diff --git a/platform/windows/include/thread.h b/platform/windows/include/thread.h
+--- a/platform/windows/include/thread.h
++++ b/platform/windows/include/thread.h
+@@ -5,7 +5,7 @@
+ 
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN 1
+-#include <Windows.h>
++#include <windows.h>
+ #endif
+ 
+ #ifdef __cplusplus

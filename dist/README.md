@@ -6,12 +6,16 @@ overlay, building MapLibre Native from its locked source revision.
 - macOS app: `dist/build/devenv/release/bundle/osx/Map.app`
 - macOS DMG: `dist/build/devenv/release/bundle/dmg/Map.dmg`
 - Linux AppImage output: `dist/build/devenv/release/bundle/appimage/Map-x86_64.AppImage`
+- Windows executable: `dist/build/devenv/release/bundle/windows/Map.exe`
 
-Both CI jobs install Nix and devenv pinned to `v2.4.0`, and pull from the
+All three CI jobs install Nix and devenv pinned to `v2.4.0`, and pull from the
 `geo-overlay`, `devenv`, and `cachix` binary caches without pushing. Linux CI
 and local `just appimage` use the same `scripts/package_linux.py` pipeline;
 neither uses mise or vcpkg. A first package build can take significantly longer
-than incremental builds.
+than incremental builds. Windows CI cross-compiles on Ubuntu with the same
+`scripts/package_windows.py` pipeline as `just exe`, tests resource embedding,
+and uploads `Map-Windows-X64`. Tagged releases include `Map.exe` alongside the
+macOS DMG and Linux AppImage.
 
 **Linux build and loader validation passed locally:** `just appimage` created
 the image, which extracted and resolved its shared libraries in an offline
@@ -218,6 +222,82 @@ The AppImage is unsigned. Direct mounting requires host FUSE support;
 an extracted AppDir can instead be run through its `AppRun` launcher. GitHub's
 artifact ZIP may remove the executable bit; restore it with
 `chmod +x Map-x86_64.AppImage` after downloading.
+
+## Local Windows cross-build
+
+On Linux, with Nix, devenv, and `just` installed:
+
+```sh
+just exe
+```
+
+This enters devenv and runs `scripts/package_windows.py`, using the locked
+pkgs-mod input's `mkBuildEnvMingwCross` setup and Rust 1.95.0 with the
+`x86_64-pc-windows-gnu` standard library. Release-only inputs are declared in
+`dist/windows-package.nix`; target libraries are not added to the native shell.
+To realize and check the toolchain without compiling Map:
+
+```sh
+devenv shell -- python3 scripts/package_windows.py --check
+```
+
+Cargo/CMake build artifacts are isolated in `dist/build/windows`. The script
+builds a locked release, checks the resulting x86_64 PE executable for accidental
+MinGW/geospatial DLL imports, and copies it to
+`dist/build/devenv/release/bundle/windows/Map.exe`. The `windows_subsystem`
+attribute in `src/main.rs` controls whether Windows release builds open a console;
+comment it out to retain console logs while debugging. Packaging accepts both
+GUI and console executables. Rust and C/C++ compiler
+wrappers are disabled for this distribution build, as for AppImage builds.
+Native build scripts retain their host compilers; target C/C++ compilation,
+resource compilation, bindgen, pkg-config, and linking use MinGW inputs.
+
+Every Windows build regenerates `dist/build/windows/map.ico` from `data/icon.png`
+with 16, 32, 48, 64, 128, and 256-pixel images. MinGW's `windres` compiles
+`dist/windows.rc` into a COFF resource object, and `cargo rustc` links it only
+into the Map executable. Packaging rejects an executable without both icon
+and icon-group resources. The `.ico` and resource object are build artifacts;
+no separate icon file needs to be shipped beside `Map.exe`. The `--check`
+preflight also generates and compiles these resources.
+
+MapLibre continues to use **wgpu**, not EGL or OpenGL. Its checked Windows
+source patch enables MinGW cross-compilation and avoids probing WGL for the
+wgpu backend. All platforms use MapLibre's bundled ICU, not an external ICU
+package. The bundled implementation uses MapLibre's basic number-formatting
+fallback rather than external ICU's locale/currency formatting.
+The static MinGW libraries include GDAL, PROJ, curl, and their dependencies;
+Windows system libraries remain dynamic. No GDAL/PROJ data directory is copied.
+The pkgs-mod pin includes the upstream fixes for PROJ's MinGW pkg-config
+archive name and C++ runtime flags; no local PROJ metadata rewrite is needed.
+The MinGW pthread archive is included for static linking. The final executable
+selects static libstdc++ with whole-archive retention before other native
+libraries, preventing later unqualified runtime requests from selecting DLL
+import thunks. Unused sections are still garbage-collected. It also resolves
+HDF5's zlib dependency after its consumers.
+GPUI separately uses Windows' system `icuuc.dll` API for jump-list strings
+(Windows 10 version 1703 or later); this is not an external MapLibre ICU build.
+These distribution settings do not affect native development builds.
+
+GPUI's pinned Windows crates normally require a Windows-hosted FXC compiler for
+release shaders. The distribution applies `dist/gpui-windows-shaders.patch` and
+`dist/gpui-pre-windows-shaders.patch` to the exact crate archives selected by
+`Cargo.lock`, verified by their checksums.
+A Cargo `paths` override selects this source only for the packaging command;
+normal development builds and the dependency lockfile remain unchanged. Only
+`gpui-fast-windows` and `gpui-pre-windows` have release debug assertions enabled
+to select their runtime shader compilers. The patches compile **embedded** HLSL
+with optimization, rather
+than opening build-machine source paths. Windows must supply
+`d3dcompiler_47.dll`; a Windows SDK/FXC installation is not required to build.
+The same distribution patches disable GPUI's DXGI debug-interface probe and
+Direct3D debug layers, independently of the shader compiler's debug-assertion
+switch. End users do not need Windows Graphics Tools or the SDK debug components;
+missing optional debugging support no longer logs `0x887A002D` at startup.
+Ordinary development builds retain upstream debug-layer detection.
+
+The executable is unsigned. Cross-build input checks and offline regression
+tests are separate from a full Windows graphical launch/rendering test, which
+must still be performed on a Windows machine.
 
 ## Shared icons
 

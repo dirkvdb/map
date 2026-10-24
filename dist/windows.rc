@@ -1,0 +1,4 @@
+// The first icon group is the application icon shown by Windows Explorer.
+// map.ico is regenerated from data/icon.png in the distribution build directory.
+LANGUAGE 0, 0
+1 ICON "map.ico"

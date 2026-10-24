@@ -14,14 +14,14 @@
 //! Set `MLN_CMAKE_PYTHON_EXECUTABLE` to Python 3.10+ for the WebGPU wrapper generator.
 //!
 
-//! Set `MLN_STATIC_DEPS=1` for macOS/Linux packaging with static pkg-config dependencies.
+//! Set `MLN_STATIC_DEPS=1` for macOS/Linux/MinGW packaging with static pkg-config dependencies.
 //! All non-system libraries, including transitive dependencies, must have archives.
 //!
 //! Required libraries:
 //! Fedora:
-//!     - `sudo dnf install libicu-devel libglslang-devel spirv-tools-devel libpng-devel libjpeg-turbo-devel libuv-devel libwebp-devel`
+//!     - `sudo dnf install libglslang-devel spirv-tools-devel libpng-devel libjpeg-turbo-devel libuv-devel libwebp-devel`
 //! Ubuntu:
-//!     - `sudo apt install glslang-dev glslang-tools libicu-dev libpng-dev libjpeg-turbo8-dev libuv1-dev libwebp-dev ccache`
+//!     - `sudo apt install glslang-dev glslang-tools libpng-dev libjpeg-turbo8-dev libuv1-dev libwebp-dev ccache`
 //!
 //! To build the amalgam library [armerge](https://github.com/tux3/armerge) is required:
 //!     - `cargo install armerge`
@@ -346,6 +346,13 @@ fn build_bridge(
         .warnings(true)
         .warnings_into_errors(true);
 
+    // Every source-built core uses bundled static ICU, on every platform.
+    build.define("U_STATIC_IMPLEMENTATION", None);
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        // Match mbgl-core: strict C++20 hides MinGW's M_PI without this opt-in.
+        build.define("_USE_MATH_DEFINES", None);
+    }
+
     // Match mbgl-core's default RTTI setting; MSVC keeps RTTI on both sides.
     if !build.get_compiler().is_like_msvc() {
         build.flag("-fno-rtti");
@@ -536,6 +543,8 @@ fn configure_local_build(
 
     // We only build the `mbgl-core` target, so skip configuring the GLFW demo app.
     config.configure_arg("-DMLN_WITH_GLFW=OFF");
+    // Use one ICU implementation for development and release on every platform.
+    config.define("MLN_USE_BUILTIN_ICU", "ON");
 
     if let Some(dependencies) = static_dependencies {
         dependencies.configure_cmake(config);
@@ -641,6 +650,8 @@ fn build_local(
     // or requiring a manually modified native checkout.
     for (name, enabled) in [
         ("darwin-no-swift.patch", matches!(target_os, "macos" | "ios")),
+        ("bundled-icu.patch", true),
+        ("windows-mingw.patch", target_os == "windows"),
         ("webgpu-custom-layer.patch", cfg!(feature = "wgpu")),
     ] {
         if !enabled {
@@ -689,7 +700,8 @@ fn build_local(
     // println!("cargo:warning=Building maplibre-native done.");
 
     // maplibre-native include directories
-    let mut include_dirs = Vec::new();
+    // Keep bridge headers consistent with the core, ahead of external ICU.
+    let mut include_dirs = vec![maplibre_native_dir.join("vendor/icu/include")];
     let maplibre_native_include_dirs = vec![
         "include",
         "src", // contains offscreen_texture.hpp
@@ -729,40 +741,91 @@ fn build_local(
 
 struct StaticDependencies(Vec<(&'static str, pkg_config::Library)>);
 
-fn is_apple_system_library(name: &str) -> bool {
-    // libc++ is intentionally left to the application's packaging policy.
-    matches!(name, "c" | "m" | "pthread" | "dl" | "resolv" | "iconv" | "System" | "c++" | "c++abi")
+fn is_system_library(target_os: &str, name: &str) -> bool {
+    if target_os == "windows" {
+        // Import libraries for Windows APIs are not bundled third-party archives.
+        // m is supplied by MinGW's CRT; C++ runtime selection remains the packager's.
+        [
+            "m", "kernel32", "user32", "gdi32", "advapi32", "crypt32", "bcrypt", "ws2_32",
+            "iphlpapi", "psapi", "userenv", "dbghelp", "ole32", "shell32",
+        ]
+        .contains(&name)
+    } else {
+        // Preserve the existing macOS/Linux system and C++ runtime policy.
+        matches!(
+            name,
+            "c" | "m" | "pthread" | "dl" | "resolv" | "iconv" | "System" | "c++" | "c++abi"
+        )
+    }
+}
+
+fn archive_library_name(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?.strip_prefix("lib")?.strip_suffix(".a")?;
+    (!name.ends_with(".dll")).then_some(name)
+}
+
+fn normalize_library_names(library: &mut pkg_config::Library) {
+    // libuv uses -l:libuv.a; Cargo's static link directive needs just "uv".
+    for name in &mut library.libs {
+        if let Some(archive) = name.strip_prefix(":lib").and_then(|name| name.strip_suffix(".a")) {
+            *name = archive.to_owned();
+        }
+    }
+}
+
+fn static_packages(target_os: &str) -> Vec<&'static str> {
+    let mut packages = vec!["libpng", "libjpeg", "libwebp", "libcurl", "zlib", "sqlite3"];
+    if matches!(target_os, "linux" | "windows") {
+        packages.push("libuv");
+    }
+    packages
 }
 
 fn static_archive(package: &str, library: &pkg_config::Library, name: &str) -> PathBuf {
+    let filename = format!("lib{name}.a");
     library
         .link_paths
         .iter()
-        .map(|path| path.join(format!("lib{name}.a")))
-        .find(|path| path.is_file())
+        .map(|path| path.join(&filename))
+        .find(|path| !filename.ends_with(".dll.a") && path.is_file())
         .unwrap_or_else(|| {
             panic!(
-                "MLN_STATIC_DEPS=1: {package} requires lib{name}.a, not a dylib; searched {:?}. \
+                "MLN_STATIC_DEPS=1: {package} requires {filename}, not a dylib/import library; searched {:?}. \
                  Provide a static package through PKG_CONFIG_PATH.",
                 library.link_paths
             )
         })
 }
 
+fn validate_static_library(package: &str, library: &pkg_config::Library, target_os: &str) {
+    for name in &library.libs {
+        if !is_system_library(target_os, name) {
+            static_archive(package, library, name);
+        }
+    }
+    for path in &library.link_files {
+        assert!(
+            archive_library_name(path).is_some() && path.is_file(),
+            "MLN_STATIC_DEPS=1: {package} requires a static archive, got {}",
+            path.display()
+        );
+    }
+}
+
 impl StaticDependencies {
-    fn resolve() -> Self {
+    fn resolve(target_os: &str) -> Self {
         println!("cargo:rerun-if-env-changed=HOMEBREW_PREFIX");
-        let packages = ["libpng", "libjpeg", "libwebp", "libcurl", "zlib", "sqlite3"];
         Self(
-            packages
+            static_packages(target_os)
                 .into_iter()
                 .map(|package| {
                     // pkg-config-rs otherwise silently emits dynamic links for missing archives.
-                    let library = pkg_config::Config::new()
+                    let mut library = pkg_config::Config::new()
                         .statik(true)
                         .cargo_metadata(false)
                         .probe(package)
                         .unwrap_or_else(|error| panic!("MLN_STATIC_DEPS=1: {package}: {error}"));
+                    normalize_library_names(&mut library);
                     for path in library
                         .link_paths
                         .iter()
@@ -779,19 +842,7 @@ impl StaticDependencies {
                             path.display()
                         );
                     }
-                    for name in &library.libs {
-                        if !is_apple_system_library(name) {
-                            static_archive(package, &library, name);
-                        }
-                    }
-                    for path in &library.link_files {
-                        assert!(
-                            path.extension().is_some_and(|extension| extension == "a")
-                                && path.is_file(),
-                            "MLN_STATIC_DEPS=1: {package} requires a static archive, got {}",
-                            path.display()
-                        );
-                    }
+                    validate_static_library(package, &library, target_os);
                     // Do not let opaque linker flags bypass archive validation (e.g. -Wl,-lfoo).
                     assert!(
                         library.ld_args.iter().all(Vec::is_empty),
@@ -807,6 +858,7 @@ impl StaticDependencies {
     fn configure_cmake(&self, config: &mut cmake::Config) {
         // Do not let an installed CURLConfig.cmake select a different ABI/sysroot.
         config.define("CURL_NO_CURL_CMAKE", "ON");
+        config.define("PKG_CONFIG_ARGN", "--static");
         for (package, prefix, include_variable, header) in [
             ("libcurl", "CURL", "CURL_INCLUDE_DIR", "curl/curl.h"),
             ("libpng", "PNG", "PNG_PNG_INCLUDE_DIR", "png.h"),
@@ -831,21 +883,17 @@ impl StaticDependencies {
         }
     }
 
-    fn link(&self) {
+    fn link(&self, target_os: &str) {
         for (_, library) in &self.0 {
             for path in &library.link_paths {
                 println!("cargo:rustc-link-search=native={}", path.display());
             }
             for name in &library.libs {
-                let kind = if is_apple_system_library(name) { "dylib" } else { "static" };
+                let kind = if is_system_library(target_os, name) { "dylib" } else { "static" };
                 println!("cargo:rustc-link-lib={kind}={name}");
             }
             for path in &library.link_files {
-                let name = path
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    .and_then(|name| name.strip_prefix("lib"))
-                    .expect("pkg-config archive must be named lib<name>.a");
+                let name = archive_library_name(path).expect("validated static archive");
                 println!("cargo:rustc-link-search=native={}", path.parent().unwrap().display());
                 println!("cargo:rustc-link-lib=static={name}");
             }
@@ -884,10 +932,10 @@ fn build_mln() {
     check_feature_combinations(&target_os, precompiled);
     let static_dependencies = static_deps.then(|| {
         assert!(
-            matches!(target_os.as_str(), "macos" | "linux"),
-            "MLN_STATIC_DEPS=1 supports macOS and Linux packaging only"
+            matches!(target_os.as_str(), "macos" | "linux" | "windows"),
+            "MLN_STATIC_DEPS=1 supports macOS, Linux, and MinGW packaging only"
         );
-        StaticDependencies::resolve()
+        StaticDependencies::resolve(&target_os)
     });
     if target_os == "macos" && !static_deps {
         // Check for Homebrew installation paths
@@ -975,18 +1023,11 @@ fn build_mln() {
         // `fastpfor-lib` must follow it on the link line.
         println!("cargo:rustc-link-lib={native_link_kind}mlt-cpp");
         println!("cargo:rustc-link-lib={native_link_kind}fastpfor-lib");
-        if is_apple {
-            // darwin builds vendored ICU.
-            println!("cargo:rustc-link-lib={native_link_kind}mbgl-vendor-icu");
-        } else {
+        if !is_apple {
             println!("cargo:rustc-link-lib={native_link_kind}mbgl-vendor-nunicode");
             println!("cargo:rustc-link-lib={native_link_kind}mbgl-vendor-sqlite");
-            // println!("cargo:rustc-link-lib=utf8proc"); // sudo dnf install utf8proc-devel
-            // Static archives must follow their consumers: i18n -> uc -> data.
-            println!("cargo:rustc-link-lib={native_link_kind}icui18n"); //sudo dnf install libicu-devel
-            println!("cargo:rustc-link-lib={native_link_kind}icuuc"); //sudo dnf install libicu-devel
-            println!("cargo:rustc-link-lib={native_link_kind}icudata"); //sudo dnf install libicu-devel
         }
+        println!("cargo:rustc-link-lib={native_link_kind}mbgl-vendor-icu");
         // Vulkan translates GLSL to SPIR-V at runtime via glslang; OpenGL/Metal don't.
         if backend == GraphicsApi::Vulkan {
             println!("cargo:rustc-link-lib=glslang"); //sudo dnf install libglslang-devel
@@ -1003,11 +1044,11 @@ fn build_mln() {
             println!("cargo:rustc-link-lib=webp"); // sudo dnf install libwebp-devel
         }
     }
-    if !is_apple {
-        println!("cargo:rustc-link-lib={native_link_kind}uv"); // sudo dnf install libuv-devel
+    if !is_apple && !static_deps {
+        println!("cargo:rustc-link-lib=uv"); // sudo dnf install libuv-devel
     }
     if let Some(dependencies) = &static_dependencies {
-        dependencies.link();
+        dependencies.link(&target_os);
     } else {
         println!("cargo:rustc-link-lib=curl");
         println!("cargo:rustc-link-lib=z");
@@ -1085,13 +1126,17 @@ mod static_dependency_tests {
         }
 
         fn library(&self) -> pkg_config::Library {
+            self.library_with_flags("-lwebp", "-lsharpyuv")
+        }
+
+        fn library_with_flags(&self, libs: &str, private_libs: &str) -> pkg_config::Library {
             let metadata = self.path("fixture.pc");
             fs::write(
                 &metadata,
                 format!(
                     "Name: fixture\nDescription: static dependency fixture\nVersion: 1.0\n\
-                     Libs: -L\"{}\" -lwebp\n\
-                     Libs.private: -L\"{}\" -lsharpyuv\n",
+                     Libs: -L\"{}\" {libs}\n\
+                     Libs.private: -L\"{}\" {private_libs}\n",
                     self.path("primary/lib").display(),
                     self.path("transitive/lib").display()
                 ),
@@ -1099,12 +1144,14 @@ mod static_dependency_tests {
             .unwrap();
             // An absolute .pc filename avoids changing process-global PKG_CONFIG_PATH,
             // so these tests can run in parallel and cannot resolve host packages.
-            pkg_config::Config::new()
+            let mut library = pkg_config::Config::new()
                 .statik(true)
                 .cargo_metadata(false)
                 .env_metadata(false)
                 .probe(metadata.to_str().unwrap())
-                .unwrap()
+                .unwrap();
+            normalize_library_names(&mut library);
+            library
         }
     }
 
@@ -1112,6 +1159,104 @@ mod static_dependency_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn windows_system_imports_do_not_require_third_party_archives() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path("primary/lib/libwebp.a"), []).unwrap();
+        let library = fixture.library_with_flags(
+            "-lwebp -lm -lbcrypt -lcrypt32 -lgdi32 -ladvapi32 -lws2_32 -liphlpapi",
+            "-lpsapi -luser32 -luserenv -ldbghelp -lole32 -lshell32 -lkernel32",
+        );
+        validate_static_library("fixture", &library, "windows");
+    }
+
+    #[test]
+    fn windows_third_party_libraries_are_not_system_imports() {
+        assert!(["curl", "ssl", "crypto", "uv", "webp", "sharpyuv", "z", "pthread"]
+            .iter()
+            .all(|name| !is_system_library("windows", name)));
+    }
+
+    #[test]
+    fn windows_system_import_classification_does_not_leak_to_linux() {
+        assert!(!is_system_library("linux", "ws2_32"));
+    }
+
+    #[test]
+    fn macos_static_package_selection_is_unchanged() {
+        assert_eq!(
+            static_packages("macos"),
+            ["libpng", "libjpeg", "libwebp", "libcurl", "zlib", "sqlite3"]
+        );
+    }
+
+    #[test]
+    fn linux_static_packages_include_libuv() {
+        assert_eq!(static_packages("linux").last(), Some(&"libuv"));
+    }
+
+    #[test]
+    fn static_packages_do_not_require_external_icu_on_any_platform() {
+        for target_os in ["linux", "windows", "macos", "ios"] {
+            assert!(static_packages(target_os).iter().all(|package| !package.starts_with("icu")));
+        }
+    }
+
+    #[test]
+    fn resolves_libuv_exact_archive_filename() {
+        let fixture = Fixture::new();
+        let archive = fixture.path("primary/lib/libuv.a");
+        fs::write(&archive, []).unwrap();
+        let library = fixture.library_with_flags("-l:libuv.a", "-lws2_32");
+        validate_static_library("libuv", &library, "windows");
+        assert_eq!(static_archive("libuv", &library, &library.libs[0]), archive);
+    }
+
+    #[test]
+    fn exact_archive_filename_has_a_rust_link_library_name() {
+        let fixture = Fixture::new();
+        assert_eq!(fixture.library_with_flags("-l:libuv.a", "").libs, ["uv"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires libsharpyuv.a")]
+    fn windows_rejects_missing_third_party_transitive_archive() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path("primary/lib/libwebp.a"), []).unwrap();
+        validate_static_library("fixture", &fixture.library(), "windows");
+    }
+
+    #[test]
+    #[should_panic(expected = "not a dylib/import library")]
+    fn windows_rejects_exact_third_party_import_library() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path("primary/lib/libwebp.dll.a"), []).unwrap();
+        let library = fixture.library_with_flags("-l:libwebp.dll.a", "");
+        validate_static_library("fixture", &library, "windows");
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a static archive")]
+    fn rejects_explicit_import_library_even_for_system_names() {
+        let fixture = Fixture::new();
+        let archive = fixture.path("primary/lib/libws2_32.dll.a");
+        fs::write(&archive, []).unwrap();
+        let mut library = fixture.library_with_flags("", "");
+        library.link_files.push(archive);
+        validate_static_library("fixture", &library, "windows");
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a static archive")]
+    fn windows_rejects_explicit_third_party_import_library() {
+        let fixture = Fixture::new();
+        let archive = fixture.path("primary/lib/libwebp.dll.a");
+        fs::write(&archive, []).unwrap();
+        let mut library = fixture.library_with_flags("", "");
+        library.link_files.push(archive);
+        validate_static_library("fixture", &library, "windows");
     }
 
     #[test]

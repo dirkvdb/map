@@ -1,5 +1,5 @@
 #!/bin/sh
-appdir=$(CDPATH= cd -P "$(dirname "$0")" && pwd) || exit 1
+appdir=$(CDPATH='' cd -P "$(dirname "$0")" && pwd) || exit 1
 
 # libxkbcommon's compiled-in data paths point into the Nix store.
 export XKB_CONFIG_ROOT="$appdir/usr/share/X11/xkb"

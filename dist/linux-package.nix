@@ -19,7 +19,7 @@ let
       pkg-mod-sqlite
       pkg-mod-openssl
       pkg-mod-zlib-compat
-      pkg-mod-icu
+
       pkg-mod-libuv
     ]
   );

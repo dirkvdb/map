@@ -58,18 +58,18 @@ in
       pkg-mod-gdal
       pkg-mod-proj
       pkg-mod-openssl
-      pkg-mod-icu
+
       pkg-mod-libpng
       pkg-mod-libjpeg
       pkg-mod-libwebp
     ]
     ++ lib.optionals pkgs.stdenv.isLinux [
+      pkg-mod-libuv
       fontconfig
       fontconfig.dev
       vulkan-headers
       libxkbcommon
-      xorg.libxcb
-      pkg-mod-libuv
+      libxcb
       libglvnd
       libglvnd.dev
     ]
@@ -113,6 +113,7 @@ in
 
   outputs = lib.optionalAttrs pkgs.stdenv.isLinux {
     linux-package = import ./dist/linux-package.nix { inherit inputs pkgs lib; };
+    windows-package = import ./dist/windows-package.nix { inherit inputs pkgs lib; };
     linux-ui = pkgs.linkFarm "map-linux-ui" (
       lib.mapAttrsToList (name: path: { inherit name path; })
         (import ./dist/linux-ui.nix { inherit inputs pkgs lib; }).libraries

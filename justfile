@@ -30,6 +30,11 @@ dmg:
 appimage:
     devenv shell -- python3 scripts/package_linux.py
 
+# Cross-compile the Windows distribution with pkgs-mod's static MinGW libraries.
+[linux]
+exe:
+    devenv shell -- python3 scripts/package_windows.py
+
 # Regenerate bundle icons before every package build so they match the source.
 [macos]
 generate-package-icons:

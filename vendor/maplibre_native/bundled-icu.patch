@@ -1,0 +1,57 @@
+diff --git a/vendor/icu.cmake b/vendor/icu.cmake
+--- a/vendor/icu.cmake
++++ b/vendor/icu.cmake
+@@ -39,6 +39,9 @@
+         _REENTRANT
+ )
+ 
++# All users of the bundled archive must avoid ICU DLL import declarations.
++target_compile_definitions(mbgl-vendor-icu PUBLIC U_STATIC_IMPLEMENTATION)
++
+ if(NOT MSVC)
+     target_compile_options(mbgl-vendor-icu PRIVATE -Wno-error -Wno-shorten-64-to-32)
+ endif()
+diff --git a/platform/linux/linux.cmake b/platform/linux/linux.cmake
+--- a/platform/linux/linux.cmake
++++ b/platform/linux/linux.cmake
+@@ -12,8 +12,10 @@
+ 
+ pkg_search_module(WEBP libwebp REQUIRED)
+ pkg_search_module(LIBUV libuv REQUIRED)
+-pkg_search_module(ICUUC icu-uc)
+-pkg_search_module(ICUI18N icu-i18n)
++if(NOT MLN_USE_BUILTIN_ICU)
++    pkg_search_module(ICUUC icu-uc)
++    pkg_search_module(ICUI18N icu-i18n)
++endif()
+ find_program(ARMERGE NAMES armerge)
+ 
+ if(MLN_WITH_WAYLAND AND NOT MLN_WITH_VULKAN)
+@@ -215,6 +217,16 @@
+         list(APPEND STATIC_LIBS "${WGPU_STATIC_LIBRARY}")
+     endif()
+ 
++    if(MLN_USE_BUILTIN_ICU)
++        set(ICU_STATIC_LIBS $<TARGET_FILE:mbgl-vendor-icu>)
++    else()
++        set(ICU_STATIC_LIBS
++            ${ICUUC_LIBRARY_DIRS}/libicuuc.a
++            ${ICUUC_LIBRARY_DIRS}/libicudata.a
++            ${ICUI18N_LIBRARY_DIRS}/libicui18n.a
++        )
++    endif()
++
+     add_custom_command(
+         TARGET mbgl-core
+         POST_BUILD
+@@ -228,9 +240,7 @@
+             $<TARGET_FILE:mbgl-vendor-parsedate>
+             $<TARGET_FILE:mlt-cpp>
+             $<TARGET_FILE:fastpfor-lib>
+-            ${ICUUC_LIBRARY_DIRS}/libicuuc.a
+-            ${ICUUC_LIBRARY_DIRS}/libicudata.a
+-            ${ICUI18N_LIBRARY_DIRS}/libicui18n.a
++            ${ICU_STATIC_LIBS}
+             ${STATIC_LIBS}
+     )
+ 
