@@ -37,7 +37,11 @@ Cargo package provenance changes.
 `maplibre_native/bundled-icu.patch` applies to every source build of the same
 pinned core. It exposes `U_STATIC_IMPLEMENTATION` from the shared bundled ICU
 target, skips Linux's unused external ICU probes, and includes the bundled
-archive in Linux amalgamations.
+archive in Linux amalgamations. `maplibre_native/bundled-icu-condition.patch`
+fixes the Linux ICU selection condition when external ICU was not probed. This
+follow-up stays separate so checkouts with the original ICU patch already
+applied can upgrade without resetting local changes. Keep applied patches stable
+and add subsequent fixes as separate patches for the same reason.
 
 `MLN_STATIC_DEPS=1` now supports MinGW as well as macOS/Linux. Third-party
 libraries still require real static archives, including transitive pkg-config

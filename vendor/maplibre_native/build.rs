@@ -651,6 +651,8 @@ fn build_local(
     for (name, enabled) in [
         ("darwin-no-swift.patch", matches!(target_os, "macos" | "ios")),
         ("bundled-icu.patch", true),
+        // Keep follow-up fixes separate so already-patched checkouts can upgrade.
+        ("bundled-icu-condition.patch", true),
         ("windows-mingw.patch", target_os == "windows"),
         ("webgpu-custom-layer.patch", cfg!(feature = "wgpu")),
     ] {

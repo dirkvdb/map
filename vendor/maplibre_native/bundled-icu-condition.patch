@@ -1,0 +1,7 @@
+diff --git a/platform/linux/linux.cmake b/platform/linux/linux.cmake
+--- a/platform/linux/linux.cmake
++++ b/platform/linux/linux.cmake
+@@ -153,2 +153,2 @@
+-if(NOT ${ICUUC_FOUND} OR "${ICUUC_VERSION}" VERSION_LESS 62.0 OR MLN_USE_BUILTIN_ICU)
++if(MLN_USE_BUILTIN_ICU OR NOT ICUUC_FOUND OR "${ICUUC_VERSION}" VERSION_LESS 62.0)
+     message(STATUS "ICU not found, too old or MLN_USE_BUILTIN_ICU requestd, using builtin.")
