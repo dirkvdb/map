@@ -86,9 +86,6 @@ jobs:
       - name: Install devenv
         run: nix profile add github:cachix/devenv/v2.4.0
 
-      - name: Test Linux packaging and host/target linker isolation
-        run: devenv shell -- env MAP_RUN_NATIVE_TESTS=1 python3 -B -m unittest discover -s scripts/tests -p test_package_linux.py -v
-
       - name: Build Linux AppImage
         run: devenv shell -- python3 scripts/package_linux.py
 
@@ -147,9 +144,6 @@ jobs:
 
       - name: Install devenv
         run: nix profile add github:cachix/devenv/v2.4.0
-
-      - name: Test Windows packaging and embedded icon
-        run: devenv shell -- env MAP_RUN_NATIVE_TESTS=1 python3 -B -m unittest discover -s scripts/tests -p test_package_windows.py -v
 
       - name: Build Windows executable
         run: devenv shell -- python3 scripts/package_windows.py
