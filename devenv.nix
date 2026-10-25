@@ -9,7 +9,11 @@ let
   linuxHostLinker = pkgs.writeShellScript "map-linux-host-linker" ''
     # Override rustc's x86_64 LLD default: the bundled Nix wrapper contains
     # unresolved @mktemp@/@rm@ placeholders. Keep host code on Nix's binutils.
-    exec ${pkgs.stdenv.cc}/bin/cc "$@" -fuse-ld=bfd
+    # Same-triple C++ build dependencies inherit the portable compiler's libc++
+    # selection, but host executables need the native library and runtime path.
+    exec ${pkgs.stdenv.cc}/bin/cc "$@" -fuse-ld=bfd \
+      -L${lib.getLib pkgs.llvmPackages.libcxx}/lib \
+      -Wl,-rpath,${lib.getLib pkgs.llvmPackages.libcxx}/lib
   '';
   packageLibraries = lib.closePropagation [
     pkgs.pkg-mod-curl

@@ -384,6 +384,29 @@ class MainTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("MAP_RUN_NATIVE_TESTS") == "1", "requires Nix native tools")
 class NativeLinkerTests(unittest.TestCase):
+    def test_host_libcxx_links_and_loads_without_inherited_library_paths(self):
+        compiler = os.environ.get("MAP_PACKAGE_HOST_LINKER")
+        self.assertIsNotNone(compiler, "run native tests inside devenv shell")
+        with tempfile.TemporaryDirectory(prefix="map host libcxx probe ") as temporary:
+            root = Path(temporary)
+            env = packaging.package_environment(CONFIG, dict(os.environ), root)
+            env.pop("LD_LIBRARY_PATH", None)
+            Path(env["TMPDIR"]).mkdir(parents=True)
+            binary = root / "probe"
+            result = subprocess.run(
+                [compiler, "-x", "c", "-", "-o", str(binary),
+                 "-Wl,--no-as-needed", "-lc++"],
+                input="int main(void) { return 0; }\n", env=env,
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            dynamic = subprocess.run(
+                ["readelf", "-d", str(binary)], env=env,
+                check=True, capture_output=True, text=True,
+            )
+            self.assertIn("libc++.so", dynamic.stdout)
+            subprocess.run([str(binary)], env=env, check=True, timeout=60)
+
     def test_same_triple_build_scripts_use_native_linker_and_target_uses_override(self):
         compiler = os.environ.get("MAP_PACKAGE_HOST_LINKER")
         self.assertIsNotNone(compiler, "run native tests inside devenv shell")
@@ -396,7 +419,11 @@ class NativeLinkerTests(unittest.TestCase):
             (root / "Cargo.toml").write_text(
                 '[package]\nname = "linker-probe"\nversion = "0.0.0"\nedition = "2024"\n'
             )
-            (root / "build.rs").write_text("fn main() {}\n")
+            # C++ build dependencies (cxx/link-cplusplus) request libc++ even
+            # though Cargo links the build script with the native C driver.
+            (root / "build.rs").write_text(
+                '#[link(name = "c++")]\nunsafe extern "C" {}\nfn main() {}\n'
+            )
             (root / "src/main.rs").write_text("fn main() {}\n")
             # Reproduce x86_64 rustc's bundled-LLD preference even on ARM64.
             # The production host linker must override it, not execute this stub.
@@ -436,6 +463,7 @@ class NativeLinkerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             native_args = json.loads((root / "native.json").read_text())
             target_args = json.loads((root / "portable.json").read_text())
+            self.assertIn("-lc++", native_args)
             self.assertTrue(any("build_script_build" in arg for arg in native_args), native_args)
             self.assertFalse(any("build_script_build" in arg for arg in target_args), target_args)
             self.assertTrue(any("linker_probe" in arg for arg in target_args), target_args)
