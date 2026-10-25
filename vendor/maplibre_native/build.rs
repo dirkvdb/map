@@ -751,11 +751,12 @@ fn is_system_library(target_os: &str, name: &str) -> bool {
         ]
         .contains(&name)
     } else {
-        // Preserve the existing macOS/Linux system and C++ runtime policy.
-        matches!(
-            name,
-            "c" | "m" | "pthread" | "dl" | "resolv" | "iconv" | "System" | "c++" | "c++abi"
-        )
+        // Linux's realtime API is supplied by the target libc, not the libuv package.
+        (target_os == "linux" && name == "rt")
+            || matches!(
+                name,
+                "c" | "m" | "pthread" | "dl" | "resolv" | "iconv" | "System" | "c++" | "c++abi"
+            )
     }
 }
 
@@ -1159,6 +1160,27 @@ mod static_dependency_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn linux_libuv_system_dependencies_do_not_require_third_party_archives() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path("primary/lib/libuv.a"), []).unwrap();
+        let library = fixture.library_with_flags("-l:libuv.a -lpthread -ldl -lrt -lm", "");
+        validate_static_library("libuv", &library, "linux");
+    }
+
+    #[test]
+    fn realtime_system_library_classification_does_not_leak_to_other_platforms() {
+        assert!(["macos", "windows"].iter().all(|target| !is_system_library(target, "rt")));
+    }
+
+    #[test]
+    #[should_panic(expected = "requires libuv.a")]
+    fn linux_libuv_still_requires_its_third_party_archive() {
+        let fixture = Fixture::new();
+        let library = fixture.library_with_flags("-l:libuv.a -lpthread -ldl -lrt -lm", "");
+        validate_static_library("libuv", &library, "linux");
     }
 
     #[test]

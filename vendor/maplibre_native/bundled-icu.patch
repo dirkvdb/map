@@ -27,6 +27,10 @@ diff --git a/platform/linux/linux.cmake b/platform/linux/linux.cmake
  find_program(ARMERGE NAMES armerge)
  
  if(MLN_WITH_WAYLAND AND NOT MLN_WITH_VULKAN)
+@@ -153,2 +155,2 @@
+-if(NOT ${ICUUC_FOUND} OR "${ICUUC_VERSION}" VERSION_LESS 62.0 OR MLN_USE_BUILTIN_ICU)
++if(MLN_USE_BUILTIN_ICU OR NOT ICUUC_FOUND OR "${ICUUC_VERSION}" VERSION_LESS 62.0)
+     message(STATUS "ICU not found, too old or MLN_USE_BUILTIN_ICU requestd, using builtin.")
 @@ -215,6 +217,16 @@
          list(APPEND STATIC_LIBS "${WGPU_STATIC_LIBRARY}")
      endif()
