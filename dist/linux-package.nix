@@ -37,11 +37,15 @@ let
   libraryPath = lib.makeLibraryPath (
     map (package: package // { outputSpecified = false; }) libraries
   );
-  # MapLibre probes the standard libuv name. GDAL's flattened curl flags omit
-  # Brotli's search directory, so retain curl's own static dependency metadata.
+  # Fix libuv's duplicated absolute prefix and expose MapLibre's standard name.
+  # GDAL's flattened curl flags omit Brotli's search directory, so retain curl's
+  # own static dependency metadata.
   packagePkgConfig = pkgs.runCommand "map-release-pkgconfig" { } ''
     mkdir -p "$out/lib/pkgconfig"
-    ln -s ${lib.getDev targetPkgs.pkg-mod-libuv}/lib/pkgconfig/libuv-static.pc "$out/lib/pkgconfig/libuv.pc"
+    sed -e 's|^libdir=.*|libdir=${lib.getLib (targetPkgs.pkg-mod-libuv // { outputSpecified = false; })}/lib|' \
+        -e 's|^includedir=.*|includedir=${lib.getDev targetPkgs.pkg-mod-libuv}/include|' \
+        ${lib.getDev targetPkgs.pkg-mod-libuv}/lib/pkgconfig/libuv-static.pc \
+        > "$out/lib/pkgconfig/libuv.pc"
     cp ${lib.getDev targetPkgs.pkg-mod-gdal}/lib/pkgconfig/gdal.pc "$out/lib/pkgconfig/gdal.pc"
     chmod u+w "$out/lib/pkgconfig/gdal.pc"
     printf '\nRequires.private: libcurl\n' >> "$out/lib/pkgconfig/gdal.pc"

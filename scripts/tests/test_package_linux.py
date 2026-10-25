@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -384,6 +385,24 @@ class MainTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("MAP_RUN_NATIVE_TESTS") == "1", "requires Nix native tools")
 class NativeLinkerTests(unittest.TestCase):
+    def test_libuv_metadata_resolves_static_archive_and_headers(self):
+        config = packaging.load_config(packaging.PROJECT_ROOT, packaging.tool_environment(os.environ))
+        env = packaging.package_environment(config, os.environ, packaging.PROJECT_ROOT)
+        directories = {}
+        for option, prefix in (("--libs-only-L", "-L"), ("--cflags-only-I", "-I")):
+            result = subprocess.run(
+                ["pkg-config", "--static", option, "libuv"], env=env,
+                check=True, capture_output=True, text=True,
+            )
+            paths = [Path(flag.removeprefix(prefix)) for flag in shlex.split(result.stdout)
+                     if flag.startswith(prefix)]
+            self.assertTrue(paths, result.stdout)
+            for path in paths:
+                self.assertTrue(path.is_dir(), str(path))
+            directories[prefix] = paths
+        self.assertTrue(any((path / "libuv.a").is_file() for path in directories["-L"]))
+        self.assertTrue(any((path / "uv.h").is_file() for path in directories["-I"]))
+
     def test_host_libcxx_links_and_loads_without_inherited_library_paths(self):
         compiler = os.environ.get("MAP_PACKAGE_HOST_LINKER")
         self.assertIsNotNone(compiler, "run native tests inside devenv shell")
