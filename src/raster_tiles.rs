@@ -1,11 +1,14 @@
 //! Numeric tile jobs and flat Web Mercator tile coverage, independent of style.
 
-use std::f64::consts::PI;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result};
-use geo::Tile;
+use geo::{
+    Coordinate, LatLonBounds, Point, Tile,
+    constants::{EARTH_CIRCUMFERENCE_M, LATITUDE_MAX},
+    crs::lat_lon_to_web_mercator,
+};
 use maplibre_native::WgpuLayerParameters;
 
 use crate::raster_source::{NumericTile, RasterSource};
@@ -13,7 +16,7 @@ use crate::raster_source::{NumericTile, RasterSource};
 pub const MAX_PENDING_TILES: usize = 64;
 
 struct TileJob {
-    generation: u64,
+    generation: u64, // Incremented whenever the visible tiles change, so stale jobs can be ignored.
     source: Arc<RasterSource>,
     tile: Tile,
     dpi: u8,
@@ -112,8 +115,24 @@ impl VisibleTile {
     }
 }
 
-pub fn mercator_y(latitude: f64) -> f64 {
-    (1.0 - latitude.clamp(-85.05112878, 85.05112878).to_radians().tan().asinh() / PI) / 2.0
+fn normalized_mercator(coordinate: Coordinate) -> Point<f64> {
+    let coordinate = Coordinate::latlon(coordinate.latitude.clamp(-LATITUDE_MAX, LATITUDE_MAX), coordinate.longitude);
+    let point = lat_lon_to_web_mercator(coordinate);
+    Point::new(
+        0.5 + point.x() / EARTH_CIRCUMFERENCE_M,
+        (0.5 - point.y() / EARTH_CIRCUMFERENCE_M).clamp(0.0, 1.0),
+    )
+}
+
+fn intersects_bounds(tile: VisibleTile, bounds: LatLonBounds) -> bool {
+    let tile_bounds = tile.canonical().bounds();
+    if bounds.west() <= bounds.east() {
+        tile_bounds.intersects(&bounds)
+    } else {
+        // LatLonBounds::intersects expects non-crossing bounds.
+        tile_bounds.intersects(&[bounds.west(), bounds.south(), 180.0, bounds.north()].into())
+            || tile_bounds.intersects(&[-180.0, bounds.south(), bounds.east(), bounds.north()].into())
+    }
 }
 
 /// Coverage for the application's north-up, unpitched camera. Projection of the
@@ -126,31 +145,19 @@ pub fn visible_tiles(parameters: &WgpuLayerParameters, source: &RasterSource) ->
         .clamp(0.0, f64::from(metadata.max_zoom.clamp(0, 22))) as i32;
     let n = (1_u32 << z) as f64;
     let world = 512.0 * parameters.zoom.exp2();
-    let center_x = (parameters.longitude + 180.0) / 360.0;
-    let center_y = mercator_y(parameters.latitude);
+    let center = normalized_mercator(Coordinate::latlon(parameters.latitude, parameters.longitude));
+    let (center_x, center_y) = (center.x(), center.y());
     let left = ((center_x - parameters.width / (2.0 * world)) * n).floor() as i64;
     let right = ((center_x + parameters.width / (2.0 * world)) * n).ceil() as i64;
     let top = ((center_y - parameters.height / (2.0 * world)) * n).floor().max(0.0) as i32;
     let bottom = ((center_y + parameters.height / (2.0 * world)) * n).ceil().min(n) as i32;
-    let [west, south, east, north] = metadata.bounds;
-    let min_y = mercator_y(north) * n;
-    let max_y = mercator_y(south) * n;
-    let min_x = (west + 180.0) / 360.0 * n;
-    let max_x = (east + 180.0) / 360.0 * n;
+    let bounds = metadata.bounds.into();
     let mut tiles = Vec::new();
     for y in top..bottom {
-        if f64::from(y) >= max_y || f64::from(y + 1) <= min_y {
-            continue;
-        }
         for x in left..right {
-            let canonical_x = x.rem_euclid(1 << z) as f64;
-            let intersects = if west <= east {
-                canonical_x < max_x && canonical_x + 1.0 > min_x
-            } else {
-                canonical_x < max_x || canonical_x + 1.0 > min_x
-            };
-            if intersects {
-                tiles.push(VisibleTile { z, x, y });
+            let tile = VisibleTile { z, x, y };
+            if intersects_bounds(tile, bounds) {
+                tiles.push(tile);
             }
         }
     }
@@ -160,14 +167,6 @@ pub fn visible_tiles(parameters: &WgpuLayerParameters, source: &RasterSource) ->
         distance(a).total_cmp(&distance(b))
     });
     tiles
-}
-
-pub fn parent(tile: Tile) -> Option<Tile> {
-    (tile.z > 0).then(|| Tile {
-        z: tile.z - 1,
-        x: tile.x / 2,
-        y: tile.y / 2,
-    })
 }
 
 pub fn parent_uv(tile: Tile, ancestor: Tile) -> [f32; 4] {
@@ -205,11 +204,41 @@ mod tests {
     }
 
     #[test]
+    fn mercator_projection_clamps_poles_without_wrapping_longitude() {
+        for (latitude, expected_y) in [(-90.0, 1.0), (0.0, 0.5), (90.0, 0.0)] {
+            let point = normalized_mercator(Coordinate::latlon(latitude, 540.0));
+            assert!((point.x() - 2.0).abs() < 1e-12);
+            assert!((point.y() - expected_y).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn bounds_exclude_tiles_that_only_touch_an_edge() {
+        let tile = VisibleTile { z: 2, x: 1, y: 1 };
+        let bounds = tile.canonical().bounds();
+        assert!(intersects_bounds(tile, bounds));
+        for (x, y) in [(0, 1), (2, 1), (1, 0), (1, 2)] {
+            assert!(!intersects_bounds(VisibleTile { z: 2, x, y }, bounds));
+        }
+    }
+
+    #[test]
+    fn antimeridian_bounds_include_both_sides_and_world_copies() {
+        let bounds = [170.0, -10.0, -170.0, 10.0].into();
+        for x in [-1, 0, 3, 4] {
+            assert!(intersects_bounds(VisibleTile { z: 2, x, y: 1 }, bounds));
+        }
+        for x in [1, 2] {
+            assert!(!intersects_bounds(VisibleTile { z: 2, x, y: 1 }, bounds));
+        }
+        assert!(!intersects_bounds(VisibleTile { z: 2, x: 0, y: 0 }, bounds));
+    }
+
+    #[test]
     fn parent_fallback_samples_only_the_child_footprint() {
         let tile = Tile { z: 3, x: 7, y: 5 };
         assert_eq!(parent_uv(tile, Tile { z: 1, x: 1, y: 1 }), [0.75, 0.25, 0.25, 0.25]);
         assert_eq!(parent_uv(tile, tile), [0.0, 0.0, 1.0, 1.0]);
-        assert_eq!(parent(Tile { z: 0, x: 0, y: 0 }), None);
     }
 
     #[test]
@@ -231,6 +260,15 @@ mod tests {
         };
         let low = visible_tiles(&parameters, &source);
         assert_eq!(low.len(), 4, "Only tiles overlapping the raster should be scheduled");
+        parameters.longitude = 360.0;
+        let wrapped = visible_tiles(&parameters, &source);
+        assert_eq!(wrapped.len(), low.len());
+        for tile in &low {
+            assert!(wrapped.contains(&VisibleTile {
+                x: tile.x + (1 << tile.z),
+                ..*tile
+            }));
+        }
         parameters.longitude = 90.0;
         parameters.zoom = 18.0;
         assert!(visible_tiles(&parameters, &source).is_empty());

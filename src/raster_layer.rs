@@ -13,7 +13,7 @@ use inf::colormap::ColorMapPreset;
 use maplibre_native::{WgpuCustomLayer, WgpuLayerParameters, texture_format_from_webgpu};
 
 use crate::raster_source::{NumericTile, RasterSource};
-use crate::raster_tiles::{MAX_PENDING_TILES, TileWorkers, VisibleTile, parent, parent_uv, tile_matrix, visible_tiles};
+use crate::raster_tiles::{MAX_PENDING_TILES, TileWorkers, VisibleTile, parent_uv, tile_matrix, visible_tiles};
 
 const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CACHE_TILES: usize = 256;
@@ -70,7 +70,7 @@ impl PreviousRaster {
             if let Some(cached) = self.cache.get(&tile) {
                 return cached.texture.as_ref().map(|_| tile);
             }
-            tile = parent(tile)?;
+            tile = tile.parent()?;
         }
     }
 }
@@ -244,7 +244,7 @@ impl RasterLayer {
             if let Some(cached) = self.cache.get(&tile) {
                 return cached.texture.as_ref().map(|_| tile);
             }
-            tile = parent(tile)?;
+            tile = tile.parent()?;
         }
     }
 
@@ -299,7 +299,7 @@ impl RasterLayer {
             self.request(tile);
             if !self.cache.contains_key(&tile)
                 && self.cached_ancestor(tile).is_none()
-                && let Some(parent) = parent(tile)
+                && let Some(parent) = tile.parent()
             {
                 self.request(parent);
             }
