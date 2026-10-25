@@ -61,7 +61,11 @@ def runtime_library_dirs(closure):
             raise ValueError(f"Invalid runtimeClosure store path: {line!r}")
         for suffix in ("lib", "lib64", "lib/x86_64-linux-gnu"):
             directory = package / suffix
-            if directory.is_dir():
+            # The closure also retains build-tool glibc. Injecting it breaks
+            # distro shells/ldd by mixing Nix libc with the host dynamic loader.
+            if directory.is_dir() and not any(
+                (directory / name).exists() for name in SYSTEM_SONAMES
+            ):
                 directories.append(str(directory))
     return list(dict.fromkeys(directories))
 

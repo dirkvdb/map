@@ -212,6 +212,18 @@ class PackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "store path"):
             packaging.runtime_library_dirs(closure)
 
+    def test_runtime_library_dirs_exclude_glibc_and_loader_directories(self):
+        closure = self.root / "store-paths"
+        closure.write_text("/nix/store/hash-ui\n/nix/store/hash-glibc\n")
+        for soname in ("libc.so.6", "ld-linux-x86-64.so.2"):
+            with self.subTest(soname=soname), \
+                 patch.object(Path, "is_dir", return_value=True), \
+                 patch.object(Path, "exists", autospec=True, side_effect=lambda path:
+                              path.name == soname and path.parent == Path("/nix/store/hash-glibc/lib")):
+                directories = packaging.runtime_library_dirs(closure)
+            self.assertNotIn("/nix/store/hash-glibc/lib", directories)
+            self.assertIn("/nix/store/hash-ui/lib", directories)
+
     def test_audit_patches_rpath_and_rejects_missing_non_glibc_library(self):
         before = elf_info(needed=["libmissing.so.1"], rpaths=["/nix/store/hash/lib"])
         after = elf_info(needed=["libmissing.so.1"], rpaths=["$ORIGIN", "$ORIGIN/../lib"])
