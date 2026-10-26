@@ -1,0 +1,26 @@
+diff --git a/src/mln/renderer/sources/render_tile_source.cpp b/src/mln/renderer/sources/render_tile_source.cpp
+--- a/src/mln/renderer/sources/render_tile_source.cpp
++++ b/src/mln/renderer/sources/render_tile_source.cpp
+@@ -325,15 +325,17 @@
+ 
+         // finish
+         polylineBuilder->flush(context);
+-        for (auto& drawable : polylineBuilder->clearDrawables()) {
+-            drawable->setTileID(tile.getOverscaledTileID());
+-            tileLayerGroup->addDrawable(renderPass, tile.getOverscaledTileID(), std::move(drawable));
+-        }
+-
+         if (!layerTweaker) {
+             layerTweaker = std::make_shared<PolylineLayerTweaker>(linePropertiesUBO);
+             tileLayerGroup->addLayerTweaker(layerTweaker);
+         }
++        for (auto& drawable : polylineBuilder->clearDrawables()) {
++            drawable->setTileID(tile.getOverscaledTileID());
++            // Layer groups retain tweakers weakly. Keep the matrix updater alive
++            // with the cached drawable after this render item is replaced.
++            drawable->setLayerTweaker(layerTweaker);
++            tileLayerGroup->addDrawable(renderPass, tile.getOverscaledTileID(), std::move(drawable));
++        }
+     };
+ #endif
+ 

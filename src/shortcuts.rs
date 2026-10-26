@@ -47,6 +47,13 @@ pub(crate) fn open(window: &mut Window, cx: &mut App) {
                             "RasterWorkspace",
                             window,
                         ))
+                        .child(shortcut(
+                            "shortcut-tile-boundaries",
+                            "Toggle debug mode",
+                            &crate::map_view::ToggleTileBoundaries,
+                            "RasterWorkspace",
+                            window,
+                        ))
                         .child(shortcut("shortcut-help", "Keyboard shortcuts", &ShowShortcuts, "RasterWorkspace", window)),
                 )
                 .child(

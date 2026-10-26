@@ -6,7 +6,9 @@ struct Draw {
     previous_range: vec2<f32>,
     opacity: f32,
     blend: f32,
-    padding: vec2<f32>,
+    tile_size: f32,
+    padding: f32,
+    tile_id: vec4<u32>,
 };
 
 @group(0) @binding(0) var<uniform> draw: Draw;

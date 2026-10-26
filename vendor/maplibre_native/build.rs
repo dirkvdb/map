@@ -655,6 +655,7 @@ fn build_local(
         ("bundled-icu-condition.patch", true),
         ("windows-mingw.patch", target_os == "windows"),
         ("webgpu-custom-layer.patch", cfg!(feature = "wgpu")),
+        ("debug-tile-boundaries.patch", cfg!(feature = "wgpu")),
     ] {
         if !enabled {
             continue;

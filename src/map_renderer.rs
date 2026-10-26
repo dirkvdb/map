@@ -8,7 +8,9 @@ use anyhow::{Context as _, Result, ensure};
 use gpui_kit::RenderImage;
 #[cfg(test)]
 use image::RgbaImage;
-use maplibre_native::{AnyLayer, AnySource, Continuous, ImageRenderer, ImageRendererBuilder, RunLoopHandle, Size, WgpuCustomLayer, WgpuLayerParameters};
+use maplibre_native::{
+    AnyLayer, AnySource, Continuous, ImageRenderer, ImageRendererBuilder, MapDebugOptions, RunLoopHandle, Size, WgpuCustomLayer, WgpuLayerParameters,
+};
 
 use crate::map_camera::MapCamera;
 use crate::map_readback::GpuReadback;
@@ -46,6 +48,7 @@ pub struct MapRequest {
 pub struct MapFrame {
     pub viewport: Viewport,
     pub basemap: BasemapStyle,
+    pub tile_boundaries: bool,
     pub raster_layer_id: Option<tiler::LayerId>,
     pub image: Result<Arc<RenderImage>>,
 }
@@ -57,6 +60,7 @@ struct RenderRequest {
     opacity: f32,
     reduce_motion: bool,
     basemap: BasemapStyle,
+    tile_boundaries: bool,
 }
 
 pub struct MapRenderer {
@@ -80,7 +84,15 @@ impl MapRenderer {
         Ok(Self { sender, frames })
     }
 
-    pub fn render_raster(&self, map: MapRequest, raster: Option<Arc<RasterSource>>, opacity: f32, reduce_motion: bool, basemap: BasemapStyle) -> Result<()> {
+    pub fn render_raster(
+        &self,
+        map: MapRequest,
+        raster: Option<Arc<RasterSource>>,
+        opacity: f32,
+        reduce_motion: bool,
+        basemap: BasemapStyle,
+        tile_boundaries: bool,
+    ) -> Result<()> {
         self.sender
             .send(RenderRequest {
                 map,
@@ -88,6 +100,7 @@ impl MapRenderer {
                 opacity,
                 reduce_motion,
                 basemap,
+                tile_boundaries,
             })
             .context("Map rendering thread stopped")?;
         Ok(())
@@ -95,7 +108,7 @@ impl MapRenderer {
 
     #[cfg(test)]
     pub fn render(&self, request: MapRequest) -> Result<()> {
-        self.render_raster(request, None, 1.0, false, BasemapStyle::Dark)
+        self.render_raster(request, None, 1.0, false, BasemapStyle::Dark, false)
     }
 
     pub fn frames(&self) -> async_channel::Receiver<MapFrame> {
@@ -137,6 +150,7 @@ fn run_renderer(requests: mpsc::Receiver<RenderRequest>, frames: async_channel::
         let frame = MapFrame {
             viewport: current_request.map.viewport,
             basemap: current_request.basemap,
+            tile_boundaries: current_request.tile_boundaries,
             raster_layer_id: current_request.raster.as_ref().map(|source| source.metadata().id),
             image,
         };
@@ -172,8 +186,17 @@ fn poll_map_image(map: &mut Option<NativeMap>, request: &RenderRequest, mut requ
     }
     let map = map.as_mut().context("Map renderer unavailable")?;
     if request_changed {
-        map.numeric.borrow_mut().set_reduce_motion(request.reduce_motion);
+        {
+            let mut numeric = map.numeric.borrow_mut();
+            numeric.set_reduce_motion(request.reduce_motion);
+            numeric.set_debug(request.tile_boundaries);
+        }
         map.set_basemap(request.basemap)?;
+        map.renderer.set_debug_flags(if request.tile_boundaries {
+            MapDebugOptions::TileBorders
+        } else {
+            MapDebugOptions::NoDebug
+        });
         map.set_raster(request.raster.clone(), request.opacity)?;
         map.apply_request(request.map);
     }

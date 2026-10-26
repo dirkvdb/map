@@ -29,7 +29,9 @@ struct DrawUniform {
     previous_range: [f32; 2],
     opacity: f32,
     blend: f32,
-    padding: [f32; 2],
+    tile_size: f32,
+    padding: f32,
+    tile_id: [u32; 4],
 }
 
 struct TileTexture {
@@ -52,6 +54,7 @@ struct DrawTile {
 struct RasterPipeline {
     formats: (u32, u32, bool),
     pipeline: wgpu::RenderPipeline,
+    debug_pipeline: Option<wgpu::RenderPipeline>,
     layout: wgpu::BindGroupLayout,
     palettes: [wgpu::Texture; 2],
     palette_views: [wgpu::TextureView; 2],
@@ -95,6 +98,7 @@ pub struct RasterLayer {
     fade_started: Option<Instant>,
     queued: Option<(Arc<RasterSource>, u8)>,
     reduce_motion: bool,
+    debug: bool,
     #[cfg(test)]
     requests: u64,
     #[cfg(test)]
@@ -123,6 +127,7 @@ impl RasterLayer {
             fade_started: None,
             queued: None,
             reduce_motion: false,
+            debug: false,
             #[cfg(test)]
             requests: 0,
             #[cfg(test)]
@@ -178,6 +183,10 @@ impl RasterLayer {
 
     pub fn set_reduce_motion(&mut self, reduce: bool) {
         self.reduce_motion = reduce;
+    }
+
+    pub fn set_debug(&mut self, debug: bool) {
+        self.debug = debug;
     }
 
     /// Called by the renderer's existing frame pump, never from a tile worker.
@@ -350,11 +359,27 @@ impl RasterLayer {
                     previous_range: [previous_range.0, previous_range.1],
                     opacity: self.opacity,
                     blend,
-                    padding: [0.0; 2],
+                    tile_size: (512.0 * parameters.zoom.exp2() / f64::from(1_u32 << tile.z)) as f32,
+                    padding: 0.0,
+                    tile_id: [tile.z as u32, tile.x as u32, tile.y as u32, 0],
                 }),
             );
             pass.set_bind_group(0, &draw.bindings, &[]);
             pass.draw(0..6, 0..1);
+        }
+        if self.debug
+            && let Some(pipeline) = &mut self.pipeline
+        {
+            let debug_pipeline = pipeline
+                .debug_pipeline
+                .get_or_insert_with(|| create_pipeline(&self.device, pipeline.formats, &pipeline.layout, "debug_fragment"));
+            // Draw after every raster quad so neighboring tiles cannot cover
+            // the grid or labels. Debug visibility is independent of opacity.
+            pass.set_pipeline(debug_pipeline);
+            for draw in self.draws.values() {
+                pass.set_bind_group(0, &draw.bindings, &[]);
+                pass.draw(0..6, 0..1);
+            }
         }
         self.evict();
     }
@@ -435,55 +460,13 @@ impl RasterPipeline {
                 texture_binding(6),
             ],
         });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Numeric raster layout"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Numeric raster shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("raster_layer.wgsl").into()),
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Numeric raster"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vertex"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: (formats.1 != 0).then(|| wgpu::DepthStencilState {
-                format: texture_format_from_webgpu(formats.1),
-                depth_write_enabled: Some(false),
-                depth_compare: Some(if formats.2 {
-                    wgpu::CompareFunction::LessEqual
-                } else {
-                    wgpu::CompareFunction::Always
-                }),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fragment"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: texture_format_from_webgpu(formats.0),
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipeline = create_pipeline(device, formats, &layout, "fragment");
         let palettes = std::array::from_fn(|_| create_texture(device, 256, 1, wgpu::TextureFormat::Rgba8Unorm));
         let palette_views = palettes.each_ref().map(|palette| palette.create_view(&Default::default()));
         Self {
             formats,
             pipeline,
+            debug_pipeline: None,
             layout,
             palettes,
             palette_views,
@@ -543,6 +526,53 @@ impl RasterPipeline {
         });
         DrawTile { sampled, uniform, bindings }
     }
+}
+
+fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wgpu::BindGroupLayout, fragment: &str) -> wgpu::RenderPipeline {
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Numeric raster layout"),
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Numeric raster shader"),
+        source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", include_str!("raster_layer.wgsl"), include_str!("raster_debug.wgsl")).into()),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Numeric raster"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vertex"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: (formats.1 != 0).then(|| wgpu::DepthStencilState {
+            format: texture_format_from_webgpu(formats.1),
+            depth_write_enabled: Some(false),
+            depth_compare: Some(if formats.2 && fragment == "fragment" {
+                wgpu::CompareFunction::LessEqual
+            } else {
+                wgpu::CompareFunction::Always
+            }),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some(fragment),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: texture_format_from_webgpu(formats.0),
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 fn create_texture(device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) -> wgpu::Texture {

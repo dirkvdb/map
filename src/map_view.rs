@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::{ActiveTheme, Disableable, Sizable, Theme, TitleBar, alert::Alert};
+use gpui_kit::component::{ActiveTheme, Disableable, Selectable, Sizable, Theme, TitleBar, alert::Alert};
 use gpui_kit::{
-    App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, Entity, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, TestSupportExt, Window, canvas, div, img,
+    Anchor, App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, Entity, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyBinding,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, TestSupportExt, Window, canvas, div, img,
 };
 
 use crate::map_camera::MapCamera;
@@ -19,7 +19,7 @@ use crate::pixel_info::PixelInfo;
 use crate::raster_panel::{ClearRasters, FitRaster, OpenRaster, RasterPanel, ToggleRasterControls};
 use crate::raster_source::RasterSource;
 
-gpui_kit::actions!(map, [ZoomIn, ZoomOut, PanLeft, PanRight, PanUp, PanDown]);
+gpui_kit::actions!(map, [ZoomIn, ZoomOut, PanLeft, PanRight, PanUp, PanDown, ToggleTileBoundaries]);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -28,6 +28,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("secondary-o", OpenRaster, Some("RasterWorkspace")),
         KeyBinding::new("secondary-0", FitRaster, Some("RasterWorkspace")),
         KeyBinding::new("secondary-l", ToggleRasterControls, Some("RasterWorkspace")),
+        KeyBinding::new("secondary-shift-d", ToggleTileBoundaries, Some("RasterWorkspace")),
         KeyBinding::new("+", ZoomIn, Some("MapNavigation")),
         KeyBinding::new("=", ZoomIn, Some("MapNavigation")),
         KeyBinding::new("-", ZoomOut, Some("MapNavigation")),
@@ -118,7 +119,8 @@ pub struct MapView {
     viewport: Option<Viewport>,
     bounds: Option<Bounds<Pixels>>,
     camera: MapCamera,
-    requested: Option<(MapRequest, Option<u64>, f32, bool, BasemapStyle)>,
+    requested: Option<(MapRequest, Option<u64>, f32, bool, BasemapStyle, bool)>,
+    tile_boundaries: bool,
     raster_panel: Entity<RasterPanel>,
     pixel_info: Entity<PixelInfo>,
     pointer: Option<Point<Pixels>>,
@@ -168,6 +170,7 @@ impl MapView {
             bounds: None,
             camera: MapCamera::default(),
             requested: None,
+            tile_boundaries: false,
             raster_panel,
             pixel_info: cx.new(|_| PixelInfo::new()),
             pointer: None,
@@ -218,6 +221,7 @@ impl MapView {
         // requiring an exact style revision starves the display during dragging.
         if self.viewport != Some(frame.viewport)
             || frame.basemap != basemap_style(cx)
+            || frame.tile_boundaries != self.tile_boundaries
             || self.raster.as_ref().map(|source| source.metadata().id) != frame.raster_layer_id
         {
             return;
@@ -246,7 +250,14 @@ impl MapView {
         let request = MapRequest { viewport, camera: self.camera };
         let reduce_motion = cx.reduce_motion();
         let basemap = basemap_style(cx);
-        let key = (request, self.raster.as_ref().map(|source| source.id()), self.opacity, reduce_motion, basemap);
+        let key = (
+            request,
+            self.raster.as_ref().map(|source| source.id()),
+            self.opacity,
+            reduce_motion,
+            basemap,
+            self.tile_boundaries,
+        );
         if self.requested == Some(key) {
             return;
         }
@@ -255,7 +266,7 @@ impl MapView {
             return;
         };
         self.error = None;
-        if let Err(error) = renderer.render_raster(request, self.raster.clone(), self.opacity, reduce_motion, basemap) {
+        if let Err(error) = renderer.render_raster(request, self.raster.clone(), self.opacity, reduce_motion, basemap, self.tile_boundaries) {
             self.error = Some(format!("Couldn’t load the map. {error}").into());
         }
         cx.notify();
@@ -267,6 +278,12 @@ impl MapView {
         self.renderer = Some(renderer);
         self.requested = None;
         self.request_render(cx);
+    }
+
+    fn toggle_tile_boundaries(&mut self, cx: &mut Context<Self>) {
+        self.tile_boundaries = !self.tile_boundaries;
+        self.request_render(cx);
+        cx.notify();
     }
 
     fn pan(&mut self, dx: f64, dy: f64, cx: &mut Context<Self>) {
@@ -343,7 +360,7 @@ impl MapView {
 }
 
 impl Render for MapView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
         let previous_bounds = self.bounds;
         let previous_viewport = self.viewport;
@@ -517,6 +534,7 @@ impl Render for MapView {
             .on_action(cx.listener(|view, _: &FitRaster, _, cx| view.raster_panel.update(cx, |panel, cx| panel.fit(cx))))
             .on_action(cx.listener(|view, _: &ClearRasters, window, cx| view.raster_panel.update(cx, |panel, cx| panel.clear(window, cx))))
             .on_action(cx.listener(|view, _: &ToggleRasterControls, window, cx| view.raster_panel.update(cx, |panel, cx| panel.toggle_controls(window, cx))))
+            .on_action(cx.listener(|view, _: &ToggleTileBoundaries, _, cx| view.toggle_tile_boundaries(cx)))
             .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| view.open_paths(paths.0.to_vec(), cx)))
             .flex()
             .flex_col()
@@ -526,17 +544,33 @@ impl Render for MapView {
             .text_color(cx.theme().foreground)
             .child(
                 TitleBar::new().child("Map").child(
-                    div().pr_2().child(
-                        Button::new("open-raster")
-                            .small()
-                            .ghost()
-                            .icon(IconName::FolderOpen)
-                            .label("Open…")
-                            .tooltip("Open raster (Ctrl/⌘+O)")
-                            .loading(self.raster_panel.read(cx).is_loading())
-                            .disabled(self.raster_panel.read(cx).is_loading())
-                            .on_click(cx.listener(|view, _, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx)))),
-                    ),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pr_2()
+                        .child(
+                            Button::new("open-raster")
+                                .small()
+                                .ghost()
+                                .icon(IconName::FolderOpen)
+                                .label("Open…")
+                                .tooltip("Open raster (Ctrl/⌘+O)")
+                                .loading(self.raster_panel.read(cx).is_loading())
+                                .disabled(self.raster_panel.read(cx).is_loading())
+                                .on_click(cx.listener(|view, _, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx)))),
+                        )
+                        .child(
+                            Button::new("toggle-tile-boundaries")
+                                .small()
+                                .ghost()
+                                .icon(IconName::Bug)
+                                .accessibility_label("Debug mode")
+                                .tooltip_with_action("Debug mode: tile boundaries, tile IDs, and FPS", &ToggleTileBoundaries, Some("RasterWorkspace"))
+                                .selected(self.tile_boundaries)
+                                .toggled(self.tile_boundaries)
+                                .on_click(cx.listener(|view, _, _, cx| view.toggle_tile_boundaries(cx))),
+                        ),
                 ),
             )
             .child(
@@ -557,7 +591,8 @@ impl Render for MapView {
                             .w_80()
                             .max_w_full()
                             .child(self.raster_panel.clone()),
-                    ),
+                    )
+                    .children(self.tile_boundaries.then(|| gpui_fps::fps_monitor(window, cx).anchor(Anchor::TopLeft))),
             )
             .child(alerts)
     }
@@ -626,6 +661,7 @@ mod tests {
                         MapFrame {
                             viewport: map.viewport.unwrap(),
                             basemap: expected,
+                            tile_boundaries: false,
                             raster_layer_id: None,
                             image: Ok(image.clone()),
                         },
@@ -642,6 +678,7 @@ mod tests {
                             },
                             raster_layer_id: None,
                             image: Err(anyhow::anyhow!("Obsolete basemap failed")),
+                            tile_boundaries: false,
                         },
                         window,
                         cx,
@@ -723,6 +760,7 @@ mod tests {
                         viewport: view.viewport.unwrap(),
                         basemap: basemap_style(cx),
                         raster_layer_id: None,
+                        tile_boundaries: false,
                         image: Err(anyhow::anyhow!("Network unavailable")),
                     },
                     window,
@@ -744,6 +782,7 @@ mod tests {
                         viewport: view.viewport.unwrap(),
                         basemap: basemap_style(cx),
                         raster_layer_id: None,
+                        tile_boundaries: false,
                         image: Ok(Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]))),
                     },
                     window,
@@ -1756,6 +1795,7 @@ mod tests {
                             viewport: view.viewport.unwrap(),
                             basemap: basemap_style(cx),
                             raster_layer_id: Some(source.metadata().id),
+                            tile_boundaries: false,
                             image: Ok(image.clone()),
                         },
                         window,
@@ -1799,6 +1839,7 @@ mod tests {
                         viewport: view.viewport.unwrap(),
                         basemap: basemap_style(cx),
                         raster_layer_id: Some(obsolete_source.metadata().id),
+                        tile_boundaries: false,
                         image: Ok(obsolete),
                     },
                     window,
@@ -1843,6 +1884,7 @@ mod tests {
                                 viewport,
                                 basemap: basemap_style(cx),
                                 raster_layer_id: None,
+                                tile_boundaries: false,
                                 image: Ok(image.clone()),
                             },
                             window,
