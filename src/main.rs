@@ -3,6 +3,7 @@
 mod appearance;
 mod bundled_themes;
 mod config;
+mod feature_info;
 mod map_camera;
 mod map_readback;
 mod map_renderer;
@@ -14,6 +15,7 @@ mod raster_source;
 mod raster_tiles;
 mod settings;
 mod shortcuts;
+mod vector_source;
 
 use gpui_kit::component::TitleBar;
 use gpui_kit::{App, AppContext, Bounds, KeyBinding, QuitMode, Window, WindowBounds, WindowOptions, px, size};

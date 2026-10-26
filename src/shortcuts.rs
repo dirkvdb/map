@@ -21,8 +21,8 @@ pub(crate) fn open(window: &mut Window, cx: &mut App) {
                         .child(section_heading("Workspace", cx))
                         .child(shortcut(
                             "shortcut-open",
-                            "Open raster…",
-                            &crate::raster_panel::OpenRaster,
+                            "Open dataset…",
+                            &crate::raster_panel::OpenDataset,
                             "RasterWorkspace",
                             window,
                         ))

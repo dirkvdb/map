@@ -552,6 +552,53 @@ impl ImagePtr {
 }
 
 impl ImageRenderer<Continuous> {
+    /// Queries features rendered at `point`, in logical screen pixels from the top-left.
+    ///
+    /// Only the supplied style layer IDs are queried; pass overlay layer IDs to exclude
+    /// basemap features. An empty layer list or no matching features returns an empty vector.
+    /// Results reflect the last rendered frame, so call [`render_once`](Self::render_once)
+    /// after style, source, or camera changes and allow asynchronous loading to complete.
+    ///
+    /// Each value is a GeoJSON Feature with `type`, `geometry`, `properties`, and an
+    /// optional `id`. Native source, source-layer, and feature-state metadata is not included.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::StyleError::Native`] if the native query or serialization fails,
+    /// or [`crate::StyleError::Json`] if the returned JSON cannot be decoded as an array.
+    #[cfg(feature = "json")]
+    pub fn query_rendered_features(
+        &mut self,
+        point: ScreenCoordinate,
+        layer_ids: &[String],
+    ) -> Result<Vec<serde_json::Value>, crate::StyleError> {
+        self.query_rendered_features_with_tolerance(point, 0.0, layer_ids)
+    }
+
+    /// Queries a square centered at `point`, extending `tolerance` logical pixels
+    /// in each direction. Layer filtering and result semantics match
+    /// [`query_rendered_features`](Self::query_rendered_features).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::StyleError::Native`] for a nonfinite/negative tolerance
+    /// or a native query failure, and [`crate::StyleError::Json`] for invalid JSON.
+    #[cfg(feature = "json")]
+    pub fn query_rendered_features_with_tolerance(
+        &mut self,
+        point: ScreenCoordinate,
+        tolerance: f64,
+        layer_ids: &[String],
+    ) -> Result<Vec<serde_json::Value>, crate::StyleError> {
+        if !tolerance.is_finite() || tolerance < 0.0 {
+            return Err(crate::StyleError::Native(
+                "Feature query tolerance must be finite and nonnegative".into(),
+            ));
+        }
+        let json = self.instance.pin_mut().queryRenderedFeatures(&point, tolerance, layer_ids)?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
     /// Sets the callback invoked when MapLibre Native requests a frame.
     ///
     /// The callback should schedule [`render_once`](Self::render_once) on the

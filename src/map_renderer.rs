@@ -9,13 +9,15 @@ use gpui_kit::RenderImage;
 #[cfg(test)]
 use image::RgbaImage;
 use maplibre_native::{
-    AnyLayer, AnySource, Continuous, ImageRenderer, ImageRendererBuilder, MapDebugOptions, RunLoopHandle, Size, WgpuCustomLayer, WgpuLayerParameters,
+    AnyLayer, AnySource, Continuous, ImageRenderer, ImageRendererBuilder, MapDebugOptions, RunLoopHandle, ScreenCoordinate, Size, WgpuCustomLayer,
+    WgpuLayerParameters,
 };
 
 use crate::map_camera::MapCamera;
 use crate::map_readback::GpuReadback;
 use crate::raster_layer::{RasterLayer, RasterLayerHost};
 use crate::raster_source::{RasterSource, RasterTiles};
+use crate::vector_source::VectorSource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BasemapStyle {
@@ -50,22 +52,56 @@ pub struct MapFrame {
     pub basemap: BasemapStyle,
     pub tile_boundaries: bool,
     pub raster_layer_id: Option<tiler::LayerId>,
+    pub vector_layer_id: Option<u64>,
     pub image: Result<Arc<RenderImage>>,
+}
+
+#[derive(Clone)]
+pub enum MapSource {
+    Raster(Arc<RasterSource>),
+    Vector(Arc<VectorSource>, String),
 }
 
 #[derive(Clone)]
 struct RenderRequest {
     map: MapRequest,
     raster: Option<Arc<RasterSource>>,
+    vector: Option<Arc<VectorSource>>,
+    vector_color: String,
     opacity: f32,
     reduce_motion: bool,
     basemap: BasemapStyle,
     tile_boundaries: bool,
 }
 
+struct FeatureQuery {
+    revision: u64,
+    map: MapRequest,
+    layer_id: u64,
+    point: (f64, f64),
+}
+
+pub struct FeatureQueryResult {
+    revision: u64,
+    features: Result<Vec<serde_json::Value>, String>,
+}
+
+impl FeatureQueryResult {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn into_features(self) -> Result<Vec<serde_json::Value>, String> {
+        self.features
+    }
+}
+
 pub struct MapRenderer {
     sender: mpsc::Sender<RenderRequest>,
     frames: async_channel::Receiver<MapFrame>,
+    queries: async_channel::Sender<Option<FeatureQuery>>,
+    pending_query: async_channel::Receiver<Option<FeatureQuery>>,
+    feature_results: async_channel::Receiver<FeatureQueryResult>,
 }
 
 impl MapRenderer {
@@ -74,29 +110,46 @@ impl MapRenderer {
         let (sender, receiver) = mpsc::channel::<RenderRequest>();
         let (frame_sender, frames) = async_channel::bounded(1);
         let pending_frame = frames.clone();
+        let (queries, query_receiver) = async_channel::bounded(1);
+        let pending_query = query_receiver.clone();
+        let (feature_sender, feature_results) = async_channel::bounded(1);
+        let pending_result = feature_results.clone();
         // The !Send renderer and its run loop remain on this dedicated thread.
         // Dropping the view closes the channel; the worker finishes its bounded
         // in-flight request, drops all native resources, and exits.
         std::thread::Builder::new()
             .name("map-renderer".into())
-            .spawn(move || run_renderer(receiver, frame_sender, pending_frame))
+            .spawn(move || run_renderer(receiver, frame_sender, pending_frame, query_receiver, feature_sender, pending_result))
             .context("Could not start the map rendering thread")?;
-        Ok(Self { sender, frames })
+        Ok(Self {
+            sender,
+            frames,
+            queries,
+            pending_query,
+            feature_results,
+        })
     }
 
-    pub fn render_raster(
+    pub fn render_layer(
         &self,
         map: MapRequest,
-        raster: Option<Arc<RasterSource>>,
+        source: Option<MapSource>,
         opacity: f32,
         reduce_motion: bool,
         basemap: BasemapStyle,
         tile_boundaries: bool,
     ) -> Result<()> {
+        let (raster, vector, vector_color) = match source {
+            Some(MapSource::Raster(source)) => (Some(source), None, String::new()),
+            Some(MapSource::Vector(source, color)) => (None, Some(source), color),
+            None => (None, None, String::new()),
+        };
         self.sender
             .send(RenderRequest {
                 map,
                 raster,
+                vector,
+                vector_color,
                 opacity,
                 reduce_motion,
                 basemap,
@@ -107,6 +160,19 @@ impl MapRenderer {
     }
 
     #[cfg(test)]
+    pub fn render_raster(
+        &self,
+        map: MapRequest,
+        raster: Option<Arc<RasterSource>>,
+        opacity: f32,
+        reduce_motion: bool,
+        basemap: BasemapStyle,
+        tile_boundaries: bool,
+    ) -> Result<()> {
+        self.render_layer(map, raster.map(MapSource::Raster), opacity, reduce_motion, basemap, tile_boundaries)
+    }
+
+    #[cfg(test)]
     pub fn render(&self, request: MapRequest) -> Result<()> {
         self.render_raster(request, None, 1.0, false, BasemapStyle::Dark, false)
     }
@@ -114,12 +180,45 @@ impl MapRenderer {
     pub fn frames(&self) -> async_channel::Receiver<MapFrame> {
         self.frames.clone()
     }
+
+    pub fn feature_results(&self) -> async_channel::Receiver<FeatureQueryResult> {
+        self.feature_results.clone()
+    }
+
+    pub fn query_features(&self, revision: u64, map: MapRequest, layer_id: u64, point: (f64, f64)) {
+        self.queue_query(Some(FeatureQuery {
+            revision,
+            map,
+            layer_id,
+            point,
+        }));
+    }
+
+    pub fn clear_feature_query(&self) {
+        self.queue_query(None);
+    }
+
+    fn queue_query(&self, query: Option<FeatureQuery>) {
+        if let Err(async_channel::TrySendError::Full(query)) = self.queries.try_send(query) {
+            let _ = self.pending_query.try_recv();
+            let _ = self.queries.try_send(query);
+        }
+    }
 }
 
-fn run_renderer(requests: mpsc::Receiver<RenderRequest>, frames: async_channel::Sender<MapFrame>, pending_frame: async_channel::Receiver<MapFrame>) {
+fn run_renderer(
+    requests: mpsc::Receiver<RenderRequest>,
+    frames: async_channel::Sender<MapFrame>,
+    pending_frame: async_channel::Receiver<MapFrame>,
+    queries: async_channel::Receiver<Option<FeatureQuery>>,
+    feature_results: async_channel::Sender<FeatureQueryResult>,
+    pending_result: async_channel::Receiver<FeatureQueryResult>,
+) {
     let mut map = None;
     let mut current_request = None;
     let mut next_frame = Instant::now();
+    let mut query = None;
+    let mut previous_features = None;
 
     loop {
         let timeout = map.as_ref().map(|_| next_frame.saturating_duration_since(Instant::now()));
@@ -133,7 +232,34 @@ fn run_renderer(requests: mpsc::Receiver<RenderRequest>, frames: async_channel::
         let Some(current_request) = &current_request else { continue };
 
         let frame_started = Instant::now();
-        let image = match poll_map_image(&mut map, current_request, request_changed, next_frame) {
+        let image = poll_map_image(&mut map, current_request, request_changed, next_frame);
+        let mut query_changed = false;
+        while let Ok(latest) = queries.try_recv() {
+            query = latest;
+            previous_features = None;
+            query_changed = true;
+        }
+        // Re-query after streamed tiles repaint, even if the pointer is stationary.
+        if (query_changed || matches!(&image, Ok(Some(_))))
+            && let (Some(map), Some(query)) = (&mut map, &query)
+            && map.viewport == query.map.viewport
+            && map.camera == Some(query.map.camera)
+            && map.vector.as_ref().is_some_and(|source| source.id() == query.layer_id)
+        {
+            let features = map.query_vector_features(query.point).map_err(|error| format!("{error:#}"));
+            if previous_features.as_ref() != Some(&features) {
+                previous_features = Some(features.clone());
+                let result = FeatureQueryResult {
+                    revision: query.revision,
+                    features,
+                };
+                if let Err(async_channel::TrySendError::Full(result)) = feature_results.try_send(result) {
+                    let _ = pending_result.try_recv();
+                    let _ = feature_results.try_send(result);
+                }
+            }
+        }
+        let image = match image {
             Ok(Some(image)) => Ok(image),
             Ok(None) => {
                 // Poll native resource/fade callbacks without busy-waiting.
@@ -152,6 +278,7 @@ fn run_renderer(requests: mpsc::Receiver<RenderRequest>, frames: async_channel::
             basemap: current_request.basemap,
             tile_boundaries: current_request.tile_boundaries,
             raster_layer_id: current_request.raster.as_ref().map(|source| source.metadata().id),
+            vector_layer_id: current_request.vector.as_ref().map(|source| source.id()),
             image,
         };
         if let Err(async_channel::TrySendError::Full(frame)) = frames.try_send(frame) {
@@ -198,6 +325,7 @@ fn poll_map_image(map: &mut Option<NativeMap>, request: &RenderRequest, mut requ
             MapDebugOptions::NoDebug
         });
         map.set_raster(request.raster.clone(), request.opacity)?;
+        map.set_vector(request.vector.clone(), request.opacity, &request.vector_color)?;
         map.apply_request(request.map);
     }
     if Instant::now() < next_frame {
@@ -232,6 +360,9 @@ struct NativeMap {
     deadline: Instant,
     raster: Option<Arc<RasterSource>>,
     opacity: f32,
+    vector: Option<Arc<VectorSource>>,
+    vector_opacity: f32,
+    vector_color: String,
     numeric: Rc<RefCell<RasterLayer>>,
     #[cfg(test)]
     camera_updates: u64,
@@ -297,6 +428,9 @@ impl NativeMap {
             deadline: Instant::now() + Duration::from_secs(30),
             raster: None,
             opacity: 1.0,
+            vector: None,
+            vector_opacity: 1.0,
+            vector_color: String::new(),
             numeric,
             #[cfg(test)]
             camera_updates: 0,
@@ -323,10 +457,12 @@ impl NativeMap {
         style.finish().context("Could not load the vector map style")?;
         self.basemap = basemap;
         // Loading a style removes its sources and layers, not the native camera.
-        // Reset only attachment bookkeeping so set_raster reinstalls either kind
-        // of overlay without clearing the retained numeric state.
+        // Reset only attachment bookkeeping so overlays are reinstalled without
+        // clearing the retained numeric state, even at unchanged opacity.
         let raster = self.raster.take();
         self.set_raster(raster, self.opacity)?;
+        let vector = self.vector.take();
+        self.set_vector(vector, self.vector_opacity, &self.vector_color.clone())?;
         self.idle.set(false);
         self.needs_frame.set(true);
         self.deadline = Instant::now() + Duration::from_secs(30);
@@ -369,6 +505,46 @@ impl NativeMap {
         self.numeric.borrow_mut().set_source(numeric_source, opacity, dpi);
         self.raster = raster;
         self.opacity = opacity;
+        Ok(())
+    }
+
+    fn query_vector_features(&mut self, point: (f64, f64)) -> Result<Vec<serde_json::Value>> {
+        let Some(source) = &self.vector else { return Ok(Vec::new()) };
+        let layers = ["fill", "line", "circle"].map(|kind| format!("local-vector-{}-{kind}", source.id()));
+        // MapLibre uses logical pixels from the viewport's top-left, independent
+        // of the physical GPU readback size and its DPI scale.
+        const HOVER_TOLERANCE: f64 = 4.0;
+        Ok(self
+            .renderer
+            .query_rendered_features_with_tolerance(ScreenCoordinate { x: point.0, y: point.1 }, HOVER_TOLERANCE, &layers)?)
+    }
+
+    fn set_vector(&mut self, vector: Option<Arc<VectorSource>>, opacity: f32, color: &str) -> Result<()> {
+        let changed = self.vector.as_ref().map(|source| source.id()) != vector.as_ref().map(|source| source.id());
+        if !changed && self.vector_opacity == opacity && self.vector_color == color {
+            return Ok(());
+        }
+        if let Some(source) = &self.vector {
+            for kind in ["fill", "line", "circle"] {
+                self.renderer.style().remove_layer(format!("local-vector-{}-{kind}", source.id()));
+            }
+        }
+        if changed {
+            self.renderer.style().remove_source("local-vector");
+            if let Some(source) = &vector {
+                self.renderer
+                    .style()
+                    .add_source(AnySource::from_json_value("local-vector", &source.source_json())?)?;
+            }
+        }
+        if let Some(source) = &vector {
+            for layer in source.layers_json(opacity, color) {
+                self.renderer.style().add_layer(AnyLayer::from_json_value(&layer)?)?;
+            }
+        }
+        self.vector = vector;
+        self.vector_opacity = opacity;
+        self.vector_color = color.to_owned();
         Ok(())
     }
 
@@ -573,6 +749,335 @@ mod tests {
         map.set_raster(None, 1.0)?;
         let cleared = map.render(request)?;
         assert!(cleared.pixels().all(|pixel| pixel.0 == [240, 240, 240, 255]));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local vector data"]
+    fn local_vectors_render_restyle_switch_clear_and_survive_basemap_reload_without_network() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("mixed.geojson");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "type": "FeatureCollection",
+                "features": [
+                    {"type": "Feature", "properties": {}, "geometry": {
+                        "type": "Polygon", "coordinates": [[[-5,-2],[-2,-2],[-2,2],[-5,2],[-5,-2]]]
+                    }},
+                    {"type": "Feature", "properties": {}, "geometry": {
+                        "type": "LineString", "coordinates": [[0,-2],[0,2]]
+                    }},
+                    {"type": "Feature", "properties": {}, "geometry": {
+                        "type": "Point", "coordinates": [5,0]
+                    }}
+                ]
+            }))?,
+        )?;
+        let source = VectorSource::open(&path)?.context("Expected mixed vector data")?.remove(0);
+        let viewport = Viewport {
+            width: NonZeroU32::new(512).unwrap(),
+            height: NonZeroU32::new(512).unwrap(),
+            scale: 1.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::fit_bounds(source.bounds(), 512.0, 512.0),
+        };
+        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
+        let background = map.render(request)?;
+        map.set_vector(Some(source.clone()), 1.0, "#3b82f6")?;
+        let rendered = map.render(request)?;
+        let mut covered = [0; 3];
+        for (x, y, pixel) in rendered.enumerate_pixels() {
+            if pixel != background.get_pixel(x, y) {
+                let longitude = request.camera.coordinate_at((f64::from(x) - 256.0, f64::from(y) - 256.0)).longitude;
+                let geometry = if longitude < -1.0 {
+                    0
+                } else if longitude > 1.0 {
+                    2
+                } else {
+                    1
+                };
+                covered[geometry] += 1;
+            }
+        }
+        assert!(covered[0] > 1_000, "Polygon fill must produce pixels: {covered:?}");
+        assert!(covered[1] > 100, "Line geometry must produce pixels: {covered:?}");
+        assert!(covered[2] > 10, "Point geometry must produce pixels: {covered:?}");
+        let camera_updates = map.camera_updates;
+
+        map.set_vector(Some(source.clone()), 0.5, "#3b82f6")?;
+        let translucent = map.render(request)?;
+        assert_ne!(translucent.as_raw(), rendered.as_raw(), "Opacity changes must repaint vector layers");
+        assert_ne!(translucent.as_raw(), background.as_raw());
+        map.set_vector(Some(source.clone()), 0.0, "#3b82f6")?;
+        assert_eq!(map.render(request)?.as_raw(), background.as_raw(), "Zero opacity must reveal the basemap");
+        map.set_vector(Some(source.clone()), 0.5, "#3b82f6")?;
+        assert_eq!(map.render(request)?.as_raw(), translucent.as_raw());
+
+        // Reattach at unchanged opacity and retain the native camera despite style defaults.
+        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
+        let light_vector = map.render(request)?;
+        assert_ne!(light_vector.as_raw(), translucent.as_raw());
+        map.load_style(BasemapStyle::Dark, Some(DARK_STYLE))?;
+        assert_eq!(
+            map.render(request)?.as_raw(),
+            translucent.as_raw(),
+            "A style round trip must restore all vector layers"
+        );
+        assert_eq!(map.camera_updates, camera_updates);
+
+        let replacement_path = dir.path().join("replacement.geojson");
+        std::fs::write(
+            &replacement_path,
+            r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[0,0]}}]}"#,
+        )?;
+        let replacement = VectorSource::open(&replacement_path)?.context("Expected replacement vector data")?.remove(0);
+        assert_ne!(source.id(), replacement.id());
+        map.set_vector(Some(replacement), 1.0, "#3b82f6")?;
+        let switched = map.render(request)?;
+        let changed = switched.pixels().zip(background.pixels()).filter(|(a, b)| a != b).count();
+        assert!(
+            changed > 10 && changed < 200,
+            "Switching must remove the previous source's polygon and line layers, got {changed} pixels"
+        );
+        map.set_vector(None, 1.0, "#3b82f6")?;
+        assert_eq!(
+            map.render(request)?.as_raw(),
+            background.as_raw(),
+            "Clearing must remove vector layers and their source"
+        );
+        map.set_vector(Some(source), 1.0, "#3b82f6")?;
+        assert_eq!(map.render(request)?.as_raw(), rendered.as_raw(), "A cleared source must be installable again");
+        Ok(())
+    }
+
+    #[test]
+    fn hover_requests_keep_only_the_newest_cursor_and_can_be_cancelled() {
+        let (sender, _requests) = mpsc::channel();
+        let (_frames, frames) = async_channel::bounded(1);
+        let (queries, pending_query) = async_channel::bounded(1);
+        let (_results, feature_results) = async_channel::bounded(1);
+        let renderer = MapRenderer {
+            sender,
+            frames,
+            queries,
+            pending_query,
+            feature_results,
+        };
+        let map = MapRequest {
+            viewport: Viewport {
+                width: NonZeroU32::new(256).unwrap(),
+                height: NonZeroU32::new(256).unwrap(),
+                scale: 2.0,
+            },
+            camera: MapCamera::default(),
+        };
+        for revision in 0..1000 {
+            renderer.query_features(revision, map, 7, (revision as f64, 100.0));
+        }
+        assert_eq!(renderer.pending_query.len(), 1);
+        let latest = renderer.pending_query.try_recv().unwrap().unwrap();
+        assert_eq!(latest.revision, 999);
+        assert_eq!(latest.point, (999.0, 100.0));
+        renderer.query_features(1000, map, 7, (42.0, 100.0));
+        renderer.clear_feature_query();
+        assert!(renderer.pending_query.try_recv().unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local vector data"]
+    fn local_vector_queries_use_logical_pixels_and_only_the_active_layer_without_network() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let open_source = |name: &str, features: serde_json::Value| -> Result<Arc<VectorSource>> {
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    "type": "FeatureCollection", "features": features
+                }))?,
+            )?;
+            Ok(VectorSource::open(&path)?.context("Expected query fixture vector data")?.remove(0))
+        };
+        let properties = |name: &str| {
+            serde_json::json!({
+                "name": name, "number": 42.5, "boolean": true, "nullable": null
+            })
+        };
+        let source = open_source(
+            "mixed.geojson",
+            serde_json::json!([
+                {"type": "Feature", "properties": properties("point"), "geometry": {
+                    "type": "Point", "coordinates": [0,0]
+                }},
+                {"type": "Feature", "properties": properties("line"), "geometry": {
+                    "type": "LineString", "coordinates": [[-2,0],[2,0]]
+                }},
+                {"type": "Feature", "properties": properties("polygon"), "geometry": {
+                    "type": "Polygon", "coordinates": [[[-2,-2],[2,-2],[2,2],[-2,2],[-2,-2]]]
+                }}
+            ]),
+        )?;
+        let viewport = Viewport {
+            width: NonZeroU32::new(256).unwrap(),
+            height: NonZeroU32::new(256).unwrap(),
+            scale: 2.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::fit_bounds([-4.0, -4.0, 4.0, 4.0], 256.0, 256.0),
+        };
+        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
+        map.renderer.style().add_source(AnySource::from_json_value(
+            "basemap-decoy",
+            &serde_json::json!({
+                "type": "geojson", "data": {
+                    "type": "Feature", "properties": {"name": "basemap-decoy"},
+                    "geometry": {"type": "Point", "coordinates": [0,0]}
+                }
+            }),
+        )?)?;
+        map.renderer.style().add_layer(AnyLayer::from_json_value(&serde_json::json!({
+            "id": "basemap-decoy", "type": "circle", "source": "basemap-decoy",
+            "paint": {"circle-radius": 8, "circle-color": "#ff0000"}
+        }))?)?;
+        map.set_vector(Some(source), 1.0, "#3b82f6")?;
+        let rendered = map.render(request)?;
+        assert_eq!(rendered.dimensions(), (512, 512), "HiDPI readback must use physical pixels");
+        let center = (128.0, 128.0);
+        let decoy = map
+            .renderer
+            .query_rendered_features(ScreenCoordinate { x: center.0, y: center.1 }, &["basemap-decoy".to_owned()])?;
+        assert_eq!(decoy.len(), 1, "The excluded basemap feature must really be queryable");
+        assert_eq!(decoy[0]["properties"]["name"], "basemap-decoy");
+
+        let features = map.query_vector_features(center)?;
+        // Native queries may return the same geometry from multiple tiles.
+        let names: std::collections::BTreeSet<_> = features
+            .iter()
+            .map(|feature| feature["properties"]["name"].as_str().expect("Expected a feature name"))
+            .collect();
+        assert_eq!(
+            names,
+            ["line", "point", "polygon"].into_iter().collect(),
+            "Only the overlapping active geometries should be returned: {features:?}"
+        );
+        for feature in &features {
+            let name = feature["properties"]["name"].as_str().unwrap();
+            assert_eq!(feature["properties"], properties(name), "Native queries must preserve property types");
+        }
+        for (name, geometry) in [("point", "Point"), ("line", "LineString"), ("polygon", "Polygon")] {
+            let feature = features
+                .iter()
+                .find(|feature| feature["properties"]["name"] == name)
+                .with_context(|| format!("Missing {name} at the logical center: {features:?}"))?;
+            assert_eq!(feature["geometry"]["type"], geometry);
+        }
+        assert!(map.query_vector_features((0.0, 0.0))?.is_empty(), "The corner must miss all vector geometry");
+
+        let replacement = open_source(
+            "replacement.geojson",
+            serde_json::json!([
+                {"type": "Feature", "properties": {"name": "replacement", "new_attribute": "active"},
+                 "geometry": {"type": "Point", "coordinates": [0,0]}}
+            ]),
+        )?;
+        map.set_vector(Some(replacement), 1.0, "#3b82f6")?;
+        let _ = map.render(request)?;
+        let switched = map.query_vector_features(center)?;
+        assert_eq!(switched.len(), 1, "Switching must exclude the old vector and basemap features: {switched:?}");
+        assert_eq!(switched[0]["properties"], serde_json::json!({"name": "replacement", "new_attribute": "active"}));
+        let near = ScreenCoordinate {
+            x: center.0 + 7.0,
+            y: center.1,
+        };
+        let circle = [format!("local-vector-{}-circle", map.vector.as_ref().unwrap().id())];
+        assert!(
+            map.renderer.query_rendered_features(near, &circle)?.is_empty(),
+            "An exact query must miss outside the point symbol"
+        );
+        assert!(
+            !map.query_vector_features((near.x, near.y))?.is_empty(),
+            "Four logical pixels of tolerance must hit the nearby point at scale 2"
+        );
+        assert!(
+            map.query_vector_features((center.0 + 10.0, center.1))?.is_empty(),
+            "The tolerance must not extend beyond four logical pixels"
+        );
+
+        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
+        let _ = map.render(request)?;
+        assert_eq!(
+            map.query_vector_features(center)?,
+            switched,
+            "Active feature queries must survive a style reload"
+        );
+        map.set_vector(None, 1.0, "#3b82f6")?;
+        let _ = map.render(request)?;
+        assert!(
+            map.query_vector_features(center)?.is_empty(),
+            "Clearing must leave no queryable vector features"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a graphics device and Dirk's local WBGT PMTiles file"]
+    fn local_pmtiles_vectors_render_without_network() -> Result<()> {
+        let path = std::path::Path::new("/home/dirk/Downloads/AD_WBGT_20240620-20240626_construction.pmtiles");
+        let directory = tempfile::tempdir()?;
+        let escaped_path = directory.path().join("construction # café.pmtiles");
+        std::fs::copy(path, &escaped_path)?;
+        let source = VectorSource::open(&escaped_path)?.context("Expected vector PMTiles")?.remove(0);
+        assert_eq!(source.source_json()["type"], "vector");
+        let viewport = Viewport {
+            width: NonZeroU32::new(800).unwrap(),
+            height: NonZeroU32::new(600).unwrap(),
+            scale: 1.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::fit_bounds(source.bounds(), 800.0, 600.0),
+        };
+        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
+        let background = map.render(request)?;
+        map.set_vector(Some(source.clone()), 1.0, "hsla(217, 90%, 60%, 1)")?;
+        let rendered = map.render(request)?;
+        let changed = rendered.pixels().zip(background.pixels()).filter(|(a, b)| a != b).count();
+        assert!(changed > 100, "Expected construction features to render, got {changed} changed pixels");
+        // Sample changed pixels at scale 1, where readback and logical coordinates
+        // coincide. Antialiasing can change pixels outside the queryable geometry.
+        let mut queried = Vec::new();
+        for (x, y, _) in rendered
+            .enumerate_pixels()
+            .filter(|(x, y, pixel)| *pixel != background.get_pixel(*x, *y))
+            .step_by((changed / 128).max(1))
+            .take(128)
+        {
+            queried.extend(map.query_vector_features((f64::from(x), f64::from(y)))?);
+            // Some construction sites have no WBGT measurements for this date.
+            if queried.iter().any(|feature| feature["properties"]["20240620"].is_number()) {
+                break;
+            }
+        }
+        assert!(!queried.is_empty(), "Expected a native feature query to hit a rendered construction feature");
+        assert!(
+            queried.iter().any(|feature| feature["properties"]["20240620"].is_number()),
+            "Native PMTiles queries must preserve the numeric WBGT date attribute: {queried:?}"
+        );
+        map.set_vector(Some(source.clone()), 0.0, "hsla(217, 90%, 60%, 1)")?;
+        assert_eq!(map.render(request)?.as_raw(), background.as_raw());
+        map.set_vector(Some(source), 1.0, "hsla(217, 90%, 60%, 1)")?;
+        let mut zoomed = request;
+        zoomed.camera.zoom_at(2.0, (0.0, 0.0));
+        assert_ne!(map.render(zoomed)?.as_raw(), rendered.as_raw());
+        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
+        let _ = map.render(request)?;
+        map.load_style(BasemapStyle::Dark, Some(DARK_STYLE))?;
+        assert_eq!(map.render(request)?.as_raw(), rendered.as_raw(), "Native PMTiles must survive style reloads");
+        map.set_vector(None, 1.0, "hsla(217, 90%, 60%, 1)")?;
+        assert_eq!(map.render(request)?.as_raw(), background.as_raw());
         Ok(())
     }
 

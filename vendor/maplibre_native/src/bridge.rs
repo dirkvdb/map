@@ -1257,6 +1257,14 @@ pub mod ffi {
             first: &ScreenCoordinate,
             second: &ScreenCoordinate,
         );
+        /// Queries rendered features at a point, restricted to the supplied layer IDs.
+        #[cfg(feature = "json")]
+        fn queryRenderedFeatures(
+            self: Pin<&mut MapRenderer>,
+            point: &ScreenCoordinate,
+            tolerance: f64,
+            layer_ids: &[String],
+        ) -> Result<String>;
         /// Loads a style from a URL.
         fn style_load_from_url(self: Pin<&mut MapRenderer>, url: &str);
         /// Loads a style from a JSON string.

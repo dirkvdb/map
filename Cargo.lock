@@ -4807,6 +4807,7 @@ dependencies = [
  "sqlite",
  "tempfile",
  "tiler",
+ "url",
  "wgpu 29.0.4",
 ]
 

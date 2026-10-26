@@ -71,6 +71,71 @@ fn continuous_renderer_requests_frame_after_update() {
     tick_until_ready(|| requested.get());
 }
 
+#[cfg(feature = "json")]
+#[test]
+fn query_rendered_features_returns_empty_for_no_layers_before_rendering() {
+    let mut renderer = ImageRendererBuilder::new().build_continuous_renderer();
+    let features = renderer
+        .query_rendered_features(maplibre_native::ScreenCoordinate { x: 0.0, y: 0.0 }, &[])
+        .expect("an empty layer query should succeed without rendering");
+    assert!(features.is_empty());
+}
+
+// The WebGPU backend needs a host-provided device and queue to render.
+#[cfg(all(feature = "json", not(feature = "wgpu")))]
+#[test]
+fn query_rendered_features_serializes_only_requested_layers_at_the_point() {
+    let mut renderer = ImageRendererBuilder::new()
+        .with_size(NonZeroU32::new(128).unwrap(), NonZeroU32::new(128).unwrap())
+        .with_pixel_ratio(1.0)
+        .build_continuous_renderer();
+    renderer
+        .load_style_from_json_str(
+            r#"{
+                "version": 8,
+                "sources": {
+                    "points": {"type": "geojson", "data": {
+                        "type": "Feature", "id": 42,
+                        "properties": {"name": "query test", "nested": {"value": true}},
+                        "geometry": {"type": "Point", "coordinates": [0, 0]}
+                    }}
+                },
+                "layers": [
+                    {"id": "basemap", "type": "circle", "source": "points"},
+                    {"id": "overlay", "type": "circle", "source": "points"}
+                ]
+            }"#,
+        )
+        .wait()
+        .expect("inline style should load");
+    renderer.update_camera(&test_camera());
+    let center = maplibre_native::ScreenCoordinate { x: 64.0, y: 64.0 };
+    let layers = ["overlay".to_owned()];
+    let mut features = Vec::new();
+    tick_until_ready(|| {
+        renderer.render_once();
+        features = renderer.query_rendered_features(center, &layers).expect("query should succeed");
+        !features.is_empty()
+    });
+
+    assert_eq!(features.len(), 1, "basemap layer must not contribute a second feature");
+    assert_eq!(features[0]["type"], "Feature");
+    assert_eq!(features[0]["id"], 42);
+    assert_eq!(
+        features[0]["properties"],
+        serde_json::json!({
+            "name": "query test", "nested": {"value": true}
+        })
+    );
+    assert_eq!(features[0]["geometry"]["type"], "Point");
+    assert!(renderer.query_rendered_features(center, &[]).unwrap().is_empty());
+    assert!(renderer.query_rendered_features(center, &["missing".to_owned()]).unwrap().is_empty());
+    assert!(renderer
+        .query_rendered_features(maplibre_native::ScreenCoordinate { x: 0.0, y: 0.0 }, &layers)
+        .unwrap()
+        .is_empty());
+}
+
 #[test]
 fn thread_run_loop_supports_worker_threads() {
     let handles = (0..2).map(|_| {

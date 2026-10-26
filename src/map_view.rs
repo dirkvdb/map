@@ -13,11 +13,13 @@ use gpui_kit::{
     SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, TestSupportExt, Window, canvas, div, img,
 };
 
+use crate::feature_info::FeatureInfo;
 use crate::map_camera::MapCamera;
-use crate::map_renderer::{BasemapStyle, MapFrame, MapRenderer, MapRequest, Viewport};
+use crate::map_renderer::{BasemapStyle, MapFrame, MapRenderer, MapRequest, MapSource, Viewport};
 use crate::pixel_info::PixelInfo;
-use crate::raster_panel::{ClearRasters, FitRaster, OpenRaster, RasterPanel, ToggleRasterControls};
+use crate::raster_panel::{ClearRasters, FitRaster, OpenDataset, RasterPanel, ToggleRasterControls};
 use crate::raster_source::RasterSource;
+use crate::vector_source::VectorSource;
 
 gpui_kit::actions!(map, [ZoomIn, ZoomOut, PanLeft, PanRight, PanUp, PanDown, ToggleTileBoundaries]);
 
@@ -25,7 +27,7 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("?", crate::shortcuts::ShowShortcuts, Some("RasterWorkspace")),
         KeyBinding::new("secondary-,", crate::settings::OpenSettings, Some("RasterWorkspace")),
-        KeyBinding::new("secondary-o", OpenRaster, Some("RasterWorkspace")),
+        KeyBinding::new("secondary-o", OpenDataset, Some("RasterWorkspace")),
         KeyBinding::new("secondary-0", FitRaster, Some("RasterWorkspace")),
         KeyBinding::new("secondary-l", ToggleRasterControls, Some("RasterWorkspace")),
         KeyBinding::new("secondary-shift-d", ToggleTileBoundaries, Some("RasterWorkspace")),
@@ -115,16 +117,40 @@ fn basemap_style(cx: &App) -> BasemapStyle {
     if cx.theme().mode.is_dark() { BasemapStyle::Dark } else { BasemapStyle::Light }
 }
 
+#[derive(PartialEq)]
+struct RenderKey {
+    map: MapRequest,
+    raster_id: Option<u64>,
+    vector_id: Option<u64>,
+    vector_color: String,
+    opacity: f32,
+    reduce_motion: bool,
+    basemap: BasemapStyle,
+    tile_boundaries: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct VectorHover {
+    map: MapRequest,
+    layer_id: u64,
+    point: (f64, f64),
+}
+
 pub struct MapView {
     viewport: Option<Viewport>,
     bounds: Option<Bounds<Pixels>>,
     camera: MapCamera,
-    requested: Option<(MapRequest, Option<u64>, f32, bool, BasemapStyle, bool)>,
+    requested: Option<RenderKey>,
     tile_boundaries: bool,
     raster_panel: Entity<RasterPanel>,
     pixel_info: Entity<PixelInfo>,
+    feature_info: Entity<FeatureInfo>,
+    vector_hover: Option<VectorHover>,
+    hover_revision: u64,
+    _feature_task: Option<Task<()>>,
     pointer: Option<Point<Pixels>>,
     raster: Option<Arc<RasterSource>>,
+    vector: Option<Arc<VectorSource>>,
     opacity: f32,
     fit_pending: bool,
     _raster_subscription: Subscription,
@@ -145,11 +171,13 @@ impl MapView {
         let renderer = MapRenderer::new().expect("Failed to create the map renderer");
 
         let task = Self::watch_frames(&renderer, cx);
+        let feature_task = Self::watch_feature_results(&renderer, cx);
         let raster_panel = cx.new(|cx| RasterPanel::new(window, cx));
         let raster_observation = cx.observe(&raster_panel, |_, _, cx| cx.notify());
         let theme_observation = cx.observe_global::<Theme>(|view, cx| view.request_render(cx));
         let raster_subscription = cx.subscribe(&raster_panel, |view, _, event: &crate::raster_panel::RasterEvent, cx| {
             view.raster = event.source();
+            view.vector = event.vector_source();
             view.opacity = event.opacity();
             view.coast = None;
             view.drag = None;
@@ -173,8 +201,13 @@ impl MapView {
             tile_boundaries: false,
             raster_panel,
             pixel_info: cx.new(|_| PixelInfo::new()),
+            feature_info: cx.new(|_| FeatureInfo::new()),
+            vector_hover: None,
+            hover_revision: 0,
+            _feature_task: Some(feature_task),
             pointer: None,
             raster: None,
+            vector: None,
             opacity: 1.0,
             fit_pending: false,
             _raster_subscription: raster_subscription,
@@ -196,10 +229,15 @@ impl MapView {
     }
 
     fn fit_raster(&mut self) {
+        let bounds = self
+            .raster
+            .as_ref()
+            .map(|source| source.metadata().bounds)
+            .or_else(|| self.vector.as_ref().map(|source| source.bounds()));
         if self.fit_pending
-            && let (Some(source), Some(viewport)) = (&self.raster, self.viewport)
+            && let (Some(bounds), Some(viewport)) = (bounds, self.viewport)
         {
-            self.camera = MapCamera::fit_bounds(source.metadata().bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get()));
+            self.camera = MapCamera::fit_bounds(bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get()));
             self.fit_pending = false;
         }
     }
@@ -215,6 +253,59 @@ impl MapView {
         })
     }
 
+    fn watch_feature_results(renderer: &MapRenderer, cx: &mut Context<Self>) -> Task<()> {
+        let results = renderer.feature_results();
+        cx.spawn(async move |this, cx| {
+            while let Ok(result) = results.recv().await {
+                if this
+                    .update(cx, |view, cx| {
+                        view.apply_feature_result(result.revision(), result.into_features(), cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    }
+
+    fn apply_feature_result(&self, revision: u64, features: Result<Vec<serde_json::Value>, String>, cx: &mut Context<Self>) {
+        if revision != self.hover_revision || self.vector_hover.is_none() {
+            return;
+        }
+        match features {
+            Ok(features) => self.show_vector_features(features, cx),
+            Err(error) => {
+                log::warn!("Could not query vector features: {error}");
+                self.show_vector_features(Vec::new(), cx);
+            }
+        }
+    }
+
+    fn show_vector_features(&self, features: Vec<serde_json::Value>, cx: &mut Context<Self>) {
+        let (Some(hover), Some(source)) = (self.vector_hover, &self.vector) else {
+            return;
+        };
+        if hover.layer_id != source.id() {
+            return;
+        }
+        let coordinate = hover.map.camera.coordinate_at((
+            hover.point.0 - f64::from(hover.map.viewport.width.get()) / 2.0,
+            hover.point.1 - f64::from(hover.map.viewport.height.get()) / 2.0,
+        ));
+        self.feature_info.update(cx, |info, cx| info.show(coordinate, source.name(), features, cx));
+    }
+
+    fn clear_vector_hover(&mut self, cx: &mut Context<Self>) {
+        if self.vector_hover.take().is_some() {
+            self.hover_revision = self.hover_revision.wrapping_add(1);
+            if let Some(renderer) = &self.renderer {
+                renderer.clear_feature_query();
+            }
+        }
+        self.feature_info.update(cx, |info, cx| info.clear(cx));
+    }
+
     fn apply_frame(&mut self, frame: MapFrame, window: &mut Window, cx: &mut Context<Self>) {
         // The worker completes frames in order. Show progress for this band
         // even if another range/palette update arrived while it was rendering;
@@ -223,6 +314,7 @@ impl MapView {
             || frame.basemap != basemap_style(cx)
             || frame.tile_boundaries != self.tile_boundaries
             || self.raster.as_ref().map(|source| source.metadata().id) != frame.raster_layer_id
+            || self.vector.as_ref().map(|source| source.id()) != frame.vector_layer_id
         {
             return;
         }
@@ -250,15 +342,19 @@ impl MapView {
         let request = MapRequest { viewport, camera: self.camera };
         let reduce_motion = cx.reduce_motion();
         let basemap = basemap_style(cx);
-        let key = (
-            request,
-            self.raster.as_ref().map(|source| source.id()),
-            self.opacity,
+        let primary = cx.theme().primary;
+        let vector_color = format!("hsla({}, {}%, {}%, {})", primary.h * 360.0, primary.s * 100.0, primary.l * 100.0, primary.a);
+        let key = RenderKey {
+            map: request,
+            raster_id: self.raster.as_ref().map(|source| source.id()),
+            vector_id: self.vector.as_ref().map(|source| source.id()),
+            vector_color: vector_color.clone(),
+            opacity: self.opacity,
             reduce_motion,
             basemap,
-            self.tile_boundaries,
-        );
-        if self.requested == Some(key) {
+            tile_boundaries: self.tile_boundaries,
+        };
+        if self.requested.as_ref() == Some(&key) {
             return;
         }
         self.requested = Some(key);
@@ -266,7 +362,12 @@ impl MapView {
             return;
         };
         self.error = None;
-        if let Err(error) = renderer.render_raster(request, self.raster.clone(), self.opacity, reduce_motion, basemap, self.tile_boundaries) {
+        let source = self
+            .raster
+            .clone()
+            .map(MapSource::Raster)
+            .or_else(|| self.vector.clone().map(|source| MapSource::Vector(source, vector_color)));
+        if let Err(error) = renderer.render_layer(request, source, self.opacity, reduce_motion, basemap, self.tile_boundaries) {
             self.error = Some(format!("Couldn’t load the map. {error}").into());
         }
         cx.notify();
@@ -275,6 +376,8 @@ impl MapView {
     fn retry(&mut self, cx: &mut Context<Self>) {
         let renderer = MapRenderer::new().expect("Failed to create the map renderer");
         self._frames_task = Some(Self::watch_frames(&renderer, cx));
+        self._feature_task = Some(Self::watch_feature_results(&renderer, cx));
+        self.vector_hover = None;
         self.renderer = Some(renderer);
         self.requested = None;
         self.request_render(cx);
@@ -348,10 +451,37 @@ impl MapView {
         }
     }
 
-    fn update_pixel_info(&self, cx: &mut Context<Self>) {
+    fn update_pixel_info(&mut self, cx: &mut Context<Self>) {
         let (Some(position), Some(bounds)) = (self.pointer, self.bounds) else {
+            self.clear_vector_hover(cx);
             return;
         };
+        if let (Some(source), Some(viewport)) = (&self.vector, self.viewport) {
+            self.pixel_info.update(cx, |info, cx| info.clear(cx));
+            let offset = position - bounds.origin;
+            let hover = VectorHover {
+                map: MapRequest { viewport, camera: self.camera },
+                layer_id: source.id(),
+                point: (f64::from(f32::from(offset.x)), f64::from(f32::from(offset.y))),
+            };
+            if self.vector_hover != Some(hover) {
+                let same_map = self
+                    .vector_hover
+                    .is_some_and(|previous| previous.map == hover.map && previous.layer_id == hover.layer_id);
+                self.hover_revision = self.hover_revision.wrapping_add(1);
+                self.vector_hover = Some(hover);
+                // Keep the last hit visible during pointer-only queries so the
+                // inspector does not collapse while waiting for the worker.
+                if !same_map {
+                    self.show_vector_features(Vec::new(), cx);
+                }
+                if let Some(renderer) = &self.renderer {
+                    renderer.query_features(self.hover_revision, hover.map, hover.layer_id, hover.point);
+                }
+            }
+            return;
+        }
+        self.clear_vector_hover(cx);
         let offset = position - bounds.center();
         let coordinate = self.camera.coordinate_at((f64::from(f32::from(offset.x)), f64::from(f32::from(offset.y))));
         let dpi = self.viewport.map_or(1, |viewport| viewport.scale.round().clamp(1.0, 4.0) as u8);
@@ -416,6 +546,7 @@ impl Render for MapView {
             .on_hover(cx.listener(|view, hovered, _, cx| {
                 if !hovered {
                     view.pointer = None;
+                    view.clear_vector_hover(cx);
                     view.pixel_info.update(cx, |info, cx| info.clear(cx));
                 }
             }))
@@ -530,7 +661,7 @@ impl Render for MapView {
                 view.drag = None;
                 crate::settings::open(window, cx);
             }))
-            .on_action(cx.listener(|view, _: &OpenRaster, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx))))
+            .on_action(cx.listener(|view, _: &OpenDataset, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx))))
             .on_action(cx.listener(|view, _: &FitRaster, _, cx| view.raster_panel.update(cx, |panel, cx| panel.fit(cx))))
             .on_action(cx.listener(|view, _: &ClearRasters, window, cx| view.raster_panel.update(cx, |panel, cx| panel.clear(window, cx))))
             .on_action(cx.listener(|view, _: &ToggleRasterControls, window, cx| view.raster_panel.update(cx, |panel, cx| panel.toggle_controls(window, cx))))
@@ -554,8 +685,8 @@ impl Render for MapView {
                                     .small()
                                     .ghost()
                                     .icon(IconName::FolderOpen)
-                                    .accessibility_label("Open raster")
-                                    .tooltip("Open raster (Ctrl/⌘+O)")
+                                    .accessibility_label("Open dataset")
+                                    .tooltip_with_action("Open dataset", &OpenDataset, Some("RasterWorkspace"))
                                     .loading(self.raster_panel.read(cx).is_loading())
                                     .disabled(self.raster_panel.read(cx).is_loading())
                                     .on_click(cx.listener(|view, _, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx)))),
@@ -598,6 +729,7 @@ impl Render for MapView {
                     .min_h_0()
                     .child(surface)
                     .child(div().absolute().bottom_3().left_3().max_w_full().child(self.pixel_info.clone()))
+                    .child(div().absolute().bottom_3().left_3().max_w_full().child(self.feature_info.clone()))
                     .children(self.raster.is_some().then(|| {
                         div()
                             .absolute()
@@ -647,7 +779,7 @@ mod tests {
         cx.run_until_parked();
         let camera = cx.update(|cx| {
             let map = view.read(cx);
-            assert_eq!(map.requested.unwrap().4, BasemapStyle::Dark);
+            assert_eq!(map.requested.as_ref().unwrap().basemap, BasemapStyle::Dark);
             map.camera
         });
 
@@ -670,7 +802,7 @@ mod tests {
                     }
                 };
                 view.update(cx, |map, cx| {
-                    assert_eq!(map.requested.unwrap().4, expected);
+                    assert_eq!(map.requested.as_ref().unwrap().basemap, expected);
                     assert_eq!(map.camera, camera);
                     let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
                     map.apply_frame(
@@ -679,6 +811,7 @@ mod tests {
                             basemap: expected,
                             tile_boundaries: false,
                             raster_layer_id: None,
+                            vector_layer_id: None,
                             image: Ok(image.clone()),
                         },
                         window,
@@ -693,6 +826,7 @@ mod tests {
                                 BasemapStyle::Light
                             },
                             raster_layer_id: None,
+                            vector_layer_id: None,
                             image: Err(anyhow::anyhow!("Obsolete basemap failed")),
                             tile_boundaries: false,
                         },
@@ -705,6 +839,115 @@ mod tests {
             })
             .unwrap();
         }
+    }
+
+    #[gpui_kit::test]
+    fn opening_vectors_fits_the_camera_rejects_obsolete_frames_and_clears_layers(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("extent.geojson");
+        std::fs::write(
+            &path,
+            r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"LineString","coordinates":[[4,50],[6,52]]}}]}"#,
+        )
+        .unwrap();
+        let mut view = None;
+        let handle = cx.open_window(size(px(900.), px(760.)), |window, cx| {
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |map, cx| map.open_paths(vec![path.clone()], cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let old_id = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let map = view.read(cx);
+                let source = map.vector.as_ref().expect("The background open must install a vector source");
+                assert!(map.raster.is_none());
+                assert_eq!(source.bounds(), [4., 50., 6., 52.]);
+                let viewport = map.viewport.unwrap();
+                let fitted = MapCamera::fit_bounds(source.bounds(), f64::from(viewport.width.get()), f64::from(viewport.height.get()));
+                assert_eq!(map.camera, fitted);
+                assert_ne!(map.camera, MapCamera::default());
+                assert!(!map.fit_pending);
+                let requested = map.requested.as_ref().unwrap();
+                assert_eq!(requested.vector_id, Some(source.id()));
+                assert_eq!(requested.raster_id, None);
+                assert_eq!(requested.map.camera, fitted);
+                let old_id = source.id();
+                for id in ["raster-palette", "raster-legend", "raster-range-slider", "raster-min", "raster-max"] {
+                    assert!(window.try_find(id).is_none(), "Raster-only control {id} must be absent for vectors");
+                }
+                assert!(window.find("raster-band").visible());
+                // Reopen through the normal worker to obtain a real obsolete source identity.
+                view.update(cx, |map, cx| map.open_paths(vec![path], cx));
+                old_id
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |map, cx| {
+                let current_id = map.vector.as_ref().unwrap().id();
+                assert_ne!(current_id, old_id);
+                assert!(map.raster.is_none());
+                assert_eq!(map.requested.as_ref().unwrap().vector_id, Some(current_id));
+                let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
+                map.apply_frame(
+                    MapFrame {
+                        viewport: map.viewport.unwrap(),
+                        basemap: basemap_style(cx),
+                        raster_layer_id: None,
+                        vector_layer_id: Some(old_id),
+                        tile_boundaries: map.tile_boundaries,
+                        image: Ok(image.clone()),
+                    },
+                    window,
+                    cx,
+                );
+                assert!(map.image.is_none(), "A frame for the previous vector source must be rejected");
+                map.apply_frame(
+                    MapFrame {
+                        viewport: map.viewport.unwrap(),
+                        basemap: basemap_style(cx),
+                        raster_layer_id: None,
+                        vector_layer_id: Some(current_id),
+                        tile_boundaries: map.tile_boundaries,
+                        image: Ok(image.clone()),
+                    },
+                    window,
+                    cx,
+                );
+                assert!(Arc::ptr_eq(map.image.as_ref().unwrap(), &image), "The current vector frame must be accepted");
+                assert!(map.error.is_none());
+            });
+            view.read(cx).raster_panel.clone().update(cx, |panel, cx| panel.clear(window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let map = view.read(cx);
+            assert!(map.vector.is_none());
+            assert!(map.raster.is_none());
+            let requested = map.requested.as_ref().unwrap();
+            assert_eq!(requested.vector_id, None);
+            assert_eq!(requested.raster_id, None);
+            assert!(window.try_find("raster-opacity").is_none());
+            assert_eq!(window.find("raster-band").disabled(), Some(true));
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
@@ -777,6 +1020,7 @@ mod tests {
                         viewport: view.viewport.unwrap(),
                         basemap: basemap_style(cx),
                         raster_layer_id: None,
+                        vector_layer_id: None,
                         tile_boundaries: false,
                         image: Err(anyhow::anyhow!("Network unavailable")),
                     },
@@ -799,6 +1043,7 @@ mod tests {
                         viewport: view.viewport.unwrap(),
                         basemap: basemap_style(cx),
                         raster_layer_id: None,
+                        vector_layer_id: None,
                         tile_boundaries: false,
                         image: Ok(Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]))),
                     },
@@ -1410,6 +1655,208 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn vector_pointer_preserves_pending_properties_invalidates_context_and_switches_to_raster(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx);
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let vector_path = directory.path().join("hover.geojson");
+        let feature = serde_json::json!({
+            "type": "Feature",
+            "id": 7,
+            "properties": {"name": "Main street", "open": true},
+            "geometry": {"type": "LineString", "coordinates": [[4, 50], [6, 52]]}
+        });
+        std::fs::write(
+            &vector_path,
+            serde_json::json!({"type": "FeatureCollection", "features": [feature.clone()]}).to_string(),
+        )
+        .unwrap();
+        let raster_path = directory.path().join("raster.tif");
+        crate::raster_source::test_support::write_raster(&raster_path, 4326, 2).unwrap();
+        let mut view = None;
+        let handle = cx.open_window(size(px(1200.), px(760.)), |window, cx| {
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map._feature_task = None;
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |map, cx| map.open_paths(vec![vector_path.clone()], cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let (original_layer, revision) = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let bounds = view.read(cx).bounds.unwrap();
+                assert!(bounds.origin.y > px(0.), "The map must start below the title bar");
+                let center = bounds.center();
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: center,
+                        pressed_button: None,
+                        modifiers: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                let (layer, revision) = view.update(cx, |map, cx| {
+                    let hover = map.vector_hover.expect("A native map pointer move must create a vector query");
+                    assert_eq!(map.pointer, Some(center));
+                    assert_eq!(hover.layer_id, map.vector.as_ref().unwrap().id());
+                    assert!(hover.map.viewport == map.viewport.unwrap());
+                    assert_eq!(hover.map.camera, map.camera);
+                    let local = center - bounds.origin;
+                    assert_eq!(hover.point, (f64::from(f32::from(local.x)), f64::from(f32::from(local.y))));
+                    assert_eq!(hover.point.0, f64::from(hover.map.viewport.width.get()) / 2.0);
+                    assert_eq!(hover.point.1, f64::from(hover.map.viewport.height.get()) / 2.0);
+                    assert_ne!(hover.point.1, f64::from(f32::from(center.y)), "Title-bar height must not enter the query point");
+                    map.apply_feature_result(map.hover_revision, Ok(vec![feature.clone()]), cx);
+                    (hover.layer_id, map.hover_revision)
+                });
+                window.render_frame(cx);
+                assert!(window.find("feature-info-properties").visible());
+                assert!(window.find("feature-info").visible());
+                assert!(window.find("feature-info").bounds().size.height > px(60.));
+                assert!(window.find("pixel-info").label().is_none(), "Vector inspection must not retain raster content");
+
+                // Pointer-only queries retain the inspector until the latest hit arrives.
+                let info_bounds = window.find("feature-info").bounds();
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: center + point(px(80.), px(40.)),
+                        pressed_button: None,
+                        modifiers: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.render_frame(cx);
+                assert!(window.find("feature-info-properties").visible(), "Pending queries must retain property rows");
+                assert_eq!(window.find("feature-info").bounds(), info_bounds);
+                view.update(cx, |map, cx| map.apply_feature_result(revision, Ok(Vec::new()), cx));
+                window.render_frame(cx);
+                assert!(
+                    window.find("feature-info-properties").visible(),
+                    "A late empty result from the previous cursor must not clear the inspector"
+                );
+                view.update(cx, |map, cx| {
+                    assert!(map.hover_revision > revision);
+                    let hover = map.vector_hover.unwrap();
+                    assert_eq!(
+                        hover.point,
+                        (
+                            f64::from(f32::from(bounds.size.width)) / 2.0 + 80.0,
+                            f64::from(f32::from(bounds.size.height)) / 2.0 + 40.0
+                        )
+                    );
+                    map.apply_feature_result(map.hover_revision, Ok(vec![feature.clone()]), cx);
+                });
+                window.render_frame(cx);
+                assert_eq!(
+                    window.find("feature-info").bounds(),
+                    info_bounds,
+                    "The same feature must not resize the inspector"
+                );
+                view.update(cx, |map, cx| map.apply_feature_result(map.hover_revision, Ok(Vec::new()), cx));
+                window.render_frame(cx);
+                assert!(
+                    window.try_find("feature-info-properties").is_none(),
+                    "A completed empty query must remove stale properties"
+                );
+                assert!(window.find("feature-info").bounds().size.height < px(40.));
+                view.update(cx, |map, cx| map.apply_feature_result(map.hover_revision, Ok(vec![feature.clone()]), cx));
+                let revision = view.read(cx).hover_revision;
+                let focus = view.read(cx).focus.clone();
+                window.focus(&focus, cx);
+                window.press("right", cx);
+                assert!(
+                    view.read(cx).hover_revision > revision,
+                    "Camera changes must invalidate a stationary pointer's query"
+                );
+                assert_eq!(view.read(cx).vector_hover.unwrap().map.camera, view.read(cx).camera);
+                view.update(cx, |map, cx| map.apply_feature_result(revision, Ok(vec![feature.clone()]), cx));
+                window.render_frame(cx);
+                assert!(
+                    window.try_find("feature-info-properties").is_none(),
+                    "A result from the previous camera must be rejected"
+                );
+                view.update(cx, |map, cx| map.show_vector_features(vec![feature.clone()], cx));
+                window.render_frame(cx);
+                assert!(window.find("feature-info").bounds().size.height > px(60.));
+                let revision = view.read(cx).hover_revision;
+                view.update(cx, |map, cx| map.open_paths(vec![vector_path], cx));
+                (layer, revision)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(view.read(cx).hover_revision > revision, "Layer switches must invalidate the previous query");
+            view.update(cx, |map, cx| map.apply_feature_result(revision, Ok(vec![feature.clone()]), cx));
+            window.render_frame(cx);
+            assert!(
+                window.try_find("feature-info-properties").is_none(),
+                "A result from the previous layer must be rejected"
+            );
+            assert!(window.find("feature-info").bounds().size.height < px(40.));
+            window.hover("map-surface", cx);
+            view.update(cx, |map, cx| {
+                let hover = map.vector_hover.unwrap();
+                assert_ne!(hover.layer_id, original_layer);
+                assert_eq!(hover.layer_id, map.vector.as_ref().unwrap().id());
+                assert!(map.hover_revision > revision, "Layer switches must invalidate the previous query");
+                map.show_vector_features(vec![feature.clone()], cx);
+            });
+            window.render_frame(cx);
+            assert!(window.find("feature-info").bounds().size.height > px(60.));
+            let revision = view.read(cx).hover_revision;
+            window.hover("open-raster", cx);
+            assert!(view.read(cx).pointer.is_none());
+            assert!(view.read(cx).vector_hover.is_none(), "Leaving the map must clear vector hover");
+            assert!(view.read(cx).hover_revision > revision);
+            assert!(window.try_find("feature-info-properties").is_none());
+            assert_eq!(window.find("feature-info").bounds().size.height, px(0.));
+            view.update(cx, |map, cx| {
+                map.clear_vector_hover(cx);
+                assert_eq!(map.hover_revision, revision + 1, "Redundant clears must not issue another revision");
+                map.open_paths(vec![raster_path], cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(view.read(cx).vector.is_none());
+            assert!(view.read(cx).raster.is_some());
+            window.hover("map-surface", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(view.read(cx).vector_hover.is_none());
+            assert!(window.try_find("feature-info-properties").is_none());
+            assert_eq!(window.find("feature-info").bounds().size.height, px(0.));
+            let info = window.find("pixel-info");
+            let text = info.label().unwrap();
+            assert!(text.contains("Lat: 0.000000") && text.contains("Lon: 0.000000"), "{text}");
+            let value = text.split_whitespace().nth(4).unwrap().parse::<f64>().unwrap();
+            assert!((value - 74.0).abs() <= 1.0, "Expected the first band's center value, got {value}");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn mouse_move_reads_the_active_band_and_hides_info_over_controls(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -1828,6 +2275,7 @@ mod tests {
                             viewport: view.viewport.unwrap(),
                             basemap: basemap_style(cx),
                             raster_layer_id: Some(source.metadata().id),
+                            vector_layer_id: None,
                             tile_boundaries: false,
                             image: Ok(image.clone()),
                         },
@@ -1872,6 +2320,7 @@ mod tests {
                         viewport: view.viewport.unwrap(),
                         basemap: basemap_style(cx),
                         raster_layer_id: Some(obsolete_source.metadata().id),
+                        vector_layer_id: None,
                         tile_boundaries: false,
                         image: Ok(obsolete),
                     },
@@ -1917,6 +2366,7 @@ mod tests {
                                 viewport,
                                 basemap: basemap_style(cx),
                                 raster_layer_id: None,
+                                vector_layer_id: None,
                                 tile_boundaries: false,
                                 image: Ok(image.clone()),
                             },

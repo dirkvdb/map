@@ -9,6 +9,8 @@
 #include <mln/map/map.hpp>
 #include <mln/map/map_observer.hpp>
 #include <mln/map/map_options.hpp>
+#include <mln/renderer/renderer.hpp>
+#include <mapbox/geojson.hpp>
 #include <mln/style/style.hpp>
 #include <mln/style/source.hpp>
 #include <mln/util/image.hpp>
@@ -329,6 +331,35 @@ public:
 
     void rotateBy(const mln::ScreenCoordinate& first, const mln::ScreenCoordinate& second) {
         map->rotateBy(first, second);
+    }
+
+    rust::String queryRenderedFeatures(const mln::ScreenCoordinate& point,
+                                       double tolerance,
+                                       rust::Slice<const rust::String> layerIds) {
+        if (layerIds.empty()) {
+            return rust::String("[]");
+        }
+
+        std::vector<std::string> ids;
+        ids.reserve(layerIds.size());
+        for (const auto& id : layerIds) {
+            ids.emplace_back(id);
+        }
+        const mln::RenderedQueryOptions options(std::move(ids));
+        const auto features = tolerance == 0.0
+            ? frontend->getRenderer()->queryRenderedFeatures(point, options)
+            : frontend->getRenderer()->queryRenderedFeatures(
+                  mln::ScreenBox{{point.x - tolerance, point.y - tolerance},
+                                 {point.x + tolerance, point.y + tolerance}}, options);
+        std::string json = "[";
+        for (const auto& feature : features) {
+            if (json.size() > 1) {
+                json += ',';
+            }
+            json += mapbox::geojson::stringify(static_cast<const mln::GeoJSONFeature&>(feature));
+        }
+        json += ']';
+        return rust::String(json);
     }
 
     // Set the wgpu device and queue required for rendering when using the wgpu ffi backend
