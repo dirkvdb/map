@@ -549,7 +549,6 @@ impl Render for MapView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(self.raster_panel.update(cx, |panel, cx| panel.render_layer_selector(cx)))
                             .child(
                                 Button::new("open-raster")
                                     .small()
@@ -560,20 +559,34 @@ impl Render for MapView {
                                     .loading(self.raster_panel.read(cx).is_loading())
                                     .disabled(self.raster_panel.read(cx).is_loading())
                                     .on_click(cx.listener(|view, _, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx)))),
-                            ),
+                            )
+                            .child(self.raster_panel.update(cx, |panel, cx| panel.render_layer_selector(cx))),
                     )
                     .child(
-                        div().flex().items_center().pr_2().child(
-                            Button::new("toggle-tile-boundaries")
-                                .small()
-                                .ghost()
-                                .icon(IconName::Bug)
-                                .accessibility_label("Debug mode")
-                                .tooltip_with_action("Debug mode: tile boundaries, tile IDs, and FPS", &ToggleTileBoundaries, Some("RasterWorkspace"))
-                                .selected(self.tile_boundaries)
-                                .toggled(self.tile_boundaries)
-                                .on_click(cx.listener(|view, _, _, cx| view.toggle_tile_boundaries(cx))),
-                        ),
+                        div()
+                            .flex()
+                            .items_center()
+                            .pr_2()
+                            .child(
+                                Button::new("toggle-tile-boundaries")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::Bug)
+                                    .accessibility_label("Debug mode")
+                                    .tooltip_with_action("Debug mode: tile boundaries, tile IDs, and FPS", &ToggleTileBoundaries, Some("RasterWorkspace"))
+                                    .selected(self.tile_boundaries)
+                                    .toggled(self.tile_boundaries)
+                                    .on_click(cx.listener(|view, _, _, cx| view.toggle_tile_boundaries(cx))),
+                            )
+                            .child(
+                                Button::new("open-settings")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::Settings)
+                                    .accessibility_label("Settings")
+                                    .tooltip_with_action("Settings…", &crate::settings::OpenSettings, Some("RasterWorkspace"))
+                                    .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::settings::OpenSettings), cx)),
+                            ),
                     ),
             )
             .child(

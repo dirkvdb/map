@@ -15,6 +15,11 @@ let
       -L${lib.getLib pkgs.llvmPackages.libcxx}/lib \
       -Wl,-rpath,${lib.getLib pkgs.llvmPackages.libcxx}/lib
   '';
+  # MapLibre probes libuv, while the static overlay only ships libuv-static.pc.
+  linuxLibuvPkgConfig = pkgs.runCommand "map-linux-libuv-pkgconfig" { } ''
+    mkdir -p "$out/lib/pkgconfig"
+    ln -s ${lib.getDev pkgs.pkg-mod-libuv}/lib/pkgconfig/libuv-static.pc "$out/lib/pkgconfig/libuv.pc"
+  '';
   packageLibraries = lib.closePropagation [
     pkgs.pkg-mod-curl
     pkgs.pkg-mod-libwebp
@@ -74,6 +79,7 @@ in
     ]
     ++ lib.optionals pkgs.stdenv.isLinux [
       pkg-mod-libuv
+      linuxLibuvPkgConfig
       fontconfig
       fontconfig.dev
       vulkan-headers

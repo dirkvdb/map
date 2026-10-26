@@ -423,7 +423,7 @@ impl RasterPanel {
                     .id("raster-band")
                     .small()
                     .accessibility_label("Raster band")
-                    .placeholder("Choose a raster band")
+                    .placeholder("Open a geospatial dataset")
                     .disabled(self.sources.is_empty()),
             )
     }
