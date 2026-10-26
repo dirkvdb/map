@@ -55,6 +55,13 @@ pub(crate) fn open(window: &mut Window, cx: &mut App) {
                             window,
                         ))
                         .child(shortcut(
+                            "shortcut-appearance",
+                            "Cycle appearance mode",
+                            &crate::appearance::CycleAppearance,
+                            "RasterWorkspace",
+                            window,
+                        ))
+                        .child(shortcut(
                             "shortcut-tile-boundaries",
                             "Toggle debug mode",
                             &crate::map_view::ToggleTileBoundaries,

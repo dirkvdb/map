@@ -28,6 +28,7 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
     cx.bind_keys([
         key_binding("?", crate::shortcuts::ShowShortcuts, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-,", crate::settings::OpenSettings, Some("RasterWorkspace"), cx)?,
+        key_binding("secondary-\\", crate::appearance::CycleAppearance, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-o", OpenDataset, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-0", FitRaster, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-l", ToggleRasterControls, Some("RasterWorkspace"), cx)?,
@@ -663,6 +664,7 @@ impl Render for MapView {
                 view.drag = None;
                 crate::settings::open(window, cx);
             }))
+            .on_action(|_: &crate::appearance::CycleAppearance, window, cx| crate::appearance::cycle_mode(window, cx))
             .on_action(cx.listener(|view, _: &OpenDataset, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx))))
             .on_action(cx.listener(|view, _: &FitRaster, _, cx| view.raster_panel.update(cx, |panel, cx| panel.fit(cx))))
             .on_action(cx.listener(|view, _: &ClearRasters, window, cx| view.raster_panel.update(cx, |panel, cx| panel.clear(window, cx))))
@@ -754,6 +756,92 @@ mod tests {
     use gpui_kit::{AppContext, InputEvent as _, TestAppContext, point, px, size};
 
     use super::*;
+
+    #[gpui_kit::test]
+    fn appearance_shortcut_cycles_persists_and_replaces_the_mode_indicator(cx: &mut TestAppContext) {
+        use crate::appearance::{self, Appearance, AppearanceMode};
+        use gpui_kit::component::{ThemeMode, WindowExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            appearance::setup_test(Some(path.clone()), cx);
+            init(cx).unwrap();
+            cx.set_reduce_motion(true);
+        });
+        let mut view = None;
+        let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
+            crate::follow_system_appearance(window, cx);
+            appearance::select_theme(ThemeMode::Light, "Gruvbox Light", window, cx).unwrap();
+            appearance::select_theme(ThemeMode::Dark, "Tokyo Night", window, cx).unwrap();
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.press("\\", cx);
+            assert_eq!(
+                Appearance::mode(cx),
+                AppearanceMode::System,
+                "An unmodified backslash must not change appearance"
+            );
+            assert!(window.notifications(cx).is_empty());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let camera = cx.update(|cx| view.read(cx).camera);
+
+        for (mode, saved_mode) in [
+            (AppearanceMode::Light, "light"),
+            (AppearanceMode::Dark, "dark"),
+            (AppearanceMode::System, "system"),
+            (AppearanceMode::Light, "light"),
+        ] {
+            cx.update_window(handle.into(), |_, window, cx| window.press("secondary-\\", cx)).unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(Appearance::mode(cx), mode);
+                let expected = match mode {
+                    AppearanceMode::System => ThemeMode::from(window.appearance()),
+                    AppearanceMode::Light => ThemeMode::Light,
+                    AppearanceMode::Dark => ThemeMode::Dark,
+                };
+                assert_eq!(cx.theme().mode, expected);
+                assert_eq!(cx.theme().theme_name().as_str(), Appearance::selected_theme(expected, cx));
+                assert_eq!(view.read(cx).requested.as_ref().unwrap().basemap, basemap_style(cx));
+                assert_eq!(view.read(cx).camera, camera);
+                assert!(view.read(cx).focus.is_focused(window), "The indicator must not steal focus");
+                assert!(window.find("notification").visible());
+                assert_eq!(window.notifications(cx).len(), 1, "Repeated presses must replace the indicator");
+                let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert_eq!(saved["mode"], saved_mode);
+                assert_eq!(saved["light_theme"], "Gruvbox Light");
+                assert_eq!(saved["dark_theme"], "Tokyo Night");
+            })
+            .unwrap();
+        }
+
+        // Advance through entrance, the auto-hide timeout, and exit separately.
+        for delay in [Duration::from_secs(1), Duration::from_secs(6), Duration::from_secs(1)] {
+            cx.executor().advance_clock(delay);
+            cx.run_until_parked();
+        }
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.notifications(cx).is_empty());
+            assert!(window.try_find("notification").is_none());
+            assert_eq!(Appearance::mode(cx), AppearanceMode::Light);
+        })
+        .unwrap();
+    }
 
     #[gpui_kit::test]
     fn appearance_changes_update_the_basemap_and_reject_obsolete_frames(cx: &mut TestAppContext) {
@@ -1142,6 +1230,7 @@ mod tests {
             window.render_frame(cx);
             assert!(window.find("keyboard-shortcuts").visible());
             assert!(window.find("shortcut-open").visible());
+            assert!(window.find("shortcut-appearance").visible());
             assert_eq!(
                 window.find("shortcuts-title").bounds().center().x,
                 px(320.0),

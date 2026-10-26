@@ -1,7 +1,11 @@
 use std::rc::Rc;
 
 use anyhow::{Context as _, bail};
-use gpui_kit::component::{Theme, ThemeConfig, ThemeMode, ThemeRegistry, highlighter::HighlightTheme};
+use gpui_kit::component::{
+    Theme, ThemeConfig, ThemeMode, ThemeRegistry, WindowExt,
+    highlighter::HighlightTheme,
+    notification::{Notification, NotificationDelivery},
+};
 use gpui_kit::{App, Global, Window};
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +13,8 @@ use crate::config::ConfigPaths;
 
 const DEFAULT_LIGHT_THEME: &str = "Ayu Light";
 const DEFAULT_DARK_THEME: &str = "Ayu Dark";
+
+gpui_kit::actions!(appearance, [CycleAppearance]);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -174,6 +180,26 @@ pub(crate) fn select_mode(mode: AppearanceMode, window: &mut Window, cx: &mut Ap
     cx.global_mut::<Appearance>().mode = mode;
     apply(window, cx);
     save(cx)
+}
+
+pub(crate) fn cycle_mode(window: &mut Window, cx: &mut App) {
+    let next = match Appearance::mode(cx) {
+        AppearanceMode::System => AppearanceMode::Light,
+        AppearanceMode::Light => AppearanceMode::Dark,
+        AppearanceMode::Dark => AppearanceMode::System,
+    };
+    let label = match next {
+        AppearanceMode::System => "Auto (follow system)",
+        mode => mode.label(),
+    };
+    let notification = match select_mode(next, window, cx) {
+        Ok(()) => Notification::new().message(format!("Appearance: {label}")),
+        Err(error) => {
+            log::error!("Could not save appearance preference: {error:#}");
+            Notification::error(format!("Appearance: {label}. The preference could not be saved."))
+        }
+    };
+    window.push_notification(notification.id::<CycleAppearance>().delivery(NotificationDelivery::InApp), cx);
 }
 
 pub(crate) fn select_theme(mode: ThemeMode, name: &str, window: &mut Window, cx: &mut App) -> anyhow::Result<()> {
