@@ -20,6 +20,8 @@ use crate::vector_source::VectorSource;
 
 gpui_kit::actions!(raster, [OpenDataset, FitRaster, ClearRasters, ToggleRasterControls]);
 
+const PALETTES: [&str; 5] = ["Terrain", "Blues", "Gray", "Turbo", "Spectral"];
+
 pub struct RasterEvent {
     source: Option<Arc<RasterSource>>,
     vector_source: Option<Arc<VectorSource>>,
@@ -69,6 +71,7 @@ pub struct RasterPanel {
     vectors: Vec<Arc<VectorSource>>,
     selected: Option<SelectionId>,
     band_scroll: f32,
+    palette_scroll: f32,
     bands: Entity<SelectState<Vec<BandChoice>>>,
     palette: Entity<SelectState<Vec<&'static str>>>,
     opacity: Entity<SliderState>,
@@ -91,7 +94,7 @@ impl EventEmitter<RasterEvent> for RasterPanel {}
 impl RasterPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let bands = cx.new(|cx| SelectState::new(Vec::<BandChoice>::new(), None, window, cx));
-        let palette = cx.new(|cx| SelectState::new(vec!["Terrain", "Blues", "Gray", "Turbo", "Spectral"], Some(IndexPath::default()), window, cx));
+        let palette = cx.new(|cx| SelectState::new(PALETTES.to_vec(), Some(IndexPath::default()), window, cx));
         let opacity = cx.new(|_| SliderState::new().min(0.0).max(100.0).step(1.0).default_value(100.0));
         // A normalized domain keeps slider stepping useful for tiny or very
         // large data ranges without replacing retained component state.
@@ -129,6 +132,7 @@ impl RasterPanel {
             vectors: Vec::new(),
             selected: None,
             band_scroll: 0.0,
+            palette_scroll: 0.0,
             bands,
             palette,
             opacity,
@@ -197,6 +201,7 @@ impl RasterPanel {
 
     fn select(&mut self, id: Option<SelectionId>, fit: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = id;
+        self.palette_scroll = 0.0;
         self.error = None;
         self.load_error = None;
         self.collapsed = false;
@@ -242,29 +247,25 @@ impl RasterPanel {
         let Some(ix) = items.iter().position(|item| Some(item.id) == self.selected) else {
             return;
         };
-        let delta = match event.delta {
-            ScrollDelta::Lines(delta) => delta.y,
-            // Accumulate precise device pixels so small trackpad events don't
-            // race through bands. This is an input threshold, not layout size.
-            ScrollDelta::Pixels(delta) => f32::from(delta.y) / 40.0,
-        };
-        if !delta.is_finite() || delta == 0.0 {
-            return;
-        }
-        cx.stop_propagation();
-        if self.band_scroll.signum() != delta.signum() {
-            self.band_scroll = 0.0;
-        }
-        self.band_scroll += delta;
-        // A wheel notch can report several lines; band navigation still moves
-        // by only one index. Keep only the fractional trackpad remainder.
-        let steps = self.band_scroll.trunc().clamp(-1.0, 1.0);
-        self.band_scroll = self.band_scroll.fract();
-        let next = (ix as f32 - steps).clamp(0.0, (items.len() - 1) as f32) as usize;
+        let next = scroll_index(event, &mut self.band_scroll, ix, items.len(), cx);
         if next != ix {
             let id = items[next].id;
             self.bands.update(cx, |state, cx| state.set_selected_value(&id, window, cx));
             self.select(Some(id), false, window, cx);
+        }
+    }
+
+    fn scroll_palette(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active().is_none() {
+            return;
+        }
+        let Some(ix) = PALETTES.iter().position(|palette| Some(palette) == self.palette.read(cx).selected_value()) else {
+            return;
+        };
+        let next = scroll_index(event, &mut self.palette_scroll, ix, PALETTES.len(), cx);
+        if next != ix {
+            self.palette.update(cx, |state, cx| state.set_selected_value(&PALETTES[next], window, cx));
+            self.apply_style(window, cx);
         }
     }
 
@@ -432,6 +433,7 @@ impl RasterPanel {
         self.sources.clear();
         self.vectors.clear();
         self.band_scroll = 0.0;
+        self.palette_scroll = 0.0;
         self.selected = None;
         self.error = None;
         self.load_error = None;
@@ -562,12 +564,17 @@ impl Render for RasterPanel {
             if self.active().is_some() {
                 layers = layers
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(field_label("Color map", cx))
-                            .child(Select::new(&self.palette).id("raster-palette").accessibility_label("Color map")),
+                        div().flex().flex_col().gap_1().child(field_label("Color map", cx)).child(
+                            div()
+                                .id("raster-palette-scroll")
+                                .on_scroll(cx.listener(Self::scroll_palette))
+                                .on_hover(cx.listener(|this, hovered, _, _| {
+                                    if !hovered {
+                                        this.palette_scroll = 0.0;
+                                    }
+                                }))
+                                .child(Select::new(&self.palette).id("raster-palette").accessibility_label("Color map")),
+                        ),
                     )
                     .child(self.render_legend(cx));
             }
@@ -688,6 +695,28 @@ impl RasterPanel {
                     .on_change(cx.listener(|this, enabled, window, cx| this.set_unscaling(*enabled, window, cx)))
             }))
     }
+}
+
+fn scroll_index(event: &ScrollEvent, scroll: &mut f32, ix: usize, count: usize, cx: &mut App) -> usize {
+    let delta = match event.delta {
+        ScrollDelta::Lines(delta) => delta.y,
+        // Accumulate precise device pixels so small trackpad events don't
+        // race through choices. This is an input threshold, not layout size.
+        ScrollDelta::Pixels(delta) => f32::from(delta.y) / 40.0,
+    };
+    if !delta.is_finite() || delta == 0.0 {
+        return ix;
+    }
+    cx.stop_propagation();
+    if scroll.signum() != delta.signum() {
+        *scroll = 0.0;
+    }
+    *scroll += delta;
+    // A wheel notch can report several lines; navigation still moves by only
+    // one index. Keep only the fractional trackpad remainder.
+    let steps = scroll.trunc().clamp(-1.0, 1.0);
+    *scroll = scroll.fract();
+    (ix as f32 - steps).clamp(0.0, (count - 1) as f32) as usize
 }
 
 fn overlay_card(id: &'static str, cx: &App) -> impl IntoElement + ParentElement + Styled {
