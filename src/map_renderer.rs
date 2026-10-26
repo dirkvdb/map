@@ -1336,6 +1336,199 @@ mod tests {
 
     #[test]
     #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
+    fn scaled_bands_render_physical_legend_colors_through_loading_and_fades() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("scaled-bands.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 2)?;
+        let mut dataset = gdal::Dataset::open_ex(
+            &path,
+            gdal::DatasetOptions {
+                open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE,
+                ..Default::default()
+            },
+        )?;
+        for (nr, raw, scale, offset) in [(1, 100.0_f32, 0.5, -7.0), (2, 40.0, -2.0, 200.0)] {
+            let mut band = dataset.rasterband(nr)?;
+            band.set_scale(scale)?;
+            band.set_offset(offset)?;
+            let values = (0..4096).map(|ix| if ix % 64 < 8 { -9999.0 } else { raw }).collect();
+            band.write((0, 0), (64, 64), &mut gdal::raster::Buffer::new((64, 64), values))?;
+        }
+        dataset.flush_cache()?;
+        drop(dataset);
+        let sources = RasterSource::open(&path)?;
+        let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
+        let second = sources[1].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
+        let legend_pixel = |source: &RasterSource, physical: f32| {
+            let color = source.legend().color_for_value(physical, None);
+            image::Rgba([color.b, color.g, color.r, 255])
+        };
+        let first_color = legend_pixel(&first, 43.0);
+        let second_color = legend_pixel(&second, 120.0);
+        let assert_center = |image: &RgbaImage, expected: image::Rgba<u8>| {
+            for (actual, expected) in image.get_pixel(128, 128).0.into_iter().zip(expected.0) {
+                assert!(
+                    actual.abs_diff(expected) <= 1,
+                    "Rendered center must match the active-unit legend: {actual} vs {expected}"
+                );
+            }
+        };
+        let viewport = Viewport {
+            width: NonZeroU32::new(256).unwrap(),
+            height: NonZeroU32::new(256).unwrap(),
+            scale: 1.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::fit_bounds(first.metadata().bounds, 256.0, 256.0),
+        };
+        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
+        let background = map.render(request)?;
+        map.set_raster(Some(first.clone()), 1.0)?;
+        let mut outgoing = map.render(request)?;
+        assert_center(&outgoing, first_color);
+        assert_eq!(
+            outgoing.get_pixel(16, 128),
+            background.get_pixel(16, 128),
+            "Scaled nodata must remain transparent"
+        );
+
+        // Exercise both uniform slots, then return with reduced motion. No
+        // particular intermediate blend is required on a slow graphics device.
+        for (incoming, expected, reduce_motion) in [(second.clone(), second_color, false), (first.clone(), first_color, true)] {
+            map.numeric.borrow_mut().set_reduce_motion(reduce_motion);
+            map.set_raster(Some(incoming), 1.0)?;
+            map.apply_request(request);
+            let texture = map.poll_frame()?.context("The scaled outgoing band must remain renderable while loading")?;
+            let loading = map.readback.read(&texture, &map.device, &map.queue)?;
+            assert_eq!(
+                loading.as_raw(),
+                outgoing.as_raw(),
+                "Loading must retain the outgoing band's own scale and offset"
+            );
+            let start = *outgoing.get_pixel(128, 128);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut previous = start[0];
+            outgoing = loop {
+                ensure!(Instant::now() < deadline, "Scaled band transition did not complete");
+                if let Some(texture) = map.poll_frame()? {
+                    let image = map.readback.read(&texture, &map.device, &map.queue)?;
+                    let pixel = *image.get_pixel(128, 128);
+                    assert_eq!(pixel[3], 255, "Scaled opaque bands must remain opaque during a fade");
+                    for (actual, (old, new)) in pixel.0.into_iter().zip(start.0.into_iter().zip(expected.0)) {
+                        assert!(
+                            actual >= old.min(new).saturating_sub(1) && actual <= old.max(new).saturating_add(1),
+                            "Fade must stay between independently unscaled legend colors: {pixel:?}"
+                        );
+                    }
+                    assert_eq!(
+                        image.get_pixel(16, 128),
+                        background.get_pixel(16, 128),
+                        "Nodata must not acquire the band's offset"
+                    );
+                    if reduce_motion {
+                        assert!(
+                            pixel == start || pixel.0.into_iter().zip(expected.0).all(|(a, b)| a.abs_diff(b) <= 1),
+                            "Reduced motion must show only a physical-color endpoint"
+                        );
+                    } else {
+                        assert!(pixel[0].saturating_add(1) >= previous, "Per-band transforms must not cause the fade to reverse");
+                    }
+                    previous = pixel[0];
+                    if !map.numeric.borrow().is_loading() {
+                        assert_center(&image, expected);
+                        break image;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+        }
+
+        for (source, raw) in [(&first, 100.0_f32), (&second, 40.0)] {
+            let tile = geo::Tile::for_coordinate(geo::Coordinate::latlon(1.0, 1.0), source.metadata().max_zoom.clamp(0, 22));
+            let numeric = source.numeric_tile(tile, 1)?.context("Missing scaled numeric tile")?;
+            assert!(numeric.values.iter().any(|value| value.is_finite()), "The fixture must contain numeric data");
+            assert!(
+                numeric
+                    .values
+                    .iter()
+                    .filter(|value| value.is_finite())
+                    .all(|value| (*value - raw).abs() <= 0.0001),
+                "Numeric tiles must retain stored values, not physical legend values"
+            );
+        }
+
+        let counts = map.numeric.borrow().tile_counts();
+        assert!(counts.0 > 0 && counts.1 > 0, "Warm the numeric tile cache before toggling units");
+        let camera_updates = map.camera_updates;
+        // Every following snapshot and render must use metadata and cached raw tiles only.
+        std::fs::rename(&path, path.with_extension("cached.tif"))?;
+        let raw_equivalent = first.with_unscaling(false)?;
+        let physical_roundtrip = raw_equivalent.with_unscaling(true)?;
+        let raw_gray = raw_equivalent.restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
+        let physical_equivalent = raw_gray.with_unscaling(true)?;
+        let physical_gray = physical_equivalent.restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
+        let raw_again = physical_gray.with_unscaling(false)?;
+        let raw_clipped = raw_gray.restyled(inf::colormap::ColorMapPreset::Gray, (110.0, 200.0))?;
+        let physical_clipped = raw_clipped.with_unscaling(true)?;
+        let clipped_roundtrip = physical_clipped.with_unscaling(false)?;
+        for (snapshot, enabled, range, expected, unchanged) in [
+            (&raw_equivalent, false, (14.0, 524.0), 43, true),
+            (&physical_roundtrip, true, (0.0, 255.0), 43, true),
+            (&raw_gray, false, (0.0, 255.0), 100, false),
+            (&physical_equivalent, true, (-7.0, 120.5), 100, false),
+            (&physical_gray, true, (0.0, 255.0), 43, true),
+            (&raw_again, false, (14.0, 524.0), 43, true),
+            (&raw_clipped, false, (110.0, 200.0), 0, false),
+            (&physical_clipped, true, (48.0, 93.0), 0, false),
+            (&clipped_roundtrip, false, (110.0, 200.0), 0, false),
+        ] {
+            assert!(snapshot.has_scale_metadata());
+            assert_eq!(snapshot.unscaling_enabled(), enabled, "Restyling must retain the snapshot's unit mode");
+            assert_eq!(
+                snapshot.scale(),
+                if enabled {
+                    geo::RasterScale { scale: 0.5, offset: -7.0 }
+                } else {
+                    geo::RasterScale::default()
+                }
+            );
+            assert_eq!(snapshot.range(), range);
+            assert_eq!(snapshot.palette(), inf::colormap::ColorMapPreset::Gray);
+            assert_eq!(snapshot.metadata().id, first.metadata().id, "Unit changes must retain raw cache identity");
+            assert_eq!(snapshot.metadata().scale, Some(geo::RasterScale { scale: 0.5, offset: -7.0 }));
+            assert_ne!(snapshot.id(), first.id(), "Unit/style snapshots need their own style identity");
+            map.set_raster(Some(snapshot.clone()), 1.0)?;
+            let image = map.render(request)?;
+            assert_center(&image, image::Rgba([expected, expected, expected, 255]));
+            if unchanged {
+                assert_eq!(
+                    image.as_raw(),
+                    outgoing.as_raw(),
+                    "Equivalent raw and physical ranges must render identical pixels"
+                );
+            }
+            assert_eq!(
+                image.get_pixel(16, 128),
+                background.get_pixel(16, 128),
+                "Toggling units or clipping must leave nodata transparent"
+            );
+            assert_eq!(
+                map.numeric.borrow().tile_counts(),
+                counts,
+                "Unit/style changes must not request or upload numeric tiles"
+            );
+            assert_eq!(map.camera_updates, camera_updates, "Unit/style changes must not reset the camera");
+        }
+        assert!(first.unscaling_enabled(), "Creating raw snapshots must not mutate the physical source");
+        assert_eq!(first.range(), (0.0, 255.0));
+        assert!(!raw_gray.unscaling_enabled(), "Creating physical snapshots must not mutate the raw source");
+        assert_eq!(raw_gray.range(), (0.0, 255.0));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
     fn custom_raster_respects_native_layer_order_and_band_changes() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("bands.tif");
@@ -1401,6 +1594,45 @@ mod tests {
             assert!(
                 actual.abs_diff(expected) <= 1,
                 "Native translucent layers must still draw correctly after the custom callback"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a graphics device and MAP_TEST_NETCDF pointing to the Abu Dhabi WBGT example"]
+    fn local_wbgt_netcdf_places_the_coast_north_and_desert_south() -> Result<()> {
+        let path = std::path::PathBuf::from(std::env::var("MAP_TEST_NETCDF")?);
+        let source = RasterSource::open(&path)?.remove(0);
+        let viewport = Viewport {
+            width: NonZeroU32::new(512).unwrap(),
+            height: NonZeroU32::new(512).unwrap(),
+            scale: 1.0,
+        };
+        let camera = MapCamera::fit_bounds(source.metadata().bounds, 512.0, 512.0);
+        let request = MapRequest { viewport, camera };
+        let mut map = NativeMap::with_style(
+            viewport,
+            Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#ff00ff"}}]}"##),
+        )?;
+        map.set_raster(Some(source.clone()), 1.0)?;
+        let image = map.render(request)?;
+        let origin = geo::crs::lat_lon_to_web_mercator(camera.coordinate_at((-256.0, -256.0)));
+        let step = geo::crs::lat_lon_to_web_mercator(camera.coordinate_at((-255.0, -255.0)));
+        for (coordinate, has_data) in [(geo::Coordinate::latlon(25.0, 54.37), false), (geo::Coordinate::latlon(23.14, 53.78), true)] {
+            let tile = geo::Tile::for_coordinate(coordinate, source.metadata().max_zoom.clamp(0, 22));
+            let data = source.numeric_tile(tile, 1)?.context("Missing WBGT tile")?;
+            let grid = geo::GeoReference::from_tile(&tile, data.width as usize, 1);
+            let projected = geo::crs::lat_lon_to_web_mercator(coordinate);
+            let cell = grid.point_to_cell(projected);
+            let value = data.values[(cell.row as u32 * data.width + cell.col as u32) as usize];
+            assert_eq!(value.is_finite(), has_data, "Numeric WBGT tile is reversed at {coordinate:?}");
+            let x = ((projected.x() - origin.x()) / (step.x() - origin.x())).round() as u32;
+            let y = ((projected.y() - origin.y()) / (step.y() - origin.y())).round() as u32;
+            assert_eq!(
+                *image.get_pixel(x, y) != image::Rgba([255, 0, 255, 255]),
+                has_data,
+                "Rendered WBGT footprint is reversed at {coordinate:?}"
             );
         }
         Ok(())

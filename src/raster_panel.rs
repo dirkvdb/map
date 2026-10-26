@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, InputState, NumberInput};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
@@ -387,6 +388,35 @@ impl RasterPanel {
         });
     }
 
+    fn set_unscaling(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(source) = self.active() else { return };
+        if !source.has_scale_metadata() || source.unscaling_enabled() == enabled {
+            return;
+        }
+        match source.with_unscaling(enabled) {
+            Ok(source) => {
+                let range = source.range();
+                if let Some(current) = self
+                    .sources
+                    .iter_mut()
+                    .find(|current| Some(SelectionId::Raster(current.metadata().id)) == self.selected)
+                {
+                    *current = source;
+                }
+                self.min.update(cx, |input, cx| input.set_value(range.0.to_string(), window, cx));
+                self.max.update(cx, |input, cx| input.set_value(range.1.to_string(), window, cx));
+                self.error = None;
+                self.sync_range_slider(window, cx);
+                self.watch_tile_errors(cx);
+                self.emit(false, cx);
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not change value units: {error}").into());
+                cx.notify();
+            }
+        }
+    }
+
     fn reset_range(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(source) = self.active() else { return };
         let (min, max) = source.data_range();
@@ -455,10 +485,41 @@ impl RasterPanel {
 }
 
 impl RasterPanel {
-    pub fn render_layer_selector(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+    pub fn render_layer_selector(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement + use<> {
+        const PLACEHOLDER: &str = "Open a geospatial dataset";
+
+        let rem = window.rem_size();
+        let text_style = window.text_style();
+        let measure = |text: &str| {
+            text.split('\n')
+                .map(|line| {
+                    window
+                        .text_system()
+                        .shape_line(line.to_owned().into(), rem * 0.875, &[text_style.to_run(line.len())], None)
+                        .width()
+                })
+                .fold(gpui_kit::Pixels::ZERO, gpui_kit::Pixels::max)
+        };
+        // Size to all loaded layers so changing selection does not move the actions.
+        let text_width = self
+            .sources
+            .iter()
+            .map(|source| source.metadata().name.as_str())
+            .chain(self.vectors.iter().map(|source| source.name()))
+            .map(measure)
+            .reduce(gpui_kit::Pixels::max)
+            .unwrap_or_else(|| measure(PLACEHOLDER));
+        // Match small Select padding, its rem-based caret + gap, and physical borders.
+        let chrome_width = gpui_kit::component::Size::Small.input_px() * 2.0 + rem * 1.125 + gpui_kit::px(2.0);
+        let viewport_width = window.viewport_size().width;
+        // Keep a drag region and room for Open, trailing actions, and window controls.
+        let max_width = (viewport_width * 0.5).min((viewport_width - rem * 14.0).max(gpui_kit::Pixels::ZERO));
+
         div()
             .id("raster-band-scroll")
-            .w_64()
+            .w((text_width + chrome_width).ceil().min(max_width))
+            .min_w_0()
+            .flex_shrink_0()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_scroll(cx.listener(Self::scroll_bands))
             .on_hover(cx.listener(|this, hovered, _, _| {
@@ -471,7 +532,7 @@ impl RasterPanel {
                     .id("raster-band")
                     .small()
                     .accessibility_label("Layer")
-                    .placeholder("Open a geospatial dataset")
+                    .placeholder(PLACEHOLDER)
                     .disabled(self.sources.is_empty() && self.vectors.is_empty()),
             )
     }
@@ -525,7 +586,7 @@ impl Render for RasterPanel {
             }
         }
 
-        let mut panel = div().flex().flex_col().gap_3().size_full().child(layers);
+        let mut panel = div().flex().flex_col().gap_3().w_full().h_auto().min_h_0().child(layers);
         if !self.collapsed && self.active().is_some() {
             panel = panel.child(self.render_value_range(cx));
         }
@@ -534,7 +595,10 @@ impl Render for RasterPanel {
             .test_support()
             .track_focus(&self.focus)
             .occlude()
-            .size_full()
+            .flex()
+            .flex_col()
+            .w_full()
+            .max_h_full()
             .min_h_0()
             .child(panel.overflow_y_scrollbar().id("raster-controls-scroll"))
     }
@@ -615,6 +679,14 @@ impl RasterPanel {
                             .child(div().id("raster-max").test_support().child(NumberInput::new(&self.max).small())),
                     ),
             )
+            .children(self.active().filter(|source| source.has_scale_metadata()).map(|source| {
+                Checkbox::new("raster-unscaling")
+                    .small()
+                    .label("Unscale values")
+                    .checked(source.unscaling_enabled())
+                    .tooltip("Apply the raster’s scale and offset to pixel values")
+                    .on_change(cx.listener(|this, enabled, window, cx| this.set_unscaling(*enabled, window, cx)))
+            }))
     }
 }
 
@@ -662,10 +734,133 @@ mod tests {
     struct PanelHarness(Entity<RasterPanel>);
 
     impl Render for PanelHarness {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let selector = self.0.update(cx, |panel, cx| panel.render_layer_selector(cx));
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let selector = self.0.update(cx, |panel, cx| panel.render_layer_selector(window, cx));
             div().flex().flex_col().size_full().child(selector).child(self.0.clone())
         }
+    }
+
+    #[gpui_kit::test]
+    fn unscaling_checkbox_tracks_metadata_units_and_per_layer_state_through_the_ui(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for (name, coefficients) in [("plain", None), ("identity", Some((1.0, 0.0))), ("scaled", Some((0.5, -7.0)))] {
+            let path = dir.path().join(format!("{name}.tif"));
+            crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
+            if let Some((scale, offset)) = coefficients {
+                let dataset = gdal::Dataset::open_ex(
+                    &path,
+                    gdal::DatasetOptions {
+                        open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let mut band = dataset.rasterband(1).unwrap();
+                band.set_scale(scale).unwrap();
+                band.set_offset(offset).unwrap();
+                dataset.close().unwrap();
+                if (scale, offset) == (1.0, 0.0) {
+                    // GeoTIFF omits identity coefficients; PAM retains their explicit presence.
+                    std::fs::write(
+                        path.with_extension("tif.aux.xml"),
+                        "<PAMDataset><PAMRasterBand band=\"1\"><Scale>1</Scale><Offset>0</Offset></PAMRasterBand></PAMDataset>",
+                    )
+                    .unwrap();
+                }
+            }
+            paths.push(path);
+        }
+        let mut panel = None;
+        let handle = cx.open_window(size(px(900.0), px(760.0)), |window, cx| {
+            let view = cx.new(|cx| RasterPanel::new(window, cx));
+            panel = Some(view.clone());
+            let harness = cx.new(|_| PanelHarness(view));
+            gpui_kit::base::Root::new(harness, window, cx)
+        });
+        let panel = panel.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("raster-unscaling").is_none());
+            panel.update(cx, |panel, cx| panel.open_paths(paths, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.within("raster-range-card").find("raster-unscaling").label(), Some("Unscale values"));
+            assert_eq!(window.find("raster-unscaling").checked(), Some(true));
+            let checkbox = window.find("raster-unscaling").bounds();
+            let minimum = window.find("raster-min").bounds();
+            let maximum = window.find("raster-max").bounds();
+            assert!(
+                checkbox.top() >= minimum.bottom() && checkbox.top() >= maximum.bottom(),
+                "Unscaling belongs below both range fields"
+            );
+            assert!(checkbox.bottom() <= window.find("raster-range-card").bounds().bottom());
+            assert_eq!(panel.read(cx).active().unwrap().range(), (2.0, 61.0));
+            window.click("raster-min", cx);
+            window.press("secondary-a", cx);
+            window.input("5", cx);
+            window.click("raster-max", cx);
+            window.press("secondary-a", cx);
+            window.input("20", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(panel.read(cx).active().unwrap().range(), (5.0, 20.0));
+            let id = panel.read(cx).active().unwrap().metadata().id;
+            window.click("raster-unscaling", cx);
+            assert_eq!(window.find("raster-unscaling").checked(), Some(false));
+            let state = panel.read(cx);
+            assert_eq!(state.active().unwrap().metadata().id, id);
+            assert_eq!(state.active().unwrap().range(), (24.0, 54.0));
+            assert_eq!(state.range_domain, (18.0, 136.0));
+            assert_eq!(state.min.read(cx).value().as_str(), "24");
+            assert_eq!(state.max.read(cx).value().as_str(), "54");
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            assert!(
+                panel.read(cx).active().unwrap().has_scale_metadata(),
+                "Explicit identity scaling must show the toggle"
+            );
+            assert_eq!(window.find("raster-unscaling").checked(), Some(true));
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            assert!(window.try_find("raster-unscaling").is_none(), "Unscaled layers must not show the toggle");
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+            assert_eq!(window.find("raster-unscaling").checked(), Some(false), "Mode must be retained per layer");
+            window.click("raster-unscaling", cx);
+            assert_eq!(window.find("raster-unscaling").checked(), Some(true));
+            for _ in 0..20 {
+                if window.find("raster-unscaling").focused() == Some(true) {
+                    break;
+                }
+                window.press("tab", cx);
+            }
+            assert_eq!(window.find("raster-unscaling").focused(), Some(true), "Checkbox must be reachable with Tab");
+            window.press("space", cx);
+            assert_eq!(window.find("raster-unscaling").checked(), Some(false), "Space must toggle the focused checkbox");
+            window.press("space", cx);
+            assert_eq!(window.find("raster-unscaling").checked(), Some(true));
+            assert_eq!(panel.read(cx).active().unwrap().range(), (5.0, 20.0));
+            window.click("reset-raster-range", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(panel.read(cx).active().unwrap().range(), (2.0, 61.0));
+            window.click("raster-unscaling", cx);
+            window.click("reset-raster-range", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(panel.read(cx).active().unwrap().range(), (18.0, 136.0));
+            assert!(!panel.read(cx).active().unwrap().unscaling_enabled());
+        });
     }
 
     #[gpui_kit::test]

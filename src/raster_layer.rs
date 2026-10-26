@@ -27,6 +27,8 @@ struct DrawUniform {
     previous_uv: [f32; 4],
     range: [f32; 2],
     previous_range: [f32; 2],
+    scale_offset: [f32; 2],
+    previous_scale_offset: [f32; 2],
     opacity: f32,
     blend: f32,
     tile_size: f32,
@@ -348,6 +350,10 @@ impl RasterLayer {
             }
             let range = source.range();
             let previous_range = self.previous.as_ref().map_or(range, |previous| previous.source.range());
+            let scale = source.scale();
+            let scale_offset = [scale.scale as f32, scale.offset as f32];
+            let previous_scale = self.previous.as_ref().map_or(scale, |previous| previous.source.scale());
+            let previous_scale_offset = [previous_scale.scale as f32, previous_scale.offset as f32];
             self.queue.write_buffer(
                 &draw.uniform,
                 0,
@@ -357,6 +363,8 @@ impl RasterLayer {
                     previous_uv: previous_sampled.map_or([0.0, 0.0, 1.0, 1.0], |sampled| parent_uv(tile, sampled)),
                     range: [range.0, range.1],
                     previous_range: [previous_range.0, previous_range.1],
+                    scale_offset,
+                    previous_scale_offset,
                     opacity: self.opacity,
                     blend,
                     tile_size: (512.0 * parameters.zoom.exp2() / f64::from(1_u32 << tile.z)) as f32,

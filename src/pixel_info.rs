@@ -109,7 +109,19 @@ impl PixelValueCache {
         let key = request.key();
         let ix = self.tiles.iter().position(|tile| tile.key == key)?;
         let tile = self.tiles.remove(ix)?;
-        let value = tile.value(request.coordinate);
+        // Keep cached samples raw; nodata must be rejected before applying even a zero scale.
+        let value = match tile.value(request.coordinate) {
+            PixelValue::Data(raw) => {
+                let scale = request.source.scale();
+                let physical = raw * scale.scale + scale.offset;
+                if physical.is_finite() {
+                    PixelValue::Data(physical)
+                } else {
+                    PixelValue::NoData
+                }
+            }
+            value => value,
+        };
         self.tiles.push_back(tile);
         Some(value)
     }
@@ -191,10 +203,13 @@ impl PixelInfo {
 
     pub fn show(&mut self, coordinate: Coordinate, source: Option<Arc<RasterSource>>, dpi: u8, cx: &mut Context<Self>) {
         let position = (coordinate, source.as_ref().map(|source| source.metadata().id), dpi);
-        if self.position == Some(position) {
+        // Display identity includes units; raw tile identity deliberately does not.
+        let same_units = self.current.as_ref().map(|request| request.source.unscaling_enabled())
+            == source.as_ref().filter(|source| source.is_numeric()).map(|source| source.unscaling_enabled());
+        if self.position == Some(position) && same_units {
             return;
         }
-        let keep_previous = self.position.is_some_and(|(_, layer, previous_dpi)| layer == position.1 && previous_dpi == dpi);
+        let keep_previous = same_units && self.position.is_some_and(|(_, layer, previous_dpi)| layer == position.1 && previous_dpi == dpi);
         self.position = Some(position);
         self.current = None;
         self.value = match source {
@@ -374,6 +389,119 @@ mod tests {
     }
 
     #[test]
+    fn sampling_applies_per_band_scale_and_offset_without_changing_cached_raw_values_or_style_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scaled.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 2).unwrap();
+        let dataset = gdal::Dataset::open_ex(
+            &path,
+            gdal::DatasetOptions {
+                open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (band_nr, scale, offset) in [(1, 2.5, -11.0), (2, -0.5, 7.0)] {
+            let mut band = dataset.rasterband(band_nr).unwrap();
+            band.set_scale(scale).unwrap();
+            band.set_offset(offset).unwrap();
+        }
+        drop(dataset);
+        let sources = RasterSource::open(&path).unwrap();
+        let coordinate = Coordinate::latlon(-0.15625, 0.15625);
+        let mut cache = PixelValueCache::default();
+        for dpi in [1, 2] {
+            for (source, raw, physical) in [(&sources[0], 74.0, 174.0), (&sources[1], 84.0, -35.0)] {
+                assert_eq!(cache.sample(source, coordinate, dpi).unwrap(), Some(physical));
+                let request = SampleRequest {
+                    source: source.clone(),
+                    coordinate,
+                    dpi,
+                };
+                let key = request.key();
+                let tile = cache.tiles.iter().find(|tile| tile.key == key).unwrap();
+                assert_eq!(tile.value(coordinate), PixelValue::Data(raw));
+                let retained_tiles = cache.tiles.len();
+                let retained_bytes = cache.bytes;
+                let restyled = source.restyled(ColorMapPreset::Blues, (0.0, 1.0)).unwrap();
+                assert_eq!(restyled.metadata().id, source.metadata().id);
+                assert_eq!(cache.sample(&restyled, coordinate, dpi).unwrap(), Some(physical));
+                let raw_source = restyled.with_unscaling(false).unwrap();
+                assert_eq!(cache.sample(&raw_source, coordinate, dpi).unwrap(), Some(raw));
+                assert_eq!(
+                    cache.sample(&raw_source.with_unscaling(true).unwrap(), coordinate, dpi).unwrap(),
+                    Some(physical)
+                );
+                assert_eq!((cache.tiles.len(), cache.bytes), (retained_tiles, retained_bytes));
+                let tile = cache.tiles.iter().find(|tile| tile.key == key).unwrap();
+                assert_eq!(tile.value(coordinate), PixelValue::Data(raw));
+            }
+        }
+    }
+
+    #[test]
+    fn sampling_rejects_nonfinite_physical_values_without_changing_the_cached_raw_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scaled.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
+        let dataset = gdal::Dataset::open_ex(
+            &path,
+            gdal::DatasetOptions {
+                open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut band = dataset.rasterband(1).unwrap();
+        band.set_scale(2.0).unwrap();
+        band.set_offset(17.0).unwrap();
+        drop(dataset);
+        let source = RasterSource::open(&path).unwrap().remove(0);
+        let coordinate = Coordinate::latlon(-0.15625, 0.15625);
+        let request = SampleRequest { source, coordinate, dpi: 1 };
+        let mut tile = CachedTile::load(&request.source, request.key());
+        // The fixture is Float32; inject a finite Float64 sample that overflows only after conversion.
+        let metadata = *tile.data.as_ref().unwrap().as_ref().unwrap().metadata();
+        tile.data = Ok(Some(AnyDenseArray::filled_with(Some(f64::MAX), metadata, geo::ArrayDataType::Float64)));
+        assert_eq!(tile.value(coordinate), PixelValue::Data(f64::MAX));
+        let mut cache = PixelValueCache::default();
+        cache.insert(tile);
+        assert_eq!(cache.lookup(&request), Some(PixelValue::NoData));
+        assert_eq!(cache.tiles.front().unwrap().value(coordinate), PixelValue::Data(f64::MAX));
+    }
+
+    #[test]
+    fn scaled_sampling_preserves_nodata_and_maps_valid_raw_zero_to_the_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        for scale in [0.0, 2.5, -0.5] {
+            let path = dir.path().join(format!("scaled-{scale}.tif"));
+            crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
+            let dataset = gdal::Dataset::open_ex(
+                &path,
+                gdal::DatasetOptions {
+                    open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut band = dataset.rasterband(1).unwrap();
+            band.set_scale(scale).unwrap();
+            band.set_offset(17.0).unwrap();
+            band.write((32, 32), (1, 1), &mut gdal::raster::Buffer::new((1, 1), vec![0.0_f32])).unwrap();
+            drop(dataset);
+            let source = RasterSource::open(&path).unwrap().remove(0);
+            let mut cache = PixelValueCache::default();
+            assert_eq!(
+                cache.sample(&source, Coordinate::latlon(-0.15625, 0.15625), 1).unwrap(),
+                Some(17.0),
+                "Scale {scale}"
+            );
+            assert_eq!(cache.sample(&source, Coordinate::latlon(-0.15625, -8.59375), 1).unwrap(), None, "Scale {scale}");
+            assert_eq!(cache.sample(&source, Coordinate::latlon(30.0, 30.0), 1).unwrap(), None, "Scale {scale}");
+        }
+    }
+
+    #[test]
     fn nodata_and_outside_extent_return_no_value_but_zero_is_data() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("raster.tif");
@@ -432,6 +560,60 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(cx.update(|cx| info.read(cx).value), PixelValue::Data(85.0));
+    }
+
+    #[gpui_kit::test]
+    fn same_point_unscaling_changes_refresh_cached_values_without_rereading(cx: &mut TestAppContext) {
+        for (scale, offset, physical) in [(2.5, -11.0, 174.0), (-0.5, 7.0, -30.0), (0.0, 12.0, 12.0), (1.0, 0.0, 74.0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("scaled.tif");
+            crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
+            let dataset = gdal::Dataset::open_ex(
+                &path,
+                gdal::DatasetOptions {
+                    open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut band = dataset.rasterband(1).unwrap();
+            band.set_scale(scale).unwrap();
+            band.set_offset(offset).unwrap();
+            dataset.close().unwrap();
+            let source = RasterSource::open(&path).unwrap().remove(0);
+            let raw = source.with_unscaling(false).unwrap();
+            let coordinate = Coordinate::latlon(-0.15625, 0.15625);
+            let info = cx.new(|_| PixelInfo::new());
+            cx.update(|cx| {
+                info.update(cx, |info, cx| {
+                    info.show(coordinate, Some(source.clone()), 1, cx);
+                    assert!(info.task.is_some());
+                    // The in-flight raw read must publish in the newest units.
+                    info.show(coordinate, Some(raw.clone()), 1, cx);
+                })
+            });
+            cx.run_until_parked();
+            assert_eq!(cx.update(|cx| info.read(cx).value), PixelValue::Data(74.0));
+            std::fs::remove_file(&path).unwrap();
+            cx.update(|cx| {
+                info.update(cx, |info, cx| {
+                    let retained_tiles = info.cache.tiles.len();
+                    let retained_bytes = info.cache.bytes;
+                    for (snapshot, expected) in [(&source, physical), (&raw, 74.0), (&source, physical)] {
+                        info.show(coordinate, Some(snapshot.clone()), 1, cx);
+                        assert_eq!(info.value, PixelValue::Data(expected));
+                        assert_eq!(info.current.as_ref().unwrap().source.unscaling_enabled(), snapshot.unscaling_enabled());
+                        assert!(info.task.is_none(), "Cached toggles must not start a new read");
+                        assert_eq!((info.cache.tiles.len(), info.cache.bytes), (retained_tiles, retained_bytes));
+                        let key = info.current.as_ref().unwrap().key();
+                        let tile = info.cache.tiles.iter().find(|tile| tile.key == key).unwrap();
+                        assert_eq!(tile.value(coordinate), PixelValue::Data(74.0));
+                    }
+                })
+            });
+            cx.run_until_parked();
+            assert_eq!(cx.update(|cx| info.read(cx).value), PixelValue::Data(physical));
+        }
     }
 
     #[gpui_kit::test]

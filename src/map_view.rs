@@ -695,7 +695,7 @@ impl Render for MapView {
                                     .disabled(self.raster_panel.read(cx).is_loading())
                                     .on_click(cx.listener(|view, _, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx)))),
                             )
-                            .child(self.raster_panel.update(cx, |panel, cx| panel.render_layer_selector(cx))),
+                            .child(self.raster_panel.update(cx, |panel, cx| panel.render_layer_selector(window, cx))),
                     )
                     .child(
                         div()
@@ -740,6 +740,8 @@ impl Render for MapView {
                             .top_3()
                             .right_3()
                             .bottom_3()
+                            .flex()
+                            .flex_col()
                             .w_80()
                             .max_w_full()
                             .child(self.raster_panel.clone())
@@ -1679,6 +1681,161 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn title_bar_layer_selector_fits_loaded_names_and_caps_width_without_hiding_actions(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::appearance::setup_test(None, cx);
+            init(cx).unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let short = directory.path().join("dem.tif");
+        let long = directory.path().join("Regional elevation observations for winter.tif");
+        let oversized = directory.path().join(format!("{}.tif", "regional_".repeat(20)));
+        for path in [&short, &long, &oversized] {
+            crate::raster_source::test_support::write_raster(path, 4326, 1).unwrap();
+        }
+        let mut view = None;
+        let handle = cx.open_window(size(px(1200.), px(760.)), |window, cx| {
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        let placeholder_width = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let selector = window.find("raster-band");
+                assert!(selector.visible());
+                assert_eq!(selector.disabled(), Some(true));
+                let width = selector.bounds().size.width;
+                let text = "Open a geospatial dataset";
+                let text_width = window
+                    .text_system()
+                    .shape_line(text.into(), window.rem_size() * 0.875, &[window.text_style().to_run(text.len())], None)
+                    .width();
+                assert!(width > text_width, "The empty placeholder must fit with room for the caret");
+                window.click("open-raster", cx);
+                width
+            })
+            .unwrap();
+        cx.simulate_path_prompt_response(|_| Some(vec![short]));
+        cx.run_until_parked();
+        let short_width = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let width = window.find("raster-band").bounds().size.width;
+                assert!(width < placeholder_width, "A short loaded name must not retain the placeholder's width");
+                assert!(width < window.rem_size() * 16., "Short names must not retain the old w_64 width");
+                window.click("open-raster", cx);
+                width
+            })
+            .unwrap();
+        cx.simulate_path_prompt_response(|_| Some(vec![long]));
+        cx.run_until_parked();
+        let long_width = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(
+                    view.read(cx).raster.as_ref().unwrap().metadata().name,
+                    "Regional elevation observations for winter"
+                );
+                let width = window.find("raster-band").bounds().size.width;
+                assert!(width > placeholder_width && width > short_width, "Longer names must grow the selector");
+                let text = &view.read(cx).raster.as_ref().unwrap().metadata().name;
+                let text_width = window
+                    .text_system()
+                    .shape_line(text.clone().into(), window.rem_size() * 0.875, &[window.text_style().to_run(text.len())], None)
+                    .width();
+                assert!(width > text_width, "An uncapped layer title must fit with room for the caret");
+                window.click("raster-band", cx);
+                window.press("up", cx);
+                window.press("enter", cx);
+                width
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().name, "dem");
+            assert_eq!(
+                window.find("raster-band").bounds().size.width,
+                long_width,
+                "Keyboard selection must not change width"
+            );
+            window.scroll("raster-band", ScrollDelta::Lines(point(0., -1.)), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx).raster.as_ref().unwrap().metadata().name,
+                "Regional elevation observations for winter"
+            );
+            assert_eq!(
+                window.find("raster-band").bounds().size.width,
+                long_width,
+                "Wheel selection must not change width"
+            );
+            Theme::update(cx, |theme| theme.font_size = px(24.));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.find("raster-band").bounds().size.width > long_width,
+                "Selector measurement must follow font zoom"
+            );
+            window.click("open-raster", cx);
+        })
+        .unwrap();
+        cx.simulate_path_prompt_response(|_| Some(vec![oversized]));
+        cx.run_until_parked();
+        let wide_capped_width = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let width = window.find("raster-band").bounds().size.width;
+                assert!(width <= window.viewport_size().width * 0.5, "Very long names must leave title-bar space");
+                width
+            })
+            .unwrap();
+        cx.simulate_window_resize(handle.into(), size(px(640.), px(400.)));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let title_bar = window.find("title-bar").bounds();
+            let band = window.find("raster-band").bounds();
+            let open = window.find("open-raster").bounds();
+            let debug = window.find("toggle-tile-boundaries").bounds();
+            let settings = window.find("open-settings").bounds();
+            assert!(band.size.width < wide_capped_width && band.size.width <= title_bar.size.width * 0.5);
+            assert!(open.right() <= band.left() && band.right() < debug.left());
+            assert!(debug.right() <= settings.left() && settings.right() <= title_bar.right());
+            let controls = window.find("window-controls").bounds();
+            if controls.size.width > px(0.) {
+                assert!(settings.right() <= controls.left() && controls.right() <= title_bar.right());
+            }
+            assert!(window.find("open-raster").visible() && window.find("open-settings").visible());
+            window.click("toggle-tile-boundaries", cx);
+            assert!(view.read(cx).tile_boundaries, "The trailing action must remain clickable after capping");
+            window.click("open-settings", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("appearance-settings").visible(), "Settings must remain clickable after capping");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn band_selection_preserves_the_camera_and_explicit_fit_restores_the_extent(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -2049,6 +2206,85 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(window.find("pixel-info").label().unwrap().split_whitespace().count(), 4);
             assert!(view.read(cx).raster.is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn map_gestures_pass_through_below_floating_controls(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx).unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raster.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
+        let mut view = None;
+        let handle = cx.open_window(size(px(1200.0), px(760.0)), |window, cx| {
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("open-raster", cx);
+        })
+        .unwrap();
+        cx.simulate_path_prompt_response(|_| Some(vec![path]));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let map = window.find("map-surface").bounds();
+            let range = window.find("raster-range-card").bounds();
+            let before = view.read(cx).camera;
+            window.scroll("raster-layers-card", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            let layers = window.find("raster-layers-card").bounds();
+            let from = layers.origin + point(px(20.0), px(20.0));
+            window.drag(from, from + point(px(20.0), px(20.0)), cx);
+            assert_eq!(view.read(cx).camera, before, "The cards must own their input");
+            let below = point(range.center().x, (range.bottom() + map.bottom()) * 0.5);
+            assert!(below.y > window.find("raster-controls").bounds().bottom());
+            window.dispatch_event(
+                ScrollEvent {
+                    position: below,
+                    delta: ScrollDelta::Lines(point(0.0, 1.0)),
+                    modifiers: Default::default(),
+                    touch_phase: Default::default(),
+                    source: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            assert_ne!(view.read(cx).camera, before, "Scrolling below the cards must zoom the map");
+            let before_drag = view.read(cx).camera;
+            window.drag(below, below + point(px(-40.0), px(-20.0)), cx);
+            assert_ne!(view.read(cx).camera, before_drag, "Dragging below the cards must pan the map");
+
+            window.click("toggle-raster-controls", cx);
+            let layers = window.find("raster-layers-card").bounds();
+            let before = view.read(cx).camera;
+            let below = point(layers.center().x, (layers.bottom() + map.bottom()) * 0.5);
+            window.drag(below, below + point(px(-40.0), px(-20.0)), cx);
+            assert_ne!(view.read(cx).camera, before, "Collapsed controls must not block the map below them");
+            window.click("toggle-raster-controls", cx);
+        })
+        .unwrap();
+        cx.simulate_window_resize(handle.into(), size(px(640.0), px(400.0)));
+        cx.update(|cx| gpui_kit::component::Theme::update(cx, |theme| theme.font_size = px(18.0)));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let before = view.read(cx).camera;
+            window.scroll("raster-layers-card", ScrollDelta::Lines(point(0.0, -30.0)), cx);
+            assert!(window.find("raster-max").visible(), "Controls must remain scrollable in short windows");
+            assert_eq!(view.read(cx).camera, before, "Scrolling the controls must not zoom the map");
         })
         .unwrap();
     }
