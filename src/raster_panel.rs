@@ -9,8 +9,8 @@ use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme, Icon, IndexPath, Sizable};
 use gpui_kit::{
-    App, AppContext, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, ParentElement, PathPromptOptions, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, Window, div, rgba,
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, PathPromptOptions,
+    Render, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, Window, div, rgba,
 };
 use inf::colormap::ColorMapPreset;
 
@@ -406,6 +406,29 @@ impl RasterPanel {
     }
 }
 
+impl RasterPanel {
+    pub fn render_layer_selector(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        div()
+            .id("raster-band-scroll")
+            .w_64()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(cx.listener(Self::scroll_bands))
+            .on_hover(cx.listener(|this, hovered, _, _| {
+                if !hovered {
+                    this.band_scroll = 0.0;
+                }
+            }))
+            .child(
+                Select::new(&self.bands)
+                    .id("raster-band")
+                    .small()
+                    .accessibility_label("Raster band")
+                    .placeholder("Choose a raster band")
+                    .disabled(self.sources.is_empty()),
+            )
+    }
+}
+
 impl Render for RasterPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_border = if self.focus.is_focused(window) { cx.theme().ring } else { cx.theme().border };
@@ -415,7 +438,7 @@ impl Render for RasterPanel {
                 .items_center()
                 .gap_2()
                 .child(Icon::new(IconName::Layers).small())
-                .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child("Layers"))
+                .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child("Layer"))
                 .child(
                     Button::new("toggle-raster-controls")
                         .small()
@@ -427,25 +450,6 @@ impl Render for RasterPanel {
                 ),
         );
         if !self.collapsed {
-            layers = layers.child(
-                div().flex().flex_col().gap_1().child(field_label("Layer", cx)).child(
-                    div()
-                        .id("raster-band-scroll")
-                        .on_scroll_wheel(cx.listener(Self::scroll_bands))
-                        .on_hover(cx.listener(|this, hovered, _, _| {
-                            if !hovered {
-                                this.band_scroll = 0.0;
-                            }
-                        }))
-                        .child(
-                            Select::new(&self.bands)
-                                .id("raster-band")
-                                .accessibility_label("Raster band")
-                                .placeholder("Choose a raster band")
-                                .disabled(self.sources.is_empty()),
-                        ),
-                ),
-            );
             if self.selected.is_some() {
                 layers = layers
                     .child(

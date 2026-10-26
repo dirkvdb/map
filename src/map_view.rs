@@ -543,24 +543,27 @@ impl Render for MapView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
-                TitleBar::new().child("Map").child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .pr_2()
-                        .child(
-                            Button::new("open-raster")
-                                .small()
-                                .ghost()
-                                .icon(IconName::FolderOpen)
-                                .label("Open…")
-                                .tooltip("Open raster (Ctrl/⌘+O)")
-                                .loading(self.raster_panel.read(cx).is_loading())
-                                .disabled(self.raster_panel.read(cx).is_loading())
-                                .on_click(cx.listener(|view, _, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx)))),
-                        )
-                        .child(
+                TitleBar::new()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.raster_panel.update(cx, |panel, cx| panel.render_layer_selector(cx)))
+                            .child(
+                                Button::new("open-raster")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::FolderOpen)
+                                    .accessibility_label("Open raster")
+                                    .tooltip("Open raster (Ctrl/⌘+O)")
+                                    .loading(self.raster_panel.read(cx).is_loading())
+                                    .disabled(self.raster_panel.read(cx).is_loading())
+                                    .on_click(cx.listener(|view, _, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx)))),
+                            ),
+                    )
+                    .child(
+                        div().flex().items_center().pr_2().child(
                             Button::new("toggle-tile-boundaries")
                                 .small()
                                 .ghost()
@@ -571,7 +574,7 @@ impl Render for MapView {
                                 .toggled(self.tile_boundaries)
                                 .on_click(cx.listener(|view, _, _, cx| view.toggle_tile_boundaries(cx))),
                         ),
-                ),
+                    ),
             )
             .child(
                 div()
@@ -582,7 +585,7 @@ impl Render for MapView {
                     .min_h_0()
                     .child(surface)
                     .child(div().absolute().bottom_3().left_3().max_w_full().child(self.pixel_info.clone()))
-                    .child(
+                    .children(self.raster.is_some().then(|| {
                         div()
                             .absolute()
                             .top_3()
@@ -590,8 +593,8 @@ impl Render for MapView {
                             .bottom_3()
                             .w_80()
                             .max_w_full()
-                            .child(self.raster_panel.clone()),
-                    )
+                            .child(self.raster_panel.clone())
+                    }))
                     .children(self.tile_boundaries.then(|| gpui_fps::fps_monitor(window, cx).anchor(Anchor::TopLeft))),
             )
             .child(alerts)
@@ -735,6 +738,7 @@ mod tests {
                 map.open_paths(vec![directory.path().join("missing.tif")], cx);
                 map
             });
+            map.read(cx).raster_panel.clone().update(cx, |panel, cx| panel.toggle_controls(window, cx));
             view = Some(map.clone());
             gpui_kit::base::Root::new(map, window, cx)
         });
@@ -742,7 +746,7 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            window.click("toggle-raster-controls", cx);
+            assert!(window.try_find("raster-controls").is_none());
             let banner = window.find("raster-error-banner");
             assert!(banner.visible());
             let inset = window.rem_size() * 0.75;
@@ -1533,6 +1537,7 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             assert!(!view.read(cx).raster_panel.read(cx).is_loading());
             assert!(view.read(cx).raster.is_none());
+            assert!(window.try_find("raster-controls").is_none());
             window.within("title-bar").click("open-raster", cx);
             assert!(view.read(cx).drag.is_none(), "Opening a raster must not start a map gesture");
         })
@@ -1551,9 +1556,13 @@ mod tests {
             let map = window.find("map-surface").bounds();
             let layers = window.find("raster-layers-card").bounds();
             let range = window.find("raster-range-card").bounds();
-            assert!(open.left() > title_bar.center().x);
+            let band = window.within("title-bar").find("raster-band").bounds();
+            assert!(band.left() < title_bar.center().x);
+            assert!(band.top() >= title_bar.top() && band.bottom() <= title_bar.bottom());
+            assert!(open.left() > band.right() && open.right() < title_bar.center().x);
             assert!(open.top() >= title_bar.top() && open.bottom() <= title_bar.bottom());
-            assert_eq!(title_bar.right() - open.right(), window.rem_size() * 0.5);
+            assert_eq!(open.left() - band.right(), window.rem_size() * 0.5);
+            assert!(window.within("raster-layers-card").try_find("raster-band").is_none());
             assert!(window.within("raster-layers-card").try_find("open-raster").is_none());
             assert_eq!(title_bar.origin, point(px(0.0), px(0.0)));
             assert_eq!(title_bar.size.width, px(1200.0));
@@ -1679,7 +1688,7 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.click("toggle-raster-controls", cx);
             assert!(window.try_find("raster-range-card").is_none());
-            assert!(window.try_find("raster-band").is_none());
+            assert!(window.within("title-bar").find("raster-band").visible());
             assert!(window.within("title-bar").find("open-raster").visible());
             let title_bar = window.find("title-bar").bounds();
             assert_eq!(window.find("map-surface").bounds().size, size(px(1200.0), px(760.0) - title_bar.size.height));
@@ -1703,7 +1712,10 @@ mod tests {
             let title_bar = window.find("title-bar").bounds();
             let open = window.within("title-bar").find("open-raster");
             assert!(open.visible());
-            assert!(open.bounds().left() > title_bar.center().x && open.bounds().right() < title_bar.right());
+            let band = window.within("title-bar").find("raster-band");
+            assert!(band.visible());
+            assert!(band.bounds().left() < title_bar.center().x);
+            assert!(open.bounds().left() > band.bounds().right() && open.bounds().right() < title_bar.right());
             assert_eq!(map.size, size(px(640.0), px(400.0) - title_bar.size.height));
             assert!(layers.right() < map.right() && layers.left() > map.left());
             window.scroll("raster-layers-card", ScrollDelta::Lines(point(0.0, -30.0)), cx);
@@ -1711,6 +1723,14 @@ mod tests {
                 window.find("raster-max").visible(),
                 "The floating controls must scroll in short windows at larger UI scales"
             );
+            view.read(cx).raster_panel.clone().update(cx, |panel, cx| panel.clear(window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("raster-controls").is_none());
+            assert!(window.within("title-bar").find("open-raster").visible());
         })
         .unwrap();
     }
