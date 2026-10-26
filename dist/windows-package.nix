@@ -40,7 +40,7 @@ let
 
   '';
   rustPkgs = pkgs.extend inputs.rust-overlay.overlays.default;
-  rust = rustPkgs.rust-bin.stable."1.95.0".minimal.override {
+  rust = rustPkgs.rust-bin.stable."1.99.0".minimal.override {
     targets = [ "x86_64-pc-windows-gnu" ];
   };
   # Cargo's paths override changes source only, preserving the locked dependency

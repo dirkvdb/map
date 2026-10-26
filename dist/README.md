@@ -232,7 +232,7 @@ just exe
 ```
 
 This enters devenv and runs `scripts/package_windows.py`, using the locked
-pkgs-mod input's `mkBuildEnvMingwCross` setup and Rust 1.95.0 with the
+pkgs-mod input's `mkBuildEnvMingwCross` setup and Rust 1.99.0 with the
 `x86_64-pc-windows-gnu` standard library. Release-only inputs are declared in
 `dist/windows-package.nix`; target libraries are not added to the native shell.
 To realize and check the toolchain without compiling Map:
