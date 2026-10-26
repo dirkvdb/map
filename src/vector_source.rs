@@ -1,16 +1,17 @@
-//! GDAL vector detection with native, on-demand PMTiles rendering. Other vector
-//! formats are converted to WGS84 GeoJSON without sampling or truncation.
+//! GDAL vector detection and bounds via `geo`, with native on-demand tiled
+//! rendering. Other vector formats are converted to WGS84 GeoJSON.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::io::Read as _;
+
 use std::path::Path;
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result, bail, ensure};
+use gdal::Dataset;
 use gdal::vector::LayerAccess as _;
-use gdal::{Dataset, DatasetOptions, GdalOpenFlags};
+use geo::vector::gdalio;
 use serde_json::{Value, json};
 
 static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -18,7 +19,7 @@ const SOURCE_ID: &str = "local-vector";
 
 /// One vector layer, safe to share between the UI and renderer.
 ///
-/// PMTiles retains only a native source URL and archive bounds: MapLibre loads
+/// PMTiles/MBTiles retain only a native source URL and archive bounds: MapLibre loads
 /// visible tiles at the requested zoom. Other formats are materialized as WGS84
 /// GeoJSON, which can use substantial memory. Unreferenced spatial layers are
 /// rejected rather than guessed to be WGS84. Empty GeoJSON layers use `[0; 4]`.
@@ -33,25 +34,15 @@ pub struct VectorSource {
 #[derive(Debug)]
 enum VectorData {
     GeoJson(Value),
-    Pmtiles { url: String },
+    Tiled { url: String },
 }
 
 impl VectorSource {
-    /// Quietly probes GDAL's vector drivers, returning `None` if none can open it.
-    ///
-    /// A successful vector open returns one source per layer (including empty
-    /// layers). Conversion errors fail the whole load, never a partial collection.
-    /// A failed probe, including an unreadable/corrupt input, returns `None` so the
-    /// caller can try raster loading. No file-extension classification is used.
+    /// Probes GDAL's vector drivers through `geo`, without extension-based detection.
+    /// Returns one source per layer or `None` so the caller can try raster loading.
+    /// Tiled sources remain native; GDAL owns layer metadata and extent handling.
     pub fn open(path: &Path) -> Result<Option<Vec<Arc<Self>>>> {
-        let Ok(dataset) = Dataset::open_ex(
-            path,
-            DatasetOptions {
-                // Omitting VERBOSE_ERROR is GDALOpenEx's quiet-probe API.
-                open_flags: GdalOpenFlags::GDAL_OF_VECTOR,
-                ..Default::default()
-            },
-        ) else {
+        let Ok(dataset) = gdalio::dataset::open_read_only(path) else {
             return Ok(None);
         };
         // Container drivers such as GeoPackage can open in vector mode even
@@ -59,20 +50,25 @@ impl VectorSource {
         if dataset.layer_count() == 0 {
             return Ok(None);
         }
-        if dataset.driver().short_name() == "PMTiles" {
-            let bounds = pmtiles_bounds(path)?;
+        let driver = dataset.driver().short_name();
+        if matches!(driver.as_str(), "PMTiles" | "MBTiles") {
             let absolute = path.canonicalize().with_context(|| format!("Could not resolve {}", path.display()))?;
             let file_url = url::Url::from_file_path(&absolute).map_err(|_| anyhow::anyhow!("Could not create a file URL for {}", absolute.display()))?;
-            let url = format!("pmtiles://{file_url}");
+            let url = match driver.as_str() {
+                "PMTiles" => format!("pmtiles://{file_url}"),
+                // Native MBTiles takes an encoded absolute path, not a file URL.
+                _ => format!("mbtiles://{}", file_url.path()),
+            };
             // Reading names uses GDAL's layer metadata, never feature iteration
             // or extent/statistics calculation, which could scan the archive.
             let sources = (0..dataset.layer_count())
                 .map(|index| {
+                    let layer = dataset.layer(index)?;
                     Ok(Arc::new(Self {
                         id: NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
-                        name: dataset.layer(index)?.name(),
-                        bounds,
-                        data: VectorData::Pmtiles { url: url.clone() },
+                        name: layer.name(),
+                        bounds: bounds_array(gdalio::layer_bounds(&layer)?.unwrap_or_else(geo::LatLonBounds::world)),
+                        data: VectorData::Tiled { url: url.clone() },
                     }))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -105,14 +101,19 @@ impl VectorSource {
                     features.len()
                 );
             }
-            let mut bounds = None;
-            for feature in features {
-                extend_geometry_bounds(&feature["geometry"], &mut bounds).with_context(|| format!("Invalid geometry in layer {name:?}"))?;
-            }
+            let fallback = if features.is_empty() {
+                geo::LatLonBounds::from([0.0; 4])
+            } else {
+                geo::LatLonBounds::world()
+            };
+            let converted = gdalio::dataset::open_read_only(&output)?;
+            // Conversion has already materialized these features. Let GDAL
+            // compute their extent; tiled archives never take this scan path.
+            let bounds = bounds_array(gdalio::layer_bounds_with_scan(&converted.layer(0)?)?.unwrap_or(fallback));
             sources.push(Arc::new(Self {
                 id: NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
                 name,
-                bounds: bounds.unwrap_or([0.0; 4]),
+                bounds,
                 data: VectorData::GeoJson(data),
             }));
         }
@@ -124,22 +125,22 @@ impl VectorSource {
         self.id
     }
 
-    /// The original GDAL layer name.
+    /// The original archive metadata or GDAL layer name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// WGS84 `[west, south, east, north]`, as expected by `MapCamera::fit_bounds`.
-    /// Uses archive header bounds for PMTiles and transformed vertices for other
-    /// vectors. Dateline-crossing GeoJSON uses a potentially wide bounding box.
+    /// Bounds and reprojection come from GDAL through `geo`. When no fast extent
+    /// is available, use world bounds rather than scanning a tiled archive.
     pub fn bounds(&self) -> [f64; 4] {
         self.bounds
     }
 
-    /// A native tiled source for PMTiles, otherwise inline GeoJSON.
+    /// A native tiled source for PMTiles/MBTiles, otherwise inline GeoJSON.
     pub fn source_json(&self) -> Value {
         match &self.data {
-            VectorData::Pmtiles { url } => json!({ "type": "vector", "url": url }),
+            VectorData::Tiled { url } => json!({ "type": "vector", "url": url }),
             VectorData::GeoJson(data) => json!({ "type": "geojson", "data": data }),
         }
     }
@@ -172,7 +173,7 @@ impl VectorSource {
                 "paint": { "circle-color": color, "circle-radius": 4, "circle-opacity": opacity }
             }),
         ];
-        if matches!(self.data, VectorData::Pmtiles { .. }) {
+        if matches!(self.data, VectorData::Tiled { .. }) {
             for layer in &mut layers {
                 layer["source-layer"] = json!(self.name);
             }
@@ -181,63 +182,8 @@ impl VectorSource {
     }
 }
 
-fn pmtiles_bounds(path: &Path) -> Result<[f64; 4]> {
-    // PMTiles v3 stores WGS84 bounds directly in its fixed 127-byte header.
-    // Do not ask GDAL to compute an extent by walking features or tiles.
-    let mut header = [0; 127];
-    std::fs::File::open(path)?.read_exact(&mut header)?;
-    ensure!(&header[..8] == b"PMTiles\x03", "Expected a PMTiles v3 archive");
-    ensure!(header[99] == 1, "Expected vector (MVT) PMTiles");
-    let mut bounds = [0.0; 4];
-    for (value, bytes) in bounds.iter_mut().zip(header[102..118].chunks_exact(4)) {
-        *value = f64::from(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])) / 10_000_000.0;
-    }
-    ensure!(
-        (-180.0..=180.0).contains(&bounds[0])
-            && (-180.0..=180.0).contains(&bounds[2])
-            && (-90.0..=90.0).contains(&bounds[1])
-            && (-90.0..=90.0).contains(&bounds[3])
-            && bounds[1] <= bounds[3],
-        "Invalid PMTiles geographic bounds"
-    );
-    Ok(bounds)
-}
-
-fn extend_geometry_bounds(geometry: &Value, bounds: &mut Option<[f64; 4]>) -> Result<()> {
-    if geometry.is_null() {
-        return Ok(());
-    }
-    if geometry["type"] == "GeometryCollection" {
-        for child in geometry["geometries"].as_array().context("Expected geometry collection members")? {
-            extend_geometry_bounds(child, bounds)?;
-        }
-        return Ok(());
-    }
-    extend_coordinate_bounds(&geometry["coordinates"], bounds)
-}
-
-fn extend_coordinate_bounds(coordinates: &Value, bounds: &mut Option<[f64; 4]>) -> Result<()> {
-    let coordinates = coordinates.as_array().context("Expected geometry coordinates")?;
-    if coordinates.first().is_some_and(Value::is_number) {
-        ensure!(coordinates.len() >= 2, "A position needs longitude and latitude");
-        let x = coordinates[0].as_f64().context("Invalid longitude")?;
-        let y = coordinates[1].as_f64().context("Invalid latitude")?;
-        ensure!(x.is_finite() && y.is_finite(), "Nonfinite geographic coordinates");
-        match bounds {
-            Some([west, south, east, north]) => {
-                *west = west.min(x);
-                *south = south.min(y);
-                *east = east.max(x);
-                *north = north.max(y);
-            }
-            None => *bounds = Some([x, y, x, y]),
-        }
-    } else {
-        for child in coordinates {
-            extend_coordinate_bounds(child, bounds)?;
-        }
-    }
-    Ok(())
+fn bounds_array(bounds: geo::LatLonBounds) -> [f64; 4] {
+    [bounds.west(), bounds.south(), bounds.east(), bounds.north()]
 }
 
 // gdal 0.19 does not wrap GDALVectorTranslate. These are the public gdal_utils.h
@@ -322,6 +268,71 @@ fn translate_layer(dataset: &Dataset, layer: &str, output: &Path) -> Result<()> 
 mod tests {
     use super::*;
 
+    fn write_mbtiles(path: &Path) -> Result<()> {
+        let connection = sqlite::Connection::new(path, sqlite::AccessMode::Create)?;
+        connection.execute("CREATE TABLE metadata (name TEXT, value TEXT)")?;
+        connection.execute("CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")?;
+        let mut tile = Vec::new();
+        for name in ["points", "polygons"] {
+            let mut layer = vec![0x0a, name.len() as u8];
+            layer.extend_from_slice(name.as_bytes());
+            layer.extend_from_slice(&[0x28, 0x80, 0x20, 0x78, 0x02]);
+            tile.extend_from_slice(&[0x1a, layer.len() as u8]);
+            tile.extend(layer);
+        }
+        let mut insert = connection.prepare_statement("INSERT INTO tiles VALUES (0,0,0,?1) RETURNING zoom_level")?;
+        insert.bind_blob(1, &tile)?;
+        ensure!(insert.next().is_some(), "Could not insert fixture tile");
+        drop(insert);
+        let layers = json!({"vector_layers": [{"id": "points", "fields": {}}, {"id": "polygons", "fields": {}}]}).to_string();
+        for (name, value) in [
+            ("format", "pbf"),
+            ("json", layers.as_str()),
+            ("minzoom", "0"),
+            ("maxzoom", "0"),
+            ("bounds", "-4,49,6,53"),
+        ] {
+            let statement = connection.prepare_statement("INSERT INTO metadata VALUES (?, ?)")?;
+            statement.bind_text(1, name)?;
+            statement.bind_text(2, value)?;
+            statement.step();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mbtiles_uses_native_urls_and_metadata_without_materializing_features() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("vector # café.mbtiles");
+        write_mbtiles(&path)?;
+        let sources = VectorSource::open(&path)?.context("Expected GDAL MBTiles driver to expose vector layers")?;
+        assert_eq!(sources.iter().map(|source| source.name()).collect::<Vec<_>>(), ["points", "polygons"]);
+        assert_ne!(sources[0].id(), sources[1].id());
+        assert_eq!(sources[0].source_json(), sources[1].source_json());
+        for source in sources {
+            assert!(matches!(source.data, VectorData::Tiled { .. }));
+            for (actual, expected) in source.bounds().into_iter().zip([-4.0, 49.0, 6.0, 53.0]) {
+                assert!((actual - expected).abs() < 1e-8);
+            }
+            let json = source.source_json();
+            assert_eq!(json["type"], "vector");
+            assert!(json.get("data").is_none(), "MBTiles must never become GeoJSON");
+            let native_url = json["url"].as_str().unwrap();
+            let encoded_path = native_url.strip_prefix("mbtiles://").unwrap();
+            assert!(encoded_path.starts_with('/'));
+            assert!(!encoded_path.starts_with("file:"));
+            assert_eq!(
+                url::Url::parse(&format!("file://{encoded_path}"))?.to_file_path().unwrap(),
+                path.canonicalize()?
+            );
+            assert!(native_url.contains("%20%23%20caf%C3%A9"));
+            for layer in source.layers_json(0.5, "red") {
+                assert_eq!(layer["source-layer"], source.name());
+            }
+        }
+        Ok(())
+    }
+
     fn write_empty_pmtiles(path: &Path) -> Result<()> {
         let metadata = serde_json::to_vec(&json!({"vector_layers": [
             {"id": "points", "fields": {}}, {"id": "polygons", "fields": {}}
@@ -358,8 +369,10 @@ mod tests {
         let sources = VectorSource::open(&path)?.context("Expected native PMTiles layers")?;
         assert_eq!(sources.iter().map(|source| source.name()).collect::<Vec<_>>(), ["points", "polygons"]);
         for source in sources {
-            assert!(matches!(source.data, VectorData::Pmtiles { .. }));
-            assert_eq!(source.bounds(), [-4.0, 49.0, 6.0, 53.0]);
+            assert!(matches!(source.data, VectorData::Tiled { .. }));
+            for (actual, expected) in source.bounds().into_iter().zip([-4.0, 49.0, 6.0, 53.0]) {
+                assert!((actual - expected).abs() < 1e-8);
+            }
             let json = source.source_json();
             assert_eq!(json["type"], "vector");
             assert!(json.get("data").is_none());
@@ -371,20 +384,6 @@ mod tests {
                 assert_eq!(layer["source-layer"], source.name());
             }
         }
-        Ok(())
-    }
-
-    #[test]
-    fn pmtiles_bounds_reject_invalid_headers() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("invalid.pmtiles");
-        std::fs::write(&path, b"PMTiles")?;
-        assert!(pmtiles_bounds(&path).is_err());
-        write_empty_pmtiles(&path)?;
-        let mut bytes = std::fs::read(&path)?;
-        bytes[114..118].copy_from_slice(&(-900_000_000_i32).to_le_bytes());
-        std::fs::write(&path, bytes)?;
-        assert!(pmtiles_bounds(&path).is_err());
         Ok(())
     }
 
@@ -431,7 +430,7 @@ mod tests {
     #[test]
     fn open_reprojects_mercator_to_longitude_latitude() -> Result<()> {
         let sources = open_geojson(json!({
-            "type": "FeatureCollection", "crs": {"type": "name", "properties": {"name": "EPSG:3857"}},
+            "type": "FeatureCollection", "crs": {"type": "name", "properties": {"name": geo::crs::epsg::WGS84_WEB_MERCATOR.to_string()}},
             "features": [{"type": "Feature", "properties": {"value": 42},
                 "geometry": {"type": "Point", "coordinates": [445277.96317309426, 6621293.722740169]}}]
         }))?;
@@ -486,7 +485,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("layers.gpkg");
         let mut dataset = gdal::DriverManager::get_driver_by_name("GPKG")?.create_vector_only(&path)?;
-        let srs = SpatialRef::from_epsg(4326)?;
+        let srs = SpatialRef::from_epsg(u32::from(geo::crs::epsg::WGS84.code()))?;
         for name in ["first", "second"] {
             let mut layer = dataset.create_layer(LayerOptions {
                 name,
@@ -532,7 +531,11 @@ mod tests {
             assert_eq!(data["type"], "vector");
             assert_eq!(data["url"], format!("pmtiles://{}", url::Url::from_file_path(path).unwrap()));
             assert!(data.get("data").is_none(), "PMTiles must not be materialized as GeoJSON");
-            assert_eq!(source.bounds(), pmtiles_bounds(path)?);
+            let dataset = gdalio::dataset::open_read_only(path)?;
+            assert_eq!(
+                source.bounds(),
+                bounds_array(gdalio::layer_bounds(&dataset.layer_by_name(source.name())?)?.unwrap_or_else(geo::LatLonBounds::world))
+            );
             for layer in source.layers_json(1.0, "red") {
                 assert_eq!(layer["source-layer"], source.name());
             }
