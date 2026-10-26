@@ -1,7 +1,14 @@
 use gpui_kit::component::{ActiveTheme, WindowExt, kbd::Kbd};
-use gpui_kit::{Action, App, FontWeight, InteractiveElement, IntoElement, ParentElement, Styled, TestSupportExt, Window, div};
+use gpui_kit::{
+    Action, App, FontWeight, InteractiveElement, IntoElement, KeyBinding, KeyBindingContextPredicate, ParentElement, Styled, TestSupportExt, Window, div,
+};
 
 gpui_kit::actions!(shortcuts, [ShowShortcuts]);
+
+pub(crate) fn key_binding(keystrokes: &str, action: impl Action, context: Option<&str>, cx: &App) -> anyhow::Result<KeyBinding> {
+    let predicate = context.map(KeyBindingContextPredicate::parse).transpose()?.map(Into::into);
+    Ok(KeyBinding::load(keystrokes, Box::new(action), predicate, false, None, cx)?)
+}
 
 pub(crate) fn open(window: &mut Window, cx: &mut App) {
     window.open_dialog(cx, |dialog, window, cx| {
@@ -92,4 +99,31 @@ fn shortcut(id: &'static str, label: &'static str, action: &dyn Action, context:
         .text_sm()
         .child(div().flex_1().min_w_0().child(label))
         .children(Kbd::binding_for_action(action, Some(context), window))
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::{Keystroke, Modifiers, TestAppContext};
+
+    use super::*;
+
+    #[gpui_kit::test]
+    fn key_binding_resolves_secondary_using_the_app(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let binding = key_binding("secondary-q", crate::Quit, None, cx).unwrap();
+            let keystroke = Keystroke {
+                modifiers: Modifiers::secondary_key(cx),
+                key: "q".into(),
+                ..Default::default()
+            };
+            assert_eq!(binding.match_keystrokes(&[keystroke]), Some(false));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn key_binding_returns_an_error_for_invalid_keystrokes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            assert!(key_binding("unknown-q", crate::Quit, None, cx).is_err());
+        });
+    }
 }

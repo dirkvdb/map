@@ -8,9 +8,9 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::{ActiveTheme, Disableable, Selectable, Sizable, Theme, TitleBar, alert::Alert};
 use gpui_kit::{
-    Anchor, App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, Entity, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyBinding,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, TestSupportExt, Window, canvas, div, img,
+    Anchor, App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, Entity, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollEvent, SharedString,
+    StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, TestSupportExt, Window, canvas, div, img,
 };
 
 use crate::feature_info::FeatureInfo;
@@ -19,26 +19,28 @@ use crate::map_renderer::{BasemapStyle, MapFrame, MapRenderer, MapRequest, MapSo
 use crate::pixel_info::PixelInfo;
 use crate::raster_panel::{ClearRasters, FitRaster, OpenDataset, RasterPanel, ToggleRasterControls};
 use crate::raster_source::RasterSource;
+use crate::shortcuts::key_binding;
 use crate::vector_source::VectorSource;
 
 gpui_kit::actions!(map, [ZoomIn, ZoomOut, PanLeft, PanRight, PanUp, PanDown, ToggleTileBoundaries]);
 
-pub fn init(cx: &mut App) {
+pub fn init(cx: &mut App) -> anyhow::Result<()> {
     cx.bind_keys([
-        KeyBinding::new("?", crate::shortcuts::ShowShortcuts, Some("RasterWorkspace")),
-        KeyBinding::new("secondary-,", crate::settings::OpenSettings, Some("RasterWorkspace")),
-        KeyBinding::new("secondary-o", OpenDataset, Some("RasterWorkspace")),
-        KeyBinding::new("secondary-0", FitRaster, Some("RasterWorkspace")),
-        KeyBinding::new("secondary-l", ToggleRasterControls, Some("RasterWorkspace")),
-        KeyBinding::new("secondary-shift-d", ToggleTileBoundaries, Some("RasterWorkspace")),
-        KeyBinding::new("+", ZoomIn, Some("MapNavigation")),
-        KeyBinding::new("=", ZoomIn, Some("MapNavigation")),
-        KeyBinding::new("-", ZoomOut, Some("MapNavigation")),
-        KeyBinding::new("left", PanLeft, Some("MapNavigation")),
-        KeyBinding::new("right", PanRight, Some("MapNavigation")),
-        KeyBinding::new("up", PanUp, Some("MapNavigation")),
-        KeyBinding::new("down", PanDown, Some("MapNavigation")),
+        key_binding("?", crate::shortcuts::ShowShortcuts, Some("RasterWorkspace"), cx)?,
+        key_binding("secondary-,", crate::settings::OpenSettings, Some("RasterWorkspace"), cx)?,
+        key_binding("secondary-o", OpenDataset, Some("RasterWorkspace"), cx)?,
+        key_binding("secondary-0", FitRaster, Some("RasterWorkspace"), cx)?,
+        key_binding("secondary-l", ToggleRasterControls, Some("RasterWorkspace"), cx)?,
+        key_binding("secondary-shift-d", ToggleTileBoundaries, Some("RasterWorkspace"), cx)?,
+        key_binding("+", ZoomIn, Some("MapNavigation"), cx)?,
+        key_binding("=", ZoomIn, Some("MapNavigation"), cx)?,
+        key_binding("-", ZoomOut, Some("MapNavigation"), cx)?,
+        key_binding("left", PanLeft, Some("MapNavigation"), cx)?,
+        key_binding("right", PanRight, Some("MapNavigation"), cx)?,
+        key_binding("up", PanUp, Some("MapNavigation"), cx)?,
+        key_binding("down", PanDown, Some("MapNavigation"), cx)?,
     ]);
+    Ok(())
 }
 
 const DRAG_SAMPLE_WINDOW: Duration = Duration::from_millis(100);
@@ -529,7 +531,7 @@ impl Render for MapView {
                     cx.notify();
                 }),
             )
-            .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, _, cx| {
+            .on_scroll(cx.listener(|view, event: &ScrollEvent, _, cx| {
                 let Some(bounds) = view.bounds else { return };
                 let offset = event.position - bounds.center();
                 let delta = match event.delta {
@@ -1068,8 +1070,8 @@ mod tests {
         let dispatches = std::rc::Rc::new(std::cell::Cell::new(0));
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::init_actions(cx);
-            init(cx);
+            crate::init_actions(cx).unwrap();
+            init(cx).unwrap();
             cx.set_reduce_motion(true);
             // The headless platform's quit is a no-op. Observe dispatch while
             // allowing the production app handler to run.
@@ -1114,7 +1116,7 @@ mod tests {
     fn question_mark_shows_shortcuts_and_dismissal_restores_focus(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            init(cx);
+            init(cx).unwrap();
             cx.set_reduce_motion(true);
         });
         let mut view = None;
@@ -1202,7 +1204,7 @@ mod tests {
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::appearance::setup_test(None, cx);
-            init(cx);
+            init(cx).unwrap();
         });
         for (viewport, escape, font_size) in [
             (size(px(640.), px(400.)), false, None),
@@ -1396,7 +1398,7 @@ mod tests {
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::appearance::setup_test(Some(path.clone()), cx);
-            init(cx);
+            init(cx).unwrap();
         });
         let mut view = None;
         let handle = cx.open_window(size(px(1000.), px(800.)), |window, cx| {
@@ -1591,7 +1593,7 @@ mod tests {
     fn band_selection_preserves_the_camera_and_explicit_fit_restores_the_extent(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            init(cx);
+            init(cx).unwrap();
         });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bands.tif");
@@ -1658,7 +1660,7 @@ mod tests {
     fn vector_pointer_preserves_pending_properties_invalidates_context_and_switches_to_raster(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            init(cx);
+            init(cx).unwrap();
         });
         let directory = tempfile::tempdir().unwrap();
         let vector_path = directory.path().join("hover.geojson");
@@ -1860,7 +1862,7 @@ mod tests {
     fn mouse_move_reads_the_active_band_and_hides_info_over_controls(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            init(cx);
+            init(cx).unwrap();
         });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("raster.tif");
@@ -1966,7 +1968,7 @@ mod tests {
     fn floating_controls_preserve_the_full_map_and_own_their_input(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            init(cx);
+            init(cx).unwrap();
         });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("raster.tif");
@@ -2487,7 +2489,7 @@ mod tests {
     fn mouse_navigation_updates_the_camera_and_ends_drag_outside_map(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            init(cx);
+            init(cx).unwrap();
         });
         let mut view = None;
         let handle = cx.open_window(size(px(800.0), px(600.0)), |window, cx| {

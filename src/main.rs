@@ -18,7 +18,7 @@ mod shortcuts;
 mod vector_source;
 
 use gpui_kit::component::TitleBar;
-use gpui_kit::{App, AppContext, Bounds, KeyBinding, QuitMode, Window, WindowBounds, WindowOptions, px, size};
+use gpui_kit::{App, AppContext, Bounds, QuitMode, Window, WindowBounds, WindowOptions, px, size};
 
 gpui_kit::actions!(app, [Quit]);
 
@@ -32,9 +32,12 @@ fn main() {
 
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
         gpui_kit::init(cx);
-        init_actions(cx);
+        if let Err(error) = init_actions(cx).and_then(|()| map_view::init(cx)) {
+            log::error!("Failed to initialize keyboard shortcuts: {error:#}");
+            cx.quit();
+            return;
+        }
         appearance::init(cx);
-        map_view::init(cx);
 
         if let Err(error) = create_main_window(cx) {
             log::error!("Failed to open window: {error:#}");
@@ -47,9 +50,10 @@ fn main() {
     });
 }
 
-fn init_actions(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
+fn init_actions(cx: &mut App) -> anyhow::Result<()> {
+    cx.bind_keys([shortcuts::key_binding("secondary-q", Quit, None, cx)?]);
     cx.on_action(|_: &Quit, cx| cx.quit());
+    Ok(())
 }
 
 fn create_main_window(cx: &mut App) -> anyhow::Result<()> {

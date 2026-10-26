@@ -10,7 +10,7 @@ use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme, Icon, IndexPath, Sizable};
 use gpui_kit::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, PathPromptOptions,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, Window, div, rgba,
+    Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, Window, div, rgba,
 };
 use inf::colormap::ColorMapPreset;
 
@@ -236,7 +236,7 @@ impl RasterPanel {
         });
     }
 
-    fn scroll_bands(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn scroll_bands(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         let items = self.choices();
         let Some(ix) = items.iter().position(|item| Some(item.id) == self.selected) else {
             return;
@@ -460,7 +460,7 @@ impl RasterPanel {
             .id("raster-band-scroll")
             .w_64()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_scroll_wheel(cx.listener(Self::scroll_bands))
+            .on_scroll(cx.listener(Self::scroll_bands))
             .on_hover(cx.listener(|this, hovered, _, _| {
                 if !hovered {
                     this.band_scroll = 0.0;
