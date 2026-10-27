@@ -1,11 +1,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
+
 use gpui_kit::component::input::{InputEvent, InputState, NumberInput};
+use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme, Icon, IndexPath, Sizable};
@@ -13,14 +17,42 @@ use gpui_kit::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, PathPromptOptions,
     Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, Window, div, rgba,
 };
-use inf::colormap::ColorMapPreset;
+use inf::colormap::{ColorMapDirection, ColorMapPreset, ProcessedColorMap};
 
 use crate::raster_source::RasterSource;
-use crate::vector_source::VectorSource;
+use crate::vector_source::{VectorLoadProgress, VectorSource};
 
 gpui_kit::actions!(raster, [OpenDataset, FitRaster, ClearRasters, ToggleRasterControls]);
 
 const PALETTES: [&str; 5] = ["Terrain", "Blues", "Gray", "Turbo", "Spectral"];
+const LOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(60);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LoadProgress {
+    Opening,
+    Converting(f64),
+    Preparing,
+    Rendering(u64),
+}
+
+impl LoadProgress {
+    fn status(self) -> SharedString {
+        match self {
+            Self::Opening => "Opening datasets".into(),
+            Self::Converting(fraction) => format!("Converting vectors · {:.0}%", fraction * 100.0).into(),
+            Self::Preparing => "Preparing vector data".into(),
+            Self::Rendering(_) => "Rendering vectors".into(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct LoadedDatasets {
+    sources: Vec<Arc<RasterSource>>,
+    vectors: Vec<Arc<VectorSource>>,
+    errors: Vec<String>,
+    selected: Option<SelectionId>,
+}
 
 pub struct RasterEvent {
     source: Option<Arc<RasterSource>>,
@@ -74,14 +106,18 @@ pub struct RasterPanel {
     palette_scroll: f32,
     bands: Entity<SelectState<Vec<BandChoice>>>,
     palette: Entity<SelectState<Vec<&'static str>>>,
+    property: Entity<SelectState<SearchableVec<SharedString>>>,
     opacity: Entity<SliderState>,
     range_slider: Entity<SliderState>,
-    range_domain: (f32, f32),
+    range_domain: (f64, f64),
     min: Entity<InputState>,
     max: Entity<InputState>,
     error: Option<SharedString>,
     load_error: Option<SharedString>,
     loading: bool,
+    load_progress: Option<LoadProgress>,
+    load_generation: u64,
+    load_started: Option<Instant>,
     collapsed: bool,
     focus: FocusHandle,
     load_task: Option<Task<()>>,
@@ -95,20 +131,13 @@ impl RasterPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let bands = cx.new(|cx| SelectState::new(Vec::<BandChoice>::new(), None, window, cx));
         let palette = cx.new(|cx| SelectState::new(PALETTES.to_vec(), Some(IndexPath::default()), window, cx));
+        let property = cx.new(|cx| SelectState::new(SearchableVec::new(Vec::<SharedString>::new()), None, window, cx).searchable(true));
         let opacity = cx.new(|_| SliderState::new().min(0.0).max(100.0).step(1.0).default_value(100.0));
         // A normalized domain keeps slider stepping useful for tiny or very
         // large data ranges without replacing retained component state.
         let range_slider = cx.new(|_| SliderState::new().min(0.0).max(1000.0).step(1.0).default_value(0.0..1000.0));
-        let min = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Minimum")
-                .validate(|value, _| value.split_once('.').is_none_or(|(_, fraction)| fraction.len() <= 2))
-        });
-        let max = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Maximum")
-                .validate(|value, _| value.split_once('.').is_none_or(|(_, fraction)| fraction.len() <= 2))
-        });
+        let min = cx.new(|cx| InputState::new(window, cx).placeholder("Minimum"));
+        let max = cx.new(|cx| InputState::new(window, cx).placeholder("Maximum"));
         let subscriptions = vec![
             cx.subscribe_in(&bands, window, |this, _, event, window, cx| {
                 let SelectEvent::Confirm(id) = event;
@@ -116,6 +145,10 @@ impl RasterPanel {
             }),
             cx.subscribe_in(&palette, window, |this, _, _: &SelectEvent<Vec<&'static str>>, window, cx| {
                 this.apply_style(window, cx)
+            }),
+            cx.subscribe_in(&property, window, |this, _, event, window, cx| {
+                let SelectEvent::Confirm(property) = event;
+                this.select_property(property.as_deref(), window, cx);
             }),
             cx.subscribe_in(&opacity, window, |this, _, event: &SliderEvent, _, cx| {
                 if let SliderEvent::Change(_) = event {
@@ -125,10 +158,9 @@ impl RasterPanel {
             cx.subscribe_in(&range_slider, window, |this, _, event: &SliderEvent, window, cx| {
                 if let SliderEvent::Change(value) = event {
                     let (min, max) = this.range_domain;
-                    let start = min + (max - min) * value.start() / 1000.0;
-                    let end = min + (max - min) * value.end() / 1000.0;
-                    this.min.update(cx, |input, cx| input.set_value(format!("{start:.2}"), window, cx));
-                    this.max.update(cx, |input, cx| input.set_value(format!("{end:.2}"), window, cx));
+                    let start = range_value((min, max), f64::from(value.start()) / 1000.0);
+                    let end = range_value((min, max), f64::from(value.end()) / 1000.0);
+                    this.set_range_inputs((start, end), window, cx);
                     this.apply_style(window, cx);
                 }
             }),
@@ -143,6 +175,7 @@ impl RasterPanel {
             palette_scroll: 0.0,
             bands,
             palette,
+            property,
             opacity,
             range_slider,
             range_domain: (0.0, 1.0),
@@ -151,6 +184,9 @@ impl RasterPanel {
             error: None,
             load_error: None,
             loading: false,
+            load_progress: None,
+            load_generation: 0,
+            load_started: None,
             collapsed: false,
             focus: cx.focus_handle(),
             load_task: None,
@@ -187,6 +223,33 @@ impl RasterPanel {
         self.loading
     }
 
+    /// Start of the most recently accepted load, for drop-to-frame diagnostics.
+    pub fn load_started(&self) -> Option<Instant> {
+        self.load_started
+    }
+
+    pub fn load_status(&self) -> Option<SharedString> {
+        self.load_progress.map(LoadProgress::status)
+    }
+
+    pub fn render_load_progress(&self) -> Option<Progress> {
+        self.load_progress.map(|progress| {
+            let fraction = match progress {
+                LoadProgress::Converting(fraction) => Some(fraction),
+                _ => None,
+            };
+            Progress::new("vector-load-progress")
+                .xsmall()
+                .value((fraction.unwrap_or(0.0) * 100.0) as f32)
+                .loading(fraction.is_none())
+                .accessibility_label(progress.status())
+                .absolute()
+                .top_0()
+                .left_0()
+                .w_full()
+        })
+    }
+
     pub fn load_error(&self) -> Option<SharedString> {
         self.load_error.clone()
     }
@@ -208,25 +271,17 @@ impl RasterPanel {
     }
 
     fn select(&mut self, id: Option<SelectionId>, fit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(LoadProgress::Rendering(source)) = self.load_progress
+            && id != Some(SelectionId::Vector(source))
+        {
+            self.load_progress = None;
+        }
         self.selected = id;
         self.palette_scroll = 0.0;
         self.error = None;
         self.load_error = None;
         self.collapsed = false;
-        if let Some(source) = self.active() {
-            let range = source.range();
-            let palette = match source.palette() {
-                ColorMapPreset::Gray => "Gray",
-                ColorMapPreset::Blues => "Blues",
-                ColorMapPreset::Turbo => "Turbo",
-                ColorMapPreset::Spectral => "Spectral",
-                _ => "Terrain",
-            };
-            self.min.update(cx, |input, cx| input.set_value(format!("{:.2}", range.0), window, cx));
-            self.max.update(cx, |input, cx| input.set_value(format!("{:.2}", range.1), window, cx));
-            self.palette.update(cx, |state, cx| state.set_selected_value(&palette, window, cx));
-        }
-        self.sync_range_slider(window, cx);
+        self.sync_color_controls(window, cx);
         self.watch_tile_errors(cx);
         self.emit(fit, cx);
     }
@@ -264,7 +319,7 @@ impl RasterPanel {
     }
 
     fn scroll_palette(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active().is_none() {
+        if self.color_range().is_none() {
             return;
         }
         let Some(ix) = PALETTES.iter().position(|palette| Some(palette) == self.palette.read(cx).selected_value()) else {
@@ -288,10 +343,17 @@ impl RasterPanel {
             prompt: Some("Open dataset".into()),
         });
         self.loading = true;
+        self.load_progress = None;
+        self.load_generation += 1;
+        let generation = self.load_generation;
         cx.notify();
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let result = paths.await;
             let _ = this.update_in(cx, |this, _, cx| {
+                if this.load_generation != generation {
+                    return;
+                }
+                this.load_task = None;
                 this.loading = false;
                 match result {
                     Ok(Ok(Some(paths))) => this.open_paths(paths, cx),
@@ -309,54 +371,102 @@ impl RasterPanel {
         if self.loading || paths.is_empty() {
             return;
         }
+        let enqueued = Instant::now();
+        log::info!(target: "map::vector_load", "stage=open-request paths={paths:?}");
+        let (progress_tx, progress_rx) = async_channel::bounded(1);
+        let work = cx.background_spawn(async move {
+            log::info!(target: "map::vector_load", "stage=loader-worker-start queue_delay={:?}", enqueued.elapsed());
+            load_paths(paths, progress_tx)
+        });
+        self.start_load(work, progress_rx, cx);
+    }
+
+    fn start_load(&mut self, work: Task<LoadedDatasets>, progress: async_channel::Receiver<LoadProgress>, cx: &mut Context<Self>) {
+        let started = Instant::now();
+        self.load_started = Some(started);
         self.loading = true;
+        self.load_progress = Some(LoadProgress::Opening);
+        self.load_generation += 1;
+        let generation = self.load_generation;
         self.error = None;
         self.load_error = None;
         cx.notify();
-        let work = cx.background_spawn(async move {
-            let mut sources = Vec::new();
-            let mut vectors = Vec::new();
-            let mut errors = Vec::new();
-            let mut selected = None;
-            for path in paths {
-                match VectorSource::open(&path) {
-                    Ok(Some(opened)) => {
-                        selected = opened.first().map(|source| SelectionId::Vector(source.id()));
-                        vectors.extend(opened);
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        errors.push(format!("{}: {error:#}", path.display()));
-                        continue;
-                    }
-                }
-                match RasterSource::open(&path) {
-                    Ok(opened) => {
-                        selected = opened.first().map(|source| SelectionId::Raster(source.metadata().id));
-                        sources.extend(opened);
-                    }
-                    Err(error) => errors.push(format!("{}: {error:#}", path.display())),
-                }
-            }
-            (sources, vectors, errors, selected)
-        });
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let (sources, vectors, errors, selected) = work.await;
+            // One retained task owns both completion and progress. Finishing or
+            // clearing the load drops the updater, its timer, and its receiver.
+            let updates = async {
+                while let Ok(progress) = progress.recv().await {
+                    if this.update(cx, |this, cx| this.update_load_progress(generation, progress, cx)).is_err() {
+                        break;
+                    }
+                    cx.background_executor().timer(LOAD_PROGRESS_INTERVAL).await;
+                }
+                futures_lite::future::pending::<LoadedDatasets>().await
+            };
+            let loaded = futures_lite::future::or(work, updates).await;
+            log::info!(target: "map::vector_load", "load={generation} stage=loader-finished since_request={:?} vectors={} rasters={} errors={}", started.elapsed(), loaded.vectors.len(), loaded.sources.len(), loaded.errors.len());
             let _ = this.update_in(cx, |this, window, cx| {
+                if this.load_generation != generation || !this.loading {
+                    return;
+                }
+                this.load_task = None;
                 this.loading = false;
-                this.sources.extend(sources);
-                this.vectors.extend(vectors);
+                this.load_progress = None;
+                let installed = Instant::now();
+                this.sources.extend(loaded.sources);
+                this.vectors.extend(loaded.vectors);
                 let items = this.choices();
                 this.bands.update(cx, |state, cx| state.set_items(items, window, cx));
-                if let Some(id) = selected {
+                if let Some(id) = loaded.selected {
                     this.bands.update(cx, |state, cx| state.set_selected_value(&id, window, cx));
                     this.select(Some(id), true, window, cx);
                 }
-                this.load_error = (!errors.is_empty()).then(|| errors.join("\n").into());
+                this.load_progress = match loaded.selected {
+                    Some(SelectionId::Vector(source)) => Some(LoadProgress::Rendering(source)),
+                    _ => None,
+                };
+                this.load_error = (!loaded.errors.is_empty()).then(|| loaded.errors.join("\n").into());
+                log::info!(target: "map::vector_load", "load={generation} stage=ui-install-loaded-layers elapsed={:?} since_request={:?} awaiting_vector_frame={}", installed.elapsed(), started.elapsed(), this.load_progress.is_some());
                 cx.notify();
             });
         }));
+    }
+
+    fn update_load_progress(&mut self, generation: u64, progress: LoadProgress, cx: &mut Context<Self>) {
+        if self.load_generation != generation || !self.loading {
+            return;
+        }
+        let progress = match progress {
+            LoadProgress::Converting(fraction) if fraction.is_finite() => {
+                let previous = match self.load_progress {
+                    Some(LoadProgress::Converting(previous)) => previous,
+                    _ => 0.0,
+                };
+                LoadProgress::Converting(fraction.clamp(0.0, 1.0).max(previous))
+            }
+            LoadProgress::Converting(_) | LoadProgress::Rendering(_) => return,
+            progress => progress,
+        };
+        if self.load_progress != Some(progress) {
+            let milestone = |progress| match progress {
+                Some(LoadProgress::Converting(fraction)) => Some((fraction * 4.0) as u8),
+                _ => None,
+            };
+            if milestone(self.load_progress) != milestone(Some(progress)) || !matches!(progress, LoadProgress::Converting(_)) {
+                log::info!(target: "map::vector_load", "load={generation} stage=ui-progress progress={progress:?} since_request={:?}", self.load_started.map(|started| started.elapsed()));
+            }
+            self.load_progress = Some(progress);
+            cx.notify();
+        }
+    }
+
+    /// Finish only the displayed load; late frames cannot clear a newer load.
+    pub fn complete_vector_render(&mut self, source: u64, cx: &mut Context<Self>) {
+        if self.load_progress == Some(LoadProgress::Rendering(source)) {
+            log::info!(target: "map::vector_load", "source={source} stage=ui-vector-render-finished since_request={:?}", self.load_started.map(|started| started.elapsed()));
+            self.load_progress = None;
+            cx.notify();
+        }
     }
 
     pub fn fit(&self, cx: &mut Context<Self>) {
@@ -377,24 +487,116 @@ impl RasterPanel {
         }
     }
 
-    fn sync_range_slider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(source) = self.active() else { return };
-        let (Ok(min), Ok(max)) = (self.min.read(cx).value().parse::<f32>(), self.max.read(cx).value().parse::<f32>()) else {
+    fn color_range(&self) -> Option<(f64, f64)> {
+        self.active()
+            .map(|source| {
+                let (min, max) = source.range();
+                (f64::from(min), f64::from(max))
+            })
+            .or_else(|| self.active_vector().and_then(|source| source.range()))
+    }
+
+    fn data_range(&self) -> Option<(f64, f64)> {
+        self.active()
+            .map(|source| {
+                let (min, max) = source.data_range();
+                (f64::from(min), f64::from(max))
+            })
+            .or_else(|| self.active_vector().and_then(|source| source.data_range()))
+    }
+
+    fn color_palette(&self) -> Option<ColorMapPreset> {
+        self.active()
+            .map(|source| source.palette())
+            .or_else(|| self.active_vector().filter(|source| source.property().is_some()).map(|source| source.palette()))
+    }
+
+    fn set_range_inputs(&self, range: (f64, f64), window: &mut Window, cx: &mut Context<Self>) {
+        let format = |value: f64| if self.active().is_some() { format!("{value:.2}") } else { value.to_string() };
+        self.min.update(cx, |input, cx| input.set_value(format(range.0), window, cx));
+        self.max.update(cx, |input, cx| input.set_value(format(range.1), window, cx));
+    }
+
+    fn sync_color_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raster = self.active().is_some();
+        for input in [&self.min, &self.max] {
+            input.update(cx, |input, cx| {
+                input.set_validator(
+                    move |value, _| !raster || value.split_once('.').is_none_or(|(_, fraction)| fraction.len() <= 2),
+                    cx,
+                );
+            });
+        }
+        let items: Vec<SharedString> = self
+            .active_vector()
+            .into_iter()
+            .flat_map(|source| source.numeric_properties())
+            .map(|property| property.name().to_owned().into())
+            .collect();
+        let selected = self
+            .active_vector()
+            .and_then(|source| source.property())
+            .map(|name| SharedString::from(name.to_owned()));
+        self.property.update(cx, |state, cx| {
+            state.set_items(SearchableVec::new(items), window, cx);
+            if let Some(selected) = selected {
+                state.set_selected_value(&selected, window, cx);
+            } else {
+                state.set_selected_index(None, window, cx);
+            }
+        });
+        if let Some(range) = self.color_range() {
+            self.set_range_inputs(range, window, cx);
+        }
+        if let Some(preset) = self.color_palette() {
+            let palette = match preset {
+                ColorMapPreset::Gray => "Gray",
+                ColorMapPreset::Blues => "Blues",
+                ColorMapPreset::Turbo => "Turbo",
+                ColorMapPreset::Spectral => "Spectral",
+                _ => "Terrain",
+            };
+            self.palette.update(cx, |state, cx| state.set_selected_value(&palette, window, cx));
+        }
+        self.sync_range_slider(window, cx);
+    }
+
+    fn select_property(&mut self, property: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(source) = self.active_vector() else { return };
+        let Some(property) = property else {
+            self.sync_color_controls(window, cx);
             return;
         };
-        if !min.is_finite() || !max.is_finite() || min >= max {
+        if source.property() == Some(property) {
             return;
         }
-        let (data_min, data_max) = source.data_range();
+        match source.with_property(property) {
+            Ok(source) => {
+                self.replace_vector(source);
+                self.error = None;
+                self.sync_color_controls(window, cx);
+                self.emit(false, cx);
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not select property: {error}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn replace_vector(&mut self, source: Arc<VectorSource>) {
+        if let Some(current) = self.vectors.iter_mut().find(|current| current.id() == source.id()) {
+            *current = source;
+        }
+    }
+
+    fn sync_range_slider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((data_min, data_max)) = self.data_range() else { return };
+        let Some((min, max)) = self.color_range() else { return };
         self.range_domain = (data_min.min(min), data_max.max(max));
-        let (start, end) = self.range_domain;
-        let span = end - start;
-        if !span.is_finite() || span <= 0.0 {
-            return;
-        }
-        self.range_slider.update(cx, |slider, cx| {
-            slider.set_value((min - start) / span * 1000.0..(max - start) / span * 1000.0, window, cx)
-        });
+        let start = range_position(self.range_domain, min) as f32 * 1000.0;
+        let end = range_position(self.range_domain, max) as f32 * 1000.0;
+        self.range_slider.update(cx, |slider, cx| slider.set_value(start..end, window, cx));
     }
 
     fn set_unscaling(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -427,17 +629,17 @@ impl RasterPanel {
     }
 
     fn reset_range(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(source) = self.active() else { return };
-        let (min, max) = source.data_range();
-        self.min.update(cx, |input, cx| input.set_value(format!("{min:.2}"), window, cx));
-        self.max.update(cx, |input, cx| input.set_value(format!("{max:.2}"), window, cx));
+        let Some(range) = self.data_range() else { return };
+        self.set_range_inputs(range, window, cx);
         self.apply_style(window, cx);
     }
 
     pub fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_generation += 1;
         self.load_task = None;
         self.tile_errors_task = None;
         self.loading = false;
+        self.load_progress = None;
         self.sources.clear();
         self.vectors.clear();
         self.band_scroll = 0.0;
@@ -449,14 +651,15 @@ impl RasterPanel {
             state.set_items(Vec::new(), window, cx);
             state.set_selected_index(None, window, cx);
         });
+        self.sync_color_controls(window, cx);
         self.emit(false, cx);
     }
 
     fn apply_style(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(source) = self.active() else { return };
-        let result = (|| -> anyhow::Result<Arc<RasterSource>> {
-            let min = self.min.read(cx).value().trim().parse::<f32>()?;
-            let max = self.max.read(cx).value().trim().parse::<f32>()?;
+        if self.color_range().is_none() {
+            return;
+        }
+        let result = (|| -> anyhow::Result<()> {
             let palette = match self.palette.read(cx).selected_value().copied() {
                 Some("Gray") => ColorMapPreset::Gray,
                 Some("Blues") => ColorMapPreset::Blues,
@@ -464,23 +667,30 @@ impl RasterPanel {
                 Some("Spectral") => ColorMapPreset::Spectral,
                 _ => ColorMapPreset::Terrain,
             };
-            // Synchronization and repeated commits must not invalidate tiles
-            // when the applied values are already current.
-            if source.palette() == palette && source.range() == (min, max) {
-                Ok(source.clone())
-            } else {
-                source.restyled(palette, (min, max))
+            if let Some(source) = self.active() {
+                let min = self.min.read(cx).value().trim().parse::<f32>()?;
+                let max = self.max.read(cx).value().trim().parse::<f32>()?;
+                // Repeated commits must not invalidate raster tiles.
+                if source.palette() != palette || source.range() != (min, max) {
+                    let source = source.restyled(palette, (min, max))?;
+                    if let Some(current) = self
+                        .sources
+                        .iter_mut()
+                        .find(|current| Some(SelectionId::Raster(current.metadata().id)) == self.selected)
+                    {
+                        *current = source;
+                    }
+                }
+            } else if let Some(source) = self.active_vector() {
+                let min = self.min.read(cx).value().trim().parse::<f64>()?;
+                let max = self.max.read(cx).value().trim().parse::<f64>()?;
+                let source = source.restyled(palette, (min, max))?;
+                self.replace_vector(source);
             }
+            Ok(())
         })();
         match result {
-            Ok(source) => {
-                if let Some(current) = self
-                    .sources
-                    .iter_mut()
-                    .find(|current| Some(SelectionId::Raster(current.metadata().id)) == self.selected)
-                {
-                    *current = source;
-                }
+            Ok(()) => {
                 self.error = None;
                 self.watch_tile_errors(cx);
                 self.sync_range_slider(window, cx);
@@ -569,7 +779,19 @@ impl Render for RasterPanel {
                 ),
         );
         if !self.collapsed {
-            if self.active().is_some() {
+            if self.active_vector().is_some_and(|source| source.property().is_some()) {
+                layers = layers.child(
+                    div().flex().flex_col().gap_1().child(field_label("Color by", cx)).child(
+                        Select::new(&self.property)
+                            .id("vector-property")
+                            .accessibility_label("Color by")
+                            .placeholder("Select a numeric property")
+                            .search_placeholder("Search properties…")
+                            .w_full(),
+                    ),
+                );
+            }
+            if self.color_range().is_some() {
                 layers = layers
                     .child(
                         div().flex().flex_col().gap_1().child(field_label("Color map", cx)).child(
@@ -602,7 +824,7 @@ impl Render for RasterPanel {
         }
 
         let mut panel = div().flex().flex_col().gap_3().w_full().h_auto().min_h_0().child(layers);
-        if !self.collapsed && self.active().is_some() {
+        if !self.collapsed && self.color_range().is_some() {
             panel = panel.child(self.render_value_range(cx));
         }
         div()
@@ -622,11 +844,15 @@ impl Render for RasterPanel {
 impl RasterPanel {
     fn render_legend(&self, cx: &App) -> impl IntoElement {
         let mut legend = div().id("raster-legend").test_support().flex().flex_col().gap_1();
-        if let Some(source) = self.active() {
-            let (min, max) = source.range();
+        if let Some(((min, max), palette)) = self.color_range().zip(self.color_palette()) {
+            let colors = ProcessedColorMap::<256>::create_for_preset(palette, ColorMapDirection::Regular);
             let swatches = (0..256).map(|ix| {
-                let color = source.legend().color_for_value(min + (max - min) * ix as f32 / 255.0, None);
-                // These colors encode raster data, not application chrome.
+                let color = if let Some(source) = self.active() {
+                    source.legend().color_for_value(range_value((min, max), ix as f64 / 255.0) as f32, None)
+                } else {
+                    colors.get_color_by_value(ix as u8)
+                };
+                // These colors encode data, not application chrome.
                 div().flex_1().h_3().bg(rgba(u32::from_be_bytes([color.r, color.g, color.b, color.a])))
             });
             legend = legend
@@ -636,7 +862,7 @@ impl RasterPanel {
                         .justify_between()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .children((0..5).map(|ix| format_value(min + (max - min) * ix as f32 / 4.0))),
+                        .children((0..5).map(|ix| format_value(range_value((min, max), ix as f64 / 4.0)))),
                 )
                 .child(
                     div()
@@ -674,24 +900,20 @@ impl RasterPanel {
                     .items_start()
                     .gap_3()
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_1()
-                            .child(field_label("Minimum", cx))
-                            .child(div().id("raster-min").test_support().child(NumberInput::new(&self.min).small())),
+                        div().flex().flex_col().flex_1().min_w_0().gap_1().child(field_label("Minimum", cx)).child(
+                            div()
+                                .id("raster-min")
+                                .test_support()
+                                .child(NumberInput::new(&self.min).small().accessibility_label("Minimum")),
+                        ),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_1()
-                            .child(field_label("Maximum", cx))
-                            .child(div().id("raster-max").test_support().child(NumberInput::new(&self.max).small())),
+                        div().flex().flex_col().flex_1().min_w_0().gap_1().child(field_label("Maximum", cx)).child(
+                            div()
+                                .id("raster-max")
+                                .test_support()
+                                .child(NumberInput::new(&self.max).small().accessibility_label("Maximum")),
+                        ),
                     ),
             )
             .children(self.active().filter(|source| source.has_scale_metadata()).map(|source| {
@@ -703,6 +925,50 @@ impl RasterPanel {
                     .on_change(cx.listener(|this, enabled, window, cx| this.set_unscaling(*enabled, window, cx)))
             }))
     }
+}
+
+fn load_paths(paths: Vec<PathBuf>, progress: async_channel::Sender<LoadProgress>) -> LoadedDatasets {
+    let mut loaded = LoadedDatasets::default();
+    let path_count = paths.len() as f64;
+
+    for (index, path) in paths.into_iter().enumerate() {
+        let opened = Instant::now();
+        let _ = progress.force_send(LoadProgress::Opening);
+        let mut progress_bucket = None;
+        let mut report = |event| {
+            let event = match event {
+                VectorLoadProgress::Converting(fraction) if fraction.is_finite() => {
+                    let bucket = (fraction.clamp(0.0, 1.0) * 4.0) as u8;
+                    if progress_bucket != Some(bucket) {
+                        progress_bucket = Some(bucket);
+                        log::info!(target: "map::vector_load", "path={path:?} stage=gdal-progress fraction={fraction:.3} since_path_open={:?}", opened.elapsed());
+                    }
+                    LoadProgress::Converting((index as f64 + fraction.clamp(0.0, 1.0)) / path_count)
+                }
+                VectorLoadProgress::Converting(_) => return,
+                VectorLoadProgress::Preparing => LoadProgress::Preparing,
+            };
+            // Replace pending samples instead of blocking GDAL or queuing one
+            // UI event per feature. Percentages describe conversion only.
+            let _ = progress.force_send(event);
+        };
+        match VectorSource::open_with_load_progress(&path, &mut report) {
+            Ok(Some(opened)) => {
+                loaded.selected = opened.first().map(|source| SelectionId::Vector(source.id()));
+                loaded.vectors.extend(opened);
+            }
+            Ok(None) => match RasterSource::open(&path) {
+                Ok(opened) => {
+                    loaded.selected = opened.first().map(|source| SelectionId::Raster(source.metadata().id));
+                    loaded.sources.extend(opened);
+                }
+                Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
+            },
+            Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
+        }
+        log::info!(target: "map::vector_load", "path={path:?} stage=path-loaded elapsed={:?}", opened.elapsed());
+    }
+    loaded
 }
 
 fn scroll_index(event: &ScrollEvent, scroll: &mut f32, ix: usize, count: usize, cx: &mut App) -> usize {
@@ -753,13 +1019,40 @@ fn field_label(label: &'static str, cx: &App) -> impl IntoElement {
         .child(label)
 }
 
-fn format_value(value: f32) -> String {
+// Keep interpolation finite even for ranges spanning both f64 extremes.
+fn range_value((min, max): (f64, f64), position: f64) -> f64 {
+    if position <= 0.0 {
+        return min;
+    }
+    if position >= 1.0 {
+        return max;
+    }
+    if (max - min).is_finite() {
+        min + (max - min) * position
+    } else {
+        min * (1.0 - position) + max * position
+    }
+}
+
+fn range_position((min, max): (f64, f64), value: f64) -> f64 {
+    if (max - min).is_finite() {
+        (value - min) / (max - min)
+    } else {
+        (value / 2.0 - min / 2.0) / (max / 2.0 - min / 2.0)
+    }
+}
+
+fn format_value(value: f64) -> String {
     if value != 0.0 && (value.abs() < 0.001 || value.abs() >= 100_000.0) {
         format!("{value:.2e}")
     } else {
         format!("{value:.3}").trim_end_matches('0').trim_end_matches('.').to_owned()
     }
 }
+
+#[cfg(test)]
+#[path = "raster_panel_progress_tests.rs"]
+pub(crate) mod progress_tests;
 
 #[cfg(test)]
 mod tests {
@@ -775,6 +1068,214 @@ mod tests {
             let selector = self.0.update(cx, |panel, cx| panel.render_layer_selector(window, cx));
             div().flex().flex_col().size_full().child(selector).child(self.0.clone())
         }
+    }
+
+    #[test]
+    fn normalized_ranges_preserve_endpoints_and_remain_finite() {
+        for range in [(1e-12, 9e-12), (-f64::MAX, f64::MAX), (0.0, f64::from_bits(1)), (1.0, 1.0 + f64::EPSILON)] {
+            assert_eq!(range_value(range, 0.0), range.0);
+            assert_eq!(range_value(range, 1.0), range.1);
+            assert_eq!(range_position(range, range.0), 0.0);
+            assert_eq!(range_position(range, range.1), 1.0);
+            assert!(range_value(range, 0.5).is_finite());
+        }
+    }
+
+    #[gpui_kit::test]
+    fn numeric_vectors_support_search_palette_ranges_and_per_layer_selection_through_the_ui(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let raster = directory.path().join("raster.tif");
+        crate::raster_source::test_support::write_raster(&raster, 4326, 1).unwrap();
+        let plain = directory.path().join("plain.geojson");
+        std::fs::write(&plain, r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"label":"00123","active":true},"geometry":{"type":"Point","coordinates":[4,51]}}]}"#).unwrap();
+        let mut paths = vec![raster, plain];
+        for name in ["first", "second"] {
+            let path = directory.path().join(format!("{name}.geojson"));
+            std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
+                "type": "FeatureCollection", "features": [
+                    {"type":"Feature", "properties":{"a_count":1,"b_fraction":0.125,"constant":7,"tiny":1e-12,"label":"42","active":true,"empty":null},"geometry":{"type":"Point","coordinates":[4,51]}},
+                    {"type":"Feature", "properties":{"a_count":9,"b_fraction":0.875,"constant":7,"tiny":9e-12},"geometry":{"type":"Point","coordinates":[5,52]}}
+                ]
+            })).unwrap()).unwrap();
+            paths.push(path);
+        }
+        let mut panel = None;
+        let handle = cx.open_window(size(px(900.0), px(900.0)), |window, cx| {
+            let view = cx.new(|cx| RasterPanel::new(window, cx));
+            panel = Some(view.clone());
+            let harness = cx.new(|_| PanelHarness(view));
+            gpui_kit::base::Root::new(harness, window, cx)
+        });
+        let panel = panel.unwrap();
+        let events = cx.update(|cx| {
+            cx.new(|cx: &mut Context<Vec<RasterEvent>>| {
+                cx.subscribe(&panel, |events, _, event, _| {
+                    events.push(RasterEvent {
+                        source: event.source(),
+                        vector_source: event.vector_source(),
+                        opacity: event.opacity(),
+                        fit: event.should_fit(),
+                    });
+                })
+                .detach();
+                Vec::new()
+            })
+        });
+        cx.update_window(handle.into(), |_, _, cx| panel.update(cx, |panel, cx| panel.open_paths(paths, cx)))
+            .unwrap();
+        cx.run_until_parked();
+        let original = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let source = panel.read(cx).active_vector().unwrap().clone();
+                assert_eq!(source.property(), Some("a_count"));
+                assert_eq!(
+                    source.numeric_properties().iter().map(|property| property.name()).collect::<Vec<_>>(),
+                    ["a_count", "b_fraction", "constant", "tiny"]
+                );
+                assert_eq!(window.find("vector-property").label(), Some("Color by"));
+                assert_eq!(window.find("vector-property").role(), Some(gpui_kit::Role::ComboBox));
+                assert_eq!(window.find("vector-property").value(), Some("a_count"));
+                assert!(window.find("raster-palette").visible());
+                assert!(window.find("raster-legend").visible());
+                assert!(window.find("raster-range-slider").visible());
+                assert!(window.try_find("raster-unscaling").is_none());
+                assert!(window.find("raster-palette").bounds().top() >= window.find("vector-property").bounds().bottom());
+                window.click("vector-property", cx);
+                window.press("escape", cx);
+                source
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("vector-property").expanded(), Some(false));
+            assert_eq!(window.find("vector-property").focused(), Some(true));
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("vector-property").expanded(), Some(true));
+            window.input("fraction", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(std::time::Duration::from_millis(150));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let source = panel.read(cx).active_vector().unwrap();
+            assert_eq!(source.id(), original.id());
+            assert_ne!(source.style_id(), original.style_id());
+            assert_eq!(source.property(), Some("b_fraction"));
+            assert_eq!(source.range(), Some((0.125, 0.875)));
+            assert_eq!(
+                panel.read(cx).property.read(cx).selected_value().map(|value| value.as_str()),
+                Some("b_fraction")
+            );
+            window.scroll("raster-palette", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+            window.click("raster-min", cx);
+            window.press("secondary-a", cx);
+            window.input("0.200001", cx);
+            window.click("raster-max", cx);
+            window.press("secondary-a", cx);
+            window.input("0.800001", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let styled = cx
+            .update_window(handle.into(), |_, window, cx| {
+                let source = panel.read(cx).active_vector().unwrap().clone();
+                assert_eq!(source.palette(), ColorMapPreset::Blues);
+                assert_eq!(source.range(), Some((0.200001, 0.800001)));
+                assert_eq!(source.source_json(), original.source_json());
+                assert_eq!(panel.read(cx).range_domain, (0.125, 0.875));
+                // Cross another numeric layer, a nonnumeric vector, and a raster.
+                window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+                assert_eq!(panel.read(cx).active_vector().unwrap().property(), Some("a_count"));
+                assert_eq!(panel.read(cx).active_vector().unwrap().palette(), ColorMapPreset::Terrain);
+                window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+                assert!(window.try_find("vector-property").is_none());
+                assert!(window.try_find("raster-palette").is_none());
+                assert!(window.try_find("raster-range-slider").is_none());
+                assert!(window.find("raster-opacity").visible());
+                window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+                assert!(panel.read(cx).active().is_some());
+                assert!(window.try_find("vector-property").is_none());
+                assert!(window.find("raster-palette").visible());
+                for _ in 0..3 {
+                    window.scroll("raster-band", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+                }
+                assert_eq!(panel.read(cx).active_vector().unwrap().style_id(), source.style_id());
+                assert_eq!(
+                    panel.read(cx).property.read(cx).selected_value().map(|value| value.as_str()),
+                    Some("b_fraction")
+                );
+                assert_eq!(panel.read(cx).min.read(cx).value().as_str(), "0.200001");
+                window.click("raster-min", cx);
+                window.press("secondary-a", cx);
+                window.input("2", cx);
+                source
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(panel.read(cx).error.is_some());
+            assert_eq!(panel.read(cx).active_vector().unwrap().style_id(), styled.style_id());
+            window.click("reset-raster-range", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(panel.read(cx).error.is_none());
+            assert_eq!(panel.read(cx).active_vector().unwrap().range(), Some((0.125, 0.875)));
+            window.click("toggle-raster-controls", cx);
+            assert!(window.try_find("vector-property").is_none());
+            window.click("toggle-raster-controls", cx);
+            window.click("vector-property", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.input("tiny", cx)).unwrap();
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(std::time::Duration::from_millis(150));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(panel.read(cx).active_vector().unwrap().property(), Some("tiny"));
+            let range = panel.read(cx).active_vector().unwrap().range().unwrap();
+            assert_eq!(Some(range), panel.read(cx).active_vector().unwrap().data_range());
+            assert!((range.0 - 1e-12).abs() < 1e-26 && (range.1 - 9e-12).abs() < 1e-26);
+            assert_eq!(panel.read(cx).min.read(cx).value().as_str().parse::<f64>().unwrap(), range.0);
+            assert_eq!(panel.read(cx).max.read(cx).value().as_str().parse::<f64>().unwrap(), range.1);
+            assert!(events.read(cx).iter().skip(1).all(|event| !event.should_fit()));
+            panel.update(cx, |panel, cx| panel.clear(window, cx));
+            window.render_frame(cx);
+            assert!(window.try_find("vector-property").is_none());
+            assert!(panel.read(cx).property.read(cx).selected_value().is_none());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
