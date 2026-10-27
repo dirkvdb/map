@@ -1,6 +1,3 @@
-//! GDAL vector detection and bounds via `geo`, with native on-demand tiled
-//! rendering. Other vector formats are converted to WGS84 GeoJSON.
-
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::marker::PhantomData;
@@ -13,7 +10,7 @@ use std::time::Instant;
 use anyhow::{Context as _, Result, ensure};
 use gdal::Dataset;
 use gdal::vector::LayerAccess as _;
-use geo::vector::{algo, gdalio};
+use geo::vector::{VectorFileFormat, algo, gdalio};
 use inf::colormap::{ColorMapDirection, ColorMapPreset, ProcessedColorMap};
 use serde_json::{Value, json};
 
@@ -24,7 +21,7 @@ const SOURCE_ID: &str = "local-vector";
 const PALETTE_STOPS: usize = 256;
 const OGR2OGR_ARROW_API: &CStr = c"OGR2OGR_USE_ARROW_API";
 
-/// Synchronous progress while materializing a vector dataset.
+/// Synchronous progress while loading a vector dataset.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VectorLoadProgress {
     /// GDAL conversion fraction, aggregated equally across dataset layers.
@@ -166,9 +163,9 @@ impl VectorSource {
             return Ok(None);
         }
         let driver = dataset.driver().short_name();
-        let is_csv = driver == "CSV";
+        let is_csv = driver == VectorFileFormat::Csv.gdal_driver_name();
         let dataset = if is_csv { open_csv_dataset(path)? } else { dataset };
-        if matches!(driver.as_str(), "PMTiles" | "MBTiles") {
+        if [VectorFileFormat::PMTiles.gdal_driver_name(), VectorFileFormat::MBTiles.gdal_driver_name()].contains(&driver.as_str()) {
             return Self::tiled_sources(&dataset, path, &driver).map(Some);
         }
 
@@ -191,10 +188,11 @@ impl VectorSource {
     fn tiled_sources(dataset: &Dataset, path: &Path, driver: &str) -> Result<Vec<Arc<Self>>> {
         let absolute = path.canonicalize().with_context(|| format!("Could not resolve {}", path.display()))?;
         let file_url = url::Url::from_file_path(&absolute).map_err(|_| anyhow::anyhow!("Could not create a file URL for {}", absolute.display()))?;
-        let url = match driver {
-            "PMTiles" => format!("pmtiles://{file_url}"),
+        let url = if driver == VectorFileFormat::PMTiles.gdal_driver_name() {
+            format!("pmtiles://{file_url}")
+        } else {
             // Native MBTiles takes an encoded absolute path, not a file URL.
-            _ => format!("mbtiles://{}", file_url.path()),
+            format!("mbtiles://{}", file_url.path())
         };
         // Reading names uses GDAL's layer metadata, never feature iteration
         // or extent/statistics calculation, which could scan the archive.
