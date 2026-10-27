@@ -42,28 +42,13 @@ impl CachedTile {
         let start = Instant::now();
         let metadata = source.metadata();
         let tile_size = metadata.tile_size.unwrap_or(Tile::TILE_SIZE);
-        let read = || -> Result<Option<AnyDenseArray>> {
-            let request = TileRequest {
-                tile: key.tile,
-                dpi_ratio: key.dpi,
-                tile_size,
-                tile_format: TileFormat::RasterTile,
-            };
-            // Use the same native COG reader/GDAL fallback as the map tiles.
-            let raw = DynamicTileProvider::get_tile_for_layer(metadata, &request).or_else(|error| {
-                if metadata.source_format == LayerSourceType::CloudOptimizedGeoTiff {
-                    WarpingTileProvider::tile(metadata, &request)
-                } else {
-                    Err(error)
-                }
-            })?;
-            if raw.data.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(AnyDenseArray::from_raster_tile_bytes(&raw.data)?))
-            }
+        let request = TileRequest {
+            tile: key.tile,
+            dpi_ratio: key.dpi,
+            tile_size,
+            tile_format: TileFormat::RasterTile,
         };
-        let data = read().map_err(|error| {
+        let data = Self::read(source, &request).map_err(|error| {
             log::error!("Couldn’t read the raster pixel tile: {error:#}");
             format!("{error:#}")
         });
@@ -74,6 +59,23 @@ impl CachedTile {
             key,
             reference: GeoReference::from_tile(&key.tile, sample_size, 1),
             data,
+        }
+    }
+
+    fn read(source: &RasterSource, request: &TileRequest) -> Result<Option<AnyDenseArray>> {
+        let metadata = source.metadata();
+        // Use the same native COG reader/GDAL fallback as the map tiles.
+        let raw = DynamicTileProvider::get_tile_for_layer(metadata, request).or_else(|error| {
+            if metadata.source_format == LayerSourceType::CloudOptimizedGeoTiff {
+                WarpingTileProvider::tile(metadata, request)
+            } else {
+                Err(error)
+            }
+        })?;
+        if raw.data.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(AnyDenseArray::from_raster_tile_bytes(&raw.data)?))
         }
     }
 
@@ -276,21 +278,23 @@ impl PixelInfo {
         let work = cx.background_spawn(async move { CachedTile::load(&source, next) });
         self.task = Some(cx.spawn(async move |this, cx| {
             let tile = work.await;
-            let _ = this.update(cx, |this, cx| {
-                this.cache.insert(tile);
-                this.task = None;
-                // Sample the latest cursor from the completed tile, not the
-                // coordinate that originally caused its load.
-                if let Some(request) = &this.current
-                    && let Some(value) = this.cache.lookup(request)
-                    && this.value != value
-                {
-                    this.value = value;
-                    cx.notify();
-                }
-                this.start_load(cx);
-            });
+            let _ = this.update(cx, |this, cx| this.finish_load(tile, cx));
         }));
+    }
+
+    fn finish_load(&mut self, tile: CachedTile, cx: &mut Context<Self>) {
+        self.cache.insert(tile);
+        self.task = None;
+        // Sample the latest cursor from the completed tile, not the
+        // coordinate that originally caused its load.
+        if let Some(request) = &self.current
+            && let Some(value) = self.cache.lookup(request)
+            && self.value != value
+        {
+            self.value = value;
+            cx.notify();
+        }
+        self.start_load(cx);
     }
 
     fn text(&self) -> Option<String> {
@@ -565,54 +569,65 @@ mod tests {
     #[gpui_kit::test]
     fn same_point_unscaling_changes_refresh_cached_values_without_rereading(cx: &mut TestAppContext) {
         for (scale, offset, physical) in [(2.5, -11.0, 174.0), (-0.5, 7.0, -30.0), (0.0, 12.0, 12.0), (1.0, 0.0, 74.0)] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("scaled.tif");
-            crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
-            let dataset = gdal::Dataset::open_ex(
-                &path,
-                gdal::DatasetOptions {
-                    open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            let mut band = dataset.rasterband(1).unwrap();
-            band.set_scale(scale).unwrap();
-            band.set_offset(offset).unwrap();
-            dataset.close().unwrap();
-            let source = RasterSource::open(&path).unwrap().remove(0);
-            let raw = source.with_unscaling(false).unwrap();
-            let coordinate = Coordinate::latlon(-0.15625, 0.15625);
-            let info = cx.new(|_| PixelInfo::new());
-            cx.update(|cx| {
-                info.update(cx, |info, cx| {
-                    info.show(coordinate, Some(source.clone()), 1, cx);
-                    assert!(info.task.is_some());
-                    // The in-flight raw read must publish in the newest units.
-                    info.show(coordinate, Some(raw.clone()), 1, cx);
-                })
-            });
-            cx.run_until_parked();
-            assert_eq!(cx.update(|cx| info.read(cx).value), PixelValue::Data(74.0));
-            std::fs::remove_file(&path).unwrap();
-            cx.update(|cx| {
-                info.update(cx, |info, cx| {
-                    let retained_tiles = info.cache.tiles.len();
-                    let retained_bytes = info.cache.bytes;
-                    for (snapshot, expected) in [(&source, physical), (&raw, 74.0), (&source, physical)] {
-                        info.show(coordinate, Some(snapshot.clone()), 1, cx);
-                        assert_eq!(info.value, PixelValue::Data(expected));
-                        assert_eq!(info.current.as_ref().unwrap().source.unscaling_enabled(), snapshot.unscaling_enabled());
-                        assert!(info.task.is_none(), "Cached toggles must not start a new read");
-                        assert_eq!((info.cache.tiles.len(), info.cache.bytes), (retained_tiles, retained_bytes));
-                        let key = info.current.as_ref().unwrap().key();
-                        let tile = info.cache.tiles.iter().find(|tile| tile.key == key).unwrap();
-                        assert_eq!(tile.value(coordinate), PixelValue::Data(74.0));
-                    }
-                })
-            });
-            cx.run_until_parked();
-            assert_eq!(cx.update(|cx| info.read(cx).value), PixelValue::Data(physical));
+            assert_same_point_unscaling_change(cx, scale, offset, physical);
+        }
+    }
+
+    fn assert_same_point_unscaling_change(cx: &mut TestAppContext, scale: f64, offset: f64, physical: f64) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scaled.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
+        let dataset = gdal::Dataset::open_ex(
+            &path,
+            gdal::DatasetOptions {
+                open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut band = dataset.rasterband(1).unwrap();
+        band.set_scale(scale).unwrap();
+        band.set_offset(offset).unwrap();
+        dataset.close().unwrap();
+        let source = RasterSource::open(&path).unwrap().remove(0);
+        let raw = source.with_unscaling(false).unwrap();
+        let coordinate = Coordinate::latlon(-0.15625, 0.15625);
+        let info = cx.new(|_| PixelInfo::new());
+        cx.update(|cx| {
+            info.update(cx, |info, cx| {
+                info.show(coordinate, Some(source.clone()), 1, cx);
+                assert!(info.task.is_some());
+                // The in-flight raw read must publish in the newest units.
+                info.show(coordinate, Some(raw.clone()), 1, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| info.read(cx).value), PixelValue::Data(74.0));
+        std::fs::remove_file(&path).unwrap();
+        cx.update(|cx| info.update(cx, |info, cx| assert_cached_unscaling_toggles(info, &source, &raw, coordinate, physical, cx)));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| info.read(cx).value), PixelValue::Data(physical));
+    }
+
+    fn assert_cached_unscaling_toggles(
+        info: &mut PixelInfo,
+        source: &Arc<RasterSource>,
+        raw: &Arc<RasterSource>,
+        coordinate: Coordinate,
+        physical: f64,
+        cx: &mut Context<PixelInfo>,
+    ) {
+        let retained_tiles = info.cache.tiles.len();
+        let retained_bytes = info.cache.bytes;
+        for (snapshot, expected) in [(source, physical), (raw, 74.0), (source, physical)] {
+            info.show(coordinate, Some(snapshot.clone()), 1, cx);
+            assert_eq!(info.value, PixelValue::Data(expected));
+            assert_eq!(info.current.as_ref().unwrap().source.unscaling_enabled(), snapshot.unscaling_enabled());
+            assert!(info.task.is_none(), "Cached toggles must not start a new read");
+            assert_eq!((info.cache.tiles.len(), info.cache.bytes), (retained_tiles, retained_bytes));
+            let key = info.current.as_ref().unwrap().key();
+            let tile = info.cache.tiles.iter().find(|tile| tile.key == key).unwrap();
+            assert_eq!(tile.value(coordinate), PixelValue::Data(74.0));
         }
     }
 

@@ -42,6 +42,12 @@ gpui-kit = { version = "0.8", features = ["test-support"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 sqlite = { path = "infra-rs/crates/sqlite" }
 
+# Policy checks must not be bypassed with source-level allow/expect attributes.
+[lints.clippy]
+cognitive_complexity = "forbid"
+too_many_lines = "forbid"
+excessive_nesting = "forbid"
+
 [profile.dev]
 debug = 0
 

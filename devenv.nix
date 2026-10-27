@@ -66,6 +66,7 @@ in
       pkg-config
 
       python3
+      uv
       pkg-mod-zlib-compat
       cmake
       ninja
@@ -140,12 +141,28 @@ in
   };
 
   tasks."ci:checks" = {
-    exec = "just build && just test";
+    exec = "just check && just build && just test";
   };
 
   tasks."maplibre:prepare" = {
     before = [ "devenv:enterShell" ];
     exec = ''python3 "$DEVENV_ROOT/scripts/prepare_maplibre.py" "$MLN_LOCAL_REPOSITORY"'';
+  };
+
+  scripts.knots.exec = ''
+    exec uvx --from knots==2.0.0 knots "$@"
+  '';
+
+  tasks."code:complexity" = {
+    description = "Enforce Rust code complexity thresholds";
+
+    exec = ''
+      knots -r src/ \
+        --cognitive-threshold 15 \
+        --mccabe-threshold 10 \
+        --nesting-threshold 4 \
+        --aird-threshold 85
+    '';
   };
 
   enterShell = ''

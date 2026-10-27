@@ -99,6 +99,83 @@ impl FeatureInfo {
     }
 }
 
+impl FeatureInfo {
+    fn render_heading(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("feature-info-heading")
+            .test_support()
+            .aria_label("Properties")
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .child(Icon::new(IconName::TableProperties).small())
+            .child(
+                div()
+                    .id("feature-info-title")
+                    .test_support()
+                    .flex_1()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Properties"),
+            )
+            .child(
+                Button::new("toggle-feature-info")
+                    .small()
+                    .ghost()
+                    .icon(if self.collapsed { IconName::ChevronDown } else { IconName::ChevronUp })
+                    .accessibility_label(if self.collapsed { "Expand properties" } else { "Collapse properties" })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.collapsed = !this.collapsed;
+                        cx.notify();
+                    })),
+            )
+    }
+}
+
+impl FeatureSection {
+    fn render(&self, index: usize, show_title: bool, cx: &gpui_kit::App) -> impl IntoElement {
+        let mut section = div()
+            .id(SharedString::from(self.identity.clone()))
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .gap_1()
+            .px_4()
+            .py_2()
+            .border_t_1()
+            .border_color(cx.theme().border);
+        if show_title {
+            let title = match &self.id {
+                Some(id) => format!("Feature {} · ID: {id}", index + 1),
+                None => format!("Feature {}", index + 1),
+            };
+            section = section.child(div().font_weight(FontWeight::MEDIUM).child(title));
+        }
+        if self.properties.is_empty() {
+            return section.child(div().text_color(cx.theme().muted_foreground).child("No properties"));
+        }
+        section.children(self.properties.iter().map(|(key, value)| {
+            div()
+                .id(key.clone())
+                .test_support()
+                .flex()
+                .items_start()
+                .gap_2()
+                .child(
+                    div()
+                        .w(rems(8.0))
+                        .flex_shrink_0()
+                        .whitespace_normal()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(key.clone()),
+                )
+                .child(div().flex_1().min_w_0().whitespace_normal().child(value.clone()))
+        }))
+    }
+}
+
 impl Render for FeatureInfo {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Keep this pane passive so entering it does not clear the map's hover
@@ -118,38 +195,7 @@ impl Render for FeatureInfo {
             .border_color(cx.theme().border)
             .rounded(cx.theme().radius_tokens().lg)
             .shadow(cx.theme().shadow_tokens().sm)
-            .child(
-                div()
-                    .id("feature-info-heading")
-                    .test_support()
-                    .aria_label("Properties")
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_4()
-                    .py_2()
-                    .child(Icon::new(IconName::TableProperties).small())
-                    .child(
-                        div()
-                            .id("feature-info-title")
-                            .test_support()
-                            .flex_1()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Properties"),
-                    )
-                    .child(
-                        Button::new("toggle-feature-info")
-                            .small()
-                            .ghost()
-                            .icon(if self.collapsed { IconName::ChevronDown } else { IconName::ChevronUp })
-                            .accessibility_label(if self.collapsed { "Expand properties" } else { "Collapse properties" })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.collapsed = !this.collapsed;
-                                cx.notify();
-                            })),
-                    ),
-            );
+            .child(self.render_heading(cx));
         if self.collapsed {
             return info;
         }
@@ -174,47 +220,12 @@ impl Render for FeatureInfo {
                 .min_h_0()
                 .overflow_y_scroll()
                 .text_xs()
-                .children(self.features.iter().enumerate().map(|(ix, feature)| {
-                    let mut section = div()
-                        .id(SharedString::from(feature.identity.clone()))
-                        .flex()
-                        .flex_col()
-                        .flex_shrink_0()
-                        .gap_1()
-                        .px_4()
-                        .py_2()
-                        .border_t_1()
-                        .border_color(cx.theme().border);
-                    if self.features.len() > 1 {
-                        let title = match &feature.id {
-                            Some(id) => format!("Feature {} · ID: {id}", ix + 1),
-                            None => format!("Feature {}", ix + 1),
-                        };
-                        section = section.child(div().font_weight(FontWeight::MEDIUM).child(title));
-                    }
-                    if feature.properties.is_empty() {
-                        section = section.child(div().text_color(cx.theme().muted_foreground).child("No properties"));
-                    } else {
-                        section = section.children(feature.properties.iter().map(|(key, value)| {
-                            div()
-                                .id(key.clone())
-                                .test_support()
-                                .flex()
-                                .items_start()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .w(rems(8.0))
-                                        .flex_shrink_0()
-                                        .whitespace_normal()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(key.clone()),
-                                )
-                                .child(div().flex_1().min_w_0().whitespace_normal().child(value.clone()))
-                        }));
-                    }
-                    section
-                })),
+                .children(
+                    self.features
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, feature)| feature.render(ix, self.features.len() > 1, cx)),
+                ),
         );
         info
     }
@@ -225,7 +236,7 @@ mod tests {
     use super::{FeatureInfo, FeatureSection, property_text};
     use gpui_kit::component::Theme;
     use gpui_kit::test::TestWindowExt as _;
-    use gpui_kit::{AppContext, TestAppContext, px, size};
+    use gpui_kit::{App, AppContext, Entity, TestAppContext, Window, px, size};
     use serde_json::{Value, json};
     use std::cell::Cell;
     use std::rc::Rc;
@@ -326,23 +337,27 @@ mod tests {
                 assert!(info.read(cx).collapsed);
                 assert!(window.try_find("feature-info-properties").is_none());
 
-                // This standalone passive view has no initial focus target.
-                window.focus_next(cx);
-                window.render_frame(cx);
-                window.press("tab", cx);
-                assert_eq!(window.find("toggle-feature-info").focused(), Some(true));
-                window.press("enter", cx);
-                assert!(!info.read(cx).collapsed);
-                assert!(window.find("feature-info-properties").visible());
-                assert_eq!(window.find("toggle-feature-info").label(), Some("Collapse properties"));
-                assert_eq!(info.read(cx).features[0].properties[0].1.as_ref(), "River");
-                window.press("space", cx);
-                assert!(info.read(cx).collapsed);
-                assert!(window.try_find("feature-info-properties").is_none());
-                assert_eq!(window.find("toggle-feature-info").focused(), Some(true));
+                assert_keyboard_collapse(&info, window, cx);
             })
             .unwrap();
         }
+    }
+
+    fn assert_keyboard_collapse(info: &Entity<FeatureInfo>, window: &mut Window, cx: &mut App) {
+        // This standalone passive view has no initial focus target.
+        window.focus_next(cx);
+        window.render_frame(cx);
+        window.press("tab", cx);
+        assert_eq!(window.find("toggle-feature-info").focused(), Some(true));
+        window.press("enter", cx);
+        assert!(!info.read(cx).collapsed);
+        assert!(window.find("feature-info-properties").visible());
+        assert_eq!(window.find("toggle-feature-info").label(), Some("Collapse properties"));
+        assert_eq!(info.read(cx).features[0].properties[0].1.as_ref(), "River");
+        window.press("space", cx);
+        assert!(info.read(cx).collapsed);
+        assert!(window.try_find("feature-info-properties").is_none());
+        assert_eq!(window.find("toggle-feature-info").focused(), Some(true));
     }
 
     #[gpui_kit::test]

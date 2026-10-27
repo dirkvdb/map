@@ -75,11 +75,7 @@ fn receive_frame(frames: &async_channel::Receiver<MapFrame>, deadline: Instant) 
     }
 }
 
-#[test]
-#[ignore = "requires a wgpu-compatible graphics device; controlled local geometry and style, no network"]
-fn local_worker_keeps_background_only_vector_frames_unsettled_and_delivers_settled_geometry() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("readiness.geojson");
+fn open_dense_point_fixture(path: &std::path::Path) -> Result<Arc<VectorSource>> {
     // Enough native GeoJSON indexing/tile work to expose the early background
     // frame, with bounded local geometry entirely inside the fitted viewport.
     let features: Vec<_> = (0..62_500)
@@ -93,10 +89,17 @@ fn local_worker_keeps_background_only_vector_frames_unsettled_and_delivers_settl
         })
         .collect();
     std::fs::write(
-        &path,
+        path,
         serde_json::to_vec(&serde_json::json!({"type": "FeatureCollection", "features": features}))?,
     )?;
-    let source = VectorSource::open(&path)?.context("Expected local vector data")?.remove(0);
+    Ok(VectorSource::open(path)?.context("Expected local vector data")?.remove(0))
+}
+
+#[test]
+#[ignore = "requires a wgpu-compatible graphics device; controlled local geometry and style, no network"]
+fn local_worker_keeps_background_only_vector_frames_unsettled_and_delivers_settled_geometry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let source = open_dense_point_fixture(&dir.path().join("readiness.geojson"))?;
     let viewport = Viewport {
         width: NonZeroU32::new(256).unwrap(),
         height: NonZeroU32::new(256).unwrap(),
@@ -109,15 +112,7 @@ fn local_worker_keeps_background_only_vector_frames_unsettled_and_delivers_settl
     let renderer = MapRenderer::with_test_style(tests::DARK_STYLE)?;
     let frames = renderer.frames();
     renderer.render(request)?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let background = loop {
-        let frame = receive_frame(&frames, deadline)?;
-        let image = frame.image?;
-        if frame.settled {
-            break image;
-        }
-    };
-    assert!(background.as_bytes(0).unwrap().chunks_exact(4).all(|pixel| pixel == [32, 32, 32, 255]));
+    let background = receive_settled_background(&frames)?;
 
     renderer.render_layer(
         request,
@@ -128,26 +123,7 @@ fn local_worker_keeps_background_only_vector_frames_unsettled_and_delivers_settl
         false,
     )?;
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut saw_background_only = false;
-    loop {
-        let frame = receive_frame(&frames, deadline)?;
-        if frame.vector_layer_id != Some(source.id()) {
-            continue;
-        }
-        let image = frame.image?;
-        let background_only = image.as_bytes(0) == background.as_bytes(0);
-        if background_only {
-            saw_background_only = true;
-            assert!(!frame.settled, "A source-tagged background-only readback must not complete loading");
-        }
-        if frame.settled {
-            assert!(saw_background_only, "Fixture must exercise an early background-only frame");
-            assert!(!background_only, "The settled frame must contain actual geometry pixels, not just a source ID");
-            // Coalescing may hide the last unsettled image, and native may render
-            // a new settled image. Shared-Arc idle-only completion is unit-tested.
-            break;
-        }
-    }
+    assert_readiness_transition(&frames, source.id(), &background, deadline)?;
 
     // Continued idle polling should neither repaint nor send repeated completion.
     std::thread::sleep(Duration::from_millis(80));
@@ -202,4 +178,49 @@ fn settled_native_map_ignores_expired_deadline_but_pending_work_still_times_out(
     assert!(map.needs_frame.get(), "Expired work must fail before rendering");
     assert_eq!(map.deadline, deadline, "Pending repaint must not extend the deadline");
     Ok(())
+}
+
+fn assert_readiness_transition(frames: &async_channel::Receiver<MapFrame>, source_id: u64, background: &RenderImage, deadline: Instant) -> Result<()> {
+    let mut saw_background_only = false;
+    loop {
+        let frame = receive_frame(frames, deadline)?;
+        if frame.vector_layer_id != Some(source_id) {
+            continue;
+        }
+        let image = frame.image?;
+        let background_only = image.as_bytes(0) == background.as_bytes(0);
+        if background_only {
+            saw_background_only = true;
+            assert!(!frame.settled, "A source-tagged background-only readback must not complete loading");
+        }
+        if frame.settled {
+            assert!(saw_background_only, "Fixture must exercise an early background-only frame");
+            assert!(!background_only, "The settled frame must contain actual geometry pixels, not just a source ID");
+            // Coalescing may hide the last unsettled image, and native may render
+            // a new settled image. Shared-Arc idle-only completion is unit-tested.
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn receive_settled_background(frames: &async_channel::Receiver<MapFrame>) -> Result<Arc<RenderImage>> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let background = loop {
+        let frame = receive_frame(frames, deadline)?;
+        let image = frame.image?;
+        if frame.settled {
+            break image;
+        }
+    };
+    assert!(
+        background
+            .as_bytes(0)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| *pixel == [32, 32, 32, 255])
+    );
+    Ok(background)
 }

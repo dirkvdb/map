@@ -151,29 +151,33 @@ impl RasterLayer {
         }
         self.queued = None;
         if changed {
-            if source.is_some() {
-                // During loading, replace only the incoming slot, even across
-                // datasets. The outgoing slot keeps its own data and style.
-                if self.previous.is_none() && !self.cache.is_empty() {
-                    self.previous = self.source.clone().map(|source| PreviousRaster {
-                        source,
-                        cache: std::mem::take(&mut self.cache),
-                    });
-                }
-            } else {
-                self.previous = None;
-            }
-            self.fade_started = None;
-            self.generation = self.workers.reset();
-            self.pending.clear();
-            self.coverage.clear();
-            self.cache.clear();
-            self.draws.clear();
-            self.cache_bytes = 0;
-            self.waiting = false;
+            self.reset_for_source_change(source.is_some());
         }
         self.source = source;
         self.dpi = dpi;
+    }
+
+    fn reset_for_source_change(&mut self, has_source: bool) {
+        if has_source {
+            // During loading, replace only the incoming slot, even across
+            // datasets. The outgoing slot keeps its own data and style.
+            if self.previous.is_none() && !self.cache.is_empty() {
+                self.previous = self.source.clone().map(|source| PreviousRaster {
+                    source,
+                    cache: std::mem::take(&mut self.cache),
+                });
+            }
+        } else {
+            self.previous = None;
+        }
+        self.fade_started = None;
+        self.generation = self.workers.reset();
+        self.pending.clear();
+        self.coverage.clear();
+        self.cache.clear();
+        self.draws.clear();
+        self.cache_bytes = 0;
+        self.waiting = false;
     }
 
     pub fn set_reduce_motion(&mut self, reduce: bool) {
@@ -192,23 +196,11 @@ impl RasterLayer {
                 continue;
             }
             self.pending.remove(&result.tile);
-            let texture = match result.data {
-                Ok(Some(data)) => {
-                    #[cfg(test)]
-                    {
-                        self.uploads += 1;
-                    }
-                    Some(upload_tile(&self.device, &self.queue, data))
-                }
-                Ok(None) => None,
-                Err(error) => {
-                    if let Some(source) = &self.source {
-                        source.report_tile_error(&error);
-                    }
-                    log::error!("Numeric tile {:?}: {error:#}", result.tile);
-                    None
-                }
-            };
+            #[cfg(test)]
+            if matches!(&result.data, Ok(Some(_))) {
+                self.uploads += 1;
+            }
+            let texture = self.completed_texture(result.tile, result.data);
             self.cache_bytes += texture.as_ref().map_or(0, |texture| texture.bytes);
             self.cache.insert(result.tile, CachedTile { texture, used: self.frame });
             changed = true;
@@ -216,6 +208,20 @@ impl RasterLayer {
         // A newly selected band can briefly find the bounded job queue full of
         // cancelled work. Retry once workers drain it, even without a result.
         changed || self.fade_started.is_some() || (self.waiting && self.pending.is_empty())
+    }
+
+    fn completed_texture(&self, tile: Tile, data: Result<Option<NumericTile>>) -> Option<TileTexture> {
+        match data {
+            Ok(Some(data)) => Some(upload_tile(&self.device, &self.queue, data)),
+            Ok(None) => None,
+            Err(error) => {
+                if let Some(source) = &self.source {
+                    source.report_tile_error(&error);
+                }
+                log::error!("Numeric tile {tile:?}: {error:#}");
+                None
+            }
+        }
     }
 
     pub fn is_loading(&self) -> bool {
@@ -259,6 +265,34 @@ impl RasterLayer {
 
     fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
         let now = Instant::now();
+        self.finish_fade(now);
+        let Some(source) = self.source.clone() else { return };
+        self.frame += 1;
+        self.prepare_pipeline(parameters);
+        let visible = visible_tiles(parameters, &source);
+        self.update_coverage(&visible, now);
+        let blend = self.fade_started.map_or(if self.previous.is_some() { 0.0 } else { 1.0 }, |start| {
+            (now.duration_since(start).as_secs_f32() / BAND_FADE.as_secs_f32()).clamp(0.0, 1.0)
+        });
+        // Before the fade, only exact incoming tiles can make progress: parent
+        // tiles are invisible and would delay readiness on the shared workers.
+        let loading_replacement = self.previous.is_some() && self.fade_started.is_none();
+        self.request_visible_tiles(&visible, loading_replacement);
+        // Loading only draws the outgoing grid. Once blending starts, draw both
+        // footprints on the finer grid so either slot can sample ancestors.
+        let visible = self.previous.as_ref().map_or(visible, |previous| {
+            if loading_replacement {
+                visible_tiles(parameters, &previous.source)
+            } else {
+                transition_tiles(parameters, &source, &previous.source)
+            }
+        });
+        self.draw_visible_tiles(pass, parameters, &source, &visible, blend);
+        self.draw_debug_tiles(pass);
+        self.evict();
+    }
+
+    fn finish_fade(&mut self, now: Instant) {
         if self
             .fade_started
             .is_some_and(|start| self.reduce_motion || now.duration_since(start) >= BAND_FADE)
@@ -270,14 +304,17 @@ impl RasterLayer {
                 self.set_source(Some(source), self.opacity, dpi);
             }
         }
-        let Some(source) = self.source.clone() else { return };
-        self.frame += 1;
+    }
+
+    fn prepare_pipeline(&mut self, parameters: &WgpuLayerParameters) {
         let formats = (parameters.color_format, parameters.depth_format, parameters.depth_test);
         if self.pipeline.as_ref().is_none_or(|pipeline| pipeline.formats != formats) {
             self.pipeline = Some(RasterPipeline::new(&self.device, formats));
             self.draws.clear();
         }
-        let visible = visible_tiles(parameters, &source);
+    }
+
+    fn update_coverage(&mut self, visible: &[VisibleTile], now: Instant) {
         let coverage = visible.iter().map(|tile| tile.canonical()).collect();
         if self.coverage != coverage {
             // Discard queued work for an old viewport, not cached data. Merely
@@ -295,14 +332,11 @@ impl RasterLayer {
                 self.fade_started = Some(now);
             }
         }
-        let blend = self.fade_started.map_or(if self.previous.is_some() { 0.0 } else { 1.0 }, |start| {
-            (now.duration_since(start).as_secs_f32() / BAND_FADE.as_secs_f32()).clamp(0.0, 1.0)
-        });
-        // Before the fade, only exact incoming tiles can make progress: parent
-        // tiles are invisible and would delay readiness on the shared workers.
-        let loading_replacement = self.previous.is_some() && self.fade_started.is_none();
+    }
+
+    fn request_visible_tiles(&mut self, visible: &[VisibleTile], loading_replacement: bool) {
         // Retain ancestors across navigation and initial progressive loading.
-        for tile in &visible {
+        for tile in visible {
             let tile = tile.canonical();
             if let Some(cached) = self.cache.get_mut(&tile) {
                 cached.used = self.frame;
@@ -316,18 +350,19 @@ impl RasterLayer {
                 self.request(parent);
             }
         }
-        // Loading only draws the outgoing grid. Once blending starts, draw both
-        // footprints on the finer grid so either slot can sample ancestors.
-        let visible = self.previous.as_ref().map_or(visible, |previous| {
-            if loading_replacement {
-                visible_tiles(parameters, &previous.source)
-            } else {
-                transition_tiles(parameters, &source, &previous.source)
-            }
-        });
+    }
+
+    fn draw_visible_tiles(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'_>,
+        parameters: &WgpuLayerParameters,
+        source: &RasterSource,
+        visible: &[VisibleTile],
+        blend: f32,
+    ) {
         let Some(pipeline) = &mut self.pipeline else { return };
-        let previous_source = self.previous.as_ref().map_or(&source, |previous| &previous.source);
-        for (ix, source) in [&source, previous_source].into_iter().enumerate() {
+        let previous_source = self.previous.as_ref().map_or(source, |previous| &previous.source);
+        for (ix, source) in [source, previous_source].into_iter().enumerate() {
             if pipeline.presets[ix] != Some(source.palette()) {
                 write_texture(&self.queue, &pipeline.palettes[ix], &source.palette_rgba(), 256, 1, 4);
                 pipeline.presets[ix] = Some(source.palette());
@@ -336,55 +371,69 @@ impl RasterLayer {
         pass.set_pipeline(&pipeline.pipeline);
         let visible_set: HashSet<_> = visible.iter().copied().collect();
         self.draws.retain(|tile, _| visible_set.contains(tile));
-        for visible_tile in visible {
-            let tile = visible_tile.canonical();
-            let sampled = self.cached_ancestor(tile);
-            let previous_sampled = self.previous.as_ref().and_then(|previous| previous.sampled(tile));
-            if sampled.is_none() && previous_sampled.is_none() {
-                self.draws.remove(&visible_tile);
-                continue;
-            }
-            let texture = sampled.and_then(|tile| self.cache.get_mut(&tile)).and_then(|cached| {
-                cached.used = self.frame;
-                cached.texture.as_ref()
-            });
-            let previous_texture = previous_sampled.and_then(|tile| self.previous.as_ref()?.cache.get(&tile)?.texture.as_ref());
-            let Some(pipeline) = &self.pipeline else { continue };
-            let pair = (sampled, previous_sampled);
-            let draw = self
-                .draws
-                .entry(visible_tile)
-                .or_insert_with(|| pipeline.draw_tile(&self.device, pair, texture, previous_texture));
-            if draw.sampled != pair {
-                *draw = pipeline.draw_tile(&self.device, pair, texture, previous_texture);
-            }
-            let range = source.range();
-            let previous_range = self.previous.as_ref().map_or(range, |previous| previous.source.range());
-            let scale = source.scale();
-            let scale_offset = [scale.scale as f32, scale.offset as f32];
-            let previous_scale = self.previous.as_ref().map_or(scale, |previous| previous.source.scale());
-            let previous_scale_offset = [previous_scale.scale as f32, previous_scale.offset as f32];
-            self.queue.write_buffer(
-                &draw.uniform,
-                0,
-                bytemuck::bytes_of(&DrawUniform {
-                    matrix: tile_matrix(&parameters.projection, parameters.zoom, visible_tile),
-                    uv: sampled.map_or([0.0, 0.0, 1.0, 1.0], |sampled| parent_uv(tile, sampled)),
-                    previous_uv: previous_sampled.map_or([0.0, 0.0, 1.0, 1.0], |sampled| parent_uv(tile, sampled)),
-                    range: [range.0, range.1],
-                    previous_range: [previous_range.0, previous_range.1],
-                    scale_offset,
-                    previous_scale_offset,
-                    opacity: self.opacity,
-                    blend,
-                    tile_size: (512.0 * parameters.zoom.exp2() / f64::from(1_u32 << tile.z)) as f32,
-                    padding: 0.0,
-                    tile_id: [tile.z as u32, tile.x as u32, tile.y as u32, 0],
-                }),
-            );
-            pass.set_bind_group(0, &draw.bindings, &[]);
-            pass.draw(0..6, 0..1);
+        for &visible_tile in visible {
+            self.draw_visible_tile(pass, parameters, source, visible_tile, blend);
         }
+    }
+
+    fn draw_visible_tile(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'_>,
+        parameters: &WgpuLayerParameters,
+        source: &RasterSource,
+        visible_tile: VisibleTile,
+        blend: f32,
+    ) {
+        let tile = visible_tile.canonical();
+        let sampled = self.cached_ancestor(tile);
+        let previous_sampled = self.previous.as_ref().and_then(|previous| previous.sampled(tile));
+        if sampled.is_none() && previous_sampled.is_none() {
+            self.draws.remove(&visible_tile);
+            return;
+        }
+        let texture = sampled.and_then(|tile| self.cache.get_mut(&tile)).and_then(|cached| {
+            cached.used = self.frame;
+            cached.texture.as_ref()
+        });
+        let previous_texture = previous_sampled.and_then(|tile| self.previous.as_ref()?.cache.get(&tile)?.texture.as_ref());
+        let Some(pipeline) = &self.pipeline else { return };
+        let pair = (sampled, previous_sampled);
+        let draw = self
+            .draws
+            .entry(visible_tile)
+            .or_insert_with(|| pipeline.draw_tile(&self.device, pair, texture, previous_texture));
+        if draw.sampled != pair {
+            *draw = pipeline.draw_tile(&self.device, pair, texture, previous_texture);
+        }
+        let range = source.range();
+        let previous_range = self.previous.as_ref().map_or(range, |previous| previous.source.range());
+        let scale = source.scale();
+        let scale_offset = [scale.scale as f32, scale.offset as f32];
+        let previous_scale = self.previous.as_ref().map_or(scale, |previous| previous.source.scale());
+        let previous_scale_offset = [previous_scale.scale as f32, previous_scale.offset as f32];
+        self.queue.write_buffer(
+            &draw.uniform,
+            0,
+            bytemuck::bytes_of(&DrawUniform {
+                matrix: tile_matrix(&parameters.projection, parameters.zoom, visible_tile),
+                uv: sampled.map_or([0.0, 0.0, 1.0, 1.0], |sampled| parent_uv(tile, sampled)),
+                previous_uv: previous_sampled.map_or([0.0, 0.0, 1.0, 1.0], |sampled| parent_uv(tile, sampled)),
+                range: [range.0, range.1],
+                previous_range: [previous_range.0, previous_range.1],
+                scale_offset,
+                previous_scale_offset,
+                opacity: self.opacity,
+                blend,
+                tile_size: (512.0 * parameters.zoom.exp2() / f64::from(1_u32 << tile.z)) as f32,
+                padding: 0.0,
+                tile_id: [tile.z as u32, tile.x as u32, tile.y as u32, 0],
+            }),
+        );
+        pass.set_bind_group(0, &draw.bindings, &[]);
+        pass.draw(0..6, 0..1);
+    }
+
+    fn draw_debug_tiles(&mut self, pass: &mut wgpu::RenderPass<'_>) {
         if self.debug
             && let Some(pipeline) = &mut self.pipeline
         {
@@ -399,7 +448,6 @@ impl RasterLayer {
                 pass.draw(0..6, 0..1);
             }
         }
-        self.evict();
     }
 
     fn evict(&mut self) {

@@ -14,8 +14,9 @@ use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme, Icon, IndexPath, Sizable};
 use gpui_kit::{
-    App, AppContext, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, PathPromptOptions,
-    Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, Window, div, rgba,
+    App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    PathPromptOptions, Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, WeakEntity,
+    Window, div, rgba,
 };
 use inf::colormap::{ColorMapDirection, ColorMapPreset, ProcessedColorMap};
 
@@ -36,6 +37,27 @@ enum LoadProgress {
 }
 
 impl LoadProgress {
+    fn conversion_milestone(self) -> Option<u8> {
+        match self {
+            Self::Converting(fraction) => Some((fraction * 4.0) as u8),
+            _ => None,
+        }
+    }
+
+    fn advance_from(self, previous: Option<Self>) -> Option<Self> {
+        match self {
+            Self::Converting(fraction) if fraction.is_finite() => {
+                let previous = match previous {
+                    Some(Self::Converting(previous)) => previous,
+                    _ => 0.0,
+                };
+                Some(Self::Converting(fraction.clamp(0.0, 1.0).max(previous)))
+            }
+            Self::Converting(_) | Self::Rendering(_) => None,
+            progress => Some(progress),
+        }
+    }
+
     fn status(self) -> SharedString {
         match self {
             Self::Opening => "Opening datasets".into(),
@@ -289,19 +311,7 @@ impl RasterPanel {
     fn watch_tile_errors(&mut self, cx: &mut Context<Self>) {
         self.tile_errors_task = self.active().map(|source| {
             let errors = source.errors();
-            cx.spawn(async move |this, cx| {
-                while let Ok(error) = errors.recv().await {
-                    if this
-                        .update(cx, |this, cx| {
-                            this.load_error = Some(error.into());
-                            cx.notify();
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            })
+            cx.spawn(async move |this, cx| receive_tile_errors(this, errors, cx).await)
         });
     }
 
@@ -348,23 +358,28 @@ impl RasterPanel {
         let generation = self.load_generation;
         cx.notify();
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = paths.await;
-            let _ = this.update_in(cx, |this, _, cx| {
-                if this.load_generation != generation {
-                    return;
-                }
-                this.load_task = None;
-                this.loading = false;
-                match result {
-                    Ok(Ok(Some(paths))) => this.open_paths(paths, cx),
-                    Ok(Ok(None)) => cx.notify(),
-                    error => {
-                        this.load_error = Some(format!("Couldn’t open the file picker: {error:?}").into());
-                        cx.notify();
-                    }
-                }
-            });
+            let result = match paths.await {
+                Ok(Ok(paths)) => Ok(paths),
+                error => Err(format!("Couldn’t open the file picker: {error:?}").into()),
+            };
+            let _ = this.update_in(cx, |this, _, cx| this.complete_path_prompt(generation, result, cx));
         }));
+    }
+
+    fn complete_path_prompt(&mut self, generation: u64, result: Result<Option<Vec<PathBuf>>, SharedString>, cx: &mut Context<Self>) {
+        if self.load_generation != generation {
+            return;
+        }
+        self.load_task = None;
+        self.loading = false;
+        match result {
+            Ok(Some(paths)) => self.open_paths(paths, cx),
+            Ok(None) => cx.notify(),
+            Err(error) => {
+                self.load_error = Some(error);
+                cx.notify();
+            }
+        }
     }
 
     pub fn open_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
@@ -394,70 +409,53 @@ impl RasterPanel {
         self.load_task = Some(cx.spawn(async move |this, cx| {
             // One retained task owns both completion and progress. Finishing or
             // clearing the load drops the updater, its timer, and its receiver.
-            let updates = async {
-                while let Ok(progress) = progress.recv().await {
-                    if this.update(cx, |this, cx| this.update_load_progress(generation, progress, cx)).is_err() {
-                        break;
-                    }
-                    cx.background_executor().timer(LOAD_PROGRESS_INTERVAL).await;
-                }
-                futures_lite::future::pending::<LoadedDatasets>().await
-            };
+            let updates = receive_load_progress(&this, generation, progress, cx);
             let loaded = futures_lite::future::or(work, updates).await;
             log::info!(target: "map::vector_load", "load={generation} stage=loader-finished since_request={:?} vectors={} rasters={} errors={}", started.elapsed(), loaded.vectors.len(), loaded.sources.len(), loaded.errors.len());
-            let _ = this.update_in(cx, |this, window, cx| {
-                if this.load_generation != generation || !this.loading {
-                    return;
-                }
-                this.load_task = None;
-                this.loading = false;
-                this.load_progress = None;
-                let installed = Instant::now();
-                this.sources.extend(loaded.sources);
-                this.vectors.extend(loaded.vectors);
-                let items = this.choices();
-                this.bands.update(cx, |state, cx| state.set_items(items, window, cx));
-                if let Some(id) = loaded.selected {
-                    this.bands.update(cx, |state, cx| state.set_selected_value(&id, window, cx));
-                    this.select(Some(id), true, window, cx);
-                }
-                this.load_progress = match loaded.selected {
-                    Some(SelectionId::Vector(source)) => Some(LoadProgress::Rendering(source)),
-                    _ => None,
-                };
-                this.load_error = (!loaded.errors.is_empty()).then(|| loaded.errors.join("\n").into());
-                log::info!(target: "map::vector_load", "load={generation} stage=ui-install-loaded-layers elapsed={:?} since_request={:?} awaiting_vector_frame={}", installed.elapsed(), started.elapsed(), this.load_progress.is_some());
-                cx.notify();
-            });
+            let _ = this.update_in(cx, |this, window, cx| this.install_loaded_datasets(generation, loaded, started, window, cx));
         }));
+    }
+
+    fn install_loaded_datasets(&mut self, generation: u64, loaded: LoadedDatasets, started: Instant, window: &mut Window, cx: &mut Context<Self>) {
+        if self.load_generation != generation || !self.loading {
+            return;
+        }
+        self.load_task = None;
+        self.loading = false;
+        self.load_progress = None;
+        let installed = Instant::now();
+        self.sources.extend(loaded.sources);
+        self.vectors.extend(loaded.vectors);
+        let items = self.choices();
+        self.bands.update(cx, |state, cx| state.set_items(items, window, cx));
+        if let Some(id) = loaded.selected {
+            self.bands.update(cx, |state, cx| state.set_selected_value(&id, window, cx));
+            self.select(Some(id), true, window, cx);
+        }
+        self.load_progress = match loaded.selected {
+            Some(SelectionId::Vector(source)) => Some(LoadProgress::Rendering(source)),
+            _ => None,
+        };
+        self.load_error = (!loaded.errors.is_empty()).then(|| loaded.errors.join("\n").into());
+        log::info!(target: "map::vector_load", "load={generation} stage=ui-install-loaded-layers elapsed={:?} since_request={:?} awaiting_vector_frame={}", installed.elapsed(), started.elapsed(), self.load_progress.is_some());
+        cx.notify();
     }
 
     fn update_load_progress(&mut self, generation: u64, progress: LoadProgress, cx: &mut Context<Self>) {
         if self.load_generation != generation || !self.loading {
             return;
         }
-        let progress = match progress {
-            LoadProgress::Converting(fraction) if fraction.is_finite() => {
-                let previous = match self.load_progress {
-                    Some(LoadProgress::Converting(previous)) => previous,
-                    _ => 0.0,
-                };
-                LoadProgress::Converting(fraction.clamp(0.0, 1.0).max(previous))
-            }
-            LoadProgress::Converting(_) | LoadProgress::Rendering(_) => return,
-            progress => progress,
-        };
-        if self.load_progress != Some(progress) {
-            let milestone = |progress| match progress {
-                Some(LoadProgress::Converting(fraction)) => Some((fraction * 4.0) as u8),
-                _ => None,
-            };
-            if milestone(self.load_progress) != milestone(Some(progress)) || !matches!(progress, LoadProgress::Converting(_)) {
-                log::info!(target: "map::vector_load", "load={generation} stage=ui-progress progress={progress:?} since_request={:?}", self.load_started.map(|started| started.elapsed()));
-            }
-            self.load_progress = Some(progress);
-            cx.notify();
+        let Some(progress) = progress.advance_from(self.load_progress) else { return };
+        if self.load_progress == Some(progress) {
+            return;
         }
+        if self.load_progress.and_then(LoadProgress::conversion_milestone) != progress.conversion_milestone()
+            || !matches!(progress, LoadProgress::Converting(_))
+        {
+            log::info!(target: "map::vector_load", "load={generation} stage=ui-progress progress={progress:?} since_request={:?}", self.load_started.map(|started| started.elapsed()));
+        }
+        self.load_progress = Some(progress);
+        cx.notify();
     }
 
     /// Finish only the displayed load; late frames cannot clear a newer load.
@@ -584,6 +582,16 @@ impl RasterPanel {
         }
     }
 
+    fn replace_raster(&mut self, source: Arc<RasterSource>) {
+        if let Some(current) = self
+            .sources
+            .iter_mut()
+            .find(|current| Some(SelectionId::Raster(current.metadata().id)) == self.selected)
+        {
+            *current = source;
+        }
+    }
+
     fn replace_vector(&mut self, source: Arc<VectorSource>) {
         if let Some(current) = self.vectors.iter_mut().find(|current| current.id() == source.id()) {
             *current = source;
@@ -607,13 +615,7 @@ impl RasterPanel {
         match source.with_unscaling(enabled) {
             Ok(source) => {
                 let range = source.range();
-                if let Some(current) = self
-                    .sources
-                    .iter_mut()
-                    .find(|current| Some(SelectionId::Raster(current.metadata().id)) == self.selected)
-                {
-                    *current = source;
-                }
+                self.replace_raster(source);
                 self.min.update(cx, |input, cx| input.set_value(format!("{:.2}", range.0), window, cx));
                 self.max.update(cx, |input, cx| input.set_value(format!("{:.2}", range.1), window, cx));
                 self.error = None;
@@ -655,41 +657,47 @@ impl RasterPanel {
         self.emit(false, cx);
     }
 
+    fn selected_palette(&self, cx: &App) -> ColorMapPreset {
+        match self.palette.read(cx).selected_value().copied() {
+            Some("Gray") => ColorMapPreset::Gray,
+            Some("Blues") => ColorMapPreset::Blues,
+            Some("Turbo") => ColorMapPreset::Turbo,
+            Some("Spectral") => ColorMapPreset::Spectral,
+            _ => ColorMapPreset::Terrain,
+        }
+    }
+
+    fn restyle_active_source(&mut self, cx: &App) -> anyhow::Result<()> {
+        let palette = self.selected_palette(cx);
+        if self.active().is_some() {
+            return self.restyle_raster(palette, cx);
+        }
+        if let Some(source) = self.active_vector() {
+            let min = self.min.read(cx).value().trim().parse::<f64>()?;
+            let max = self.max.read(cx).value().trim().parse::<f64>()?;
+            let source = source.restyled(palette, (min, max))?;
+            self.replace_vector(source);
+        }
+        Ok(())
+    }
+
+    fn restyle_raster(&mut self, palette: ColorMapPreset, cx: &App) -> anyhow::Result<()> {
+        let Some(source) = self.active() else { return Ok(()) };
+        let min = self.min.read(cx).value().trim().parse::<f32>()?;
+        let max = self.max.read(cx).value().trim().parse::<f32>()?;
+        // Repeated commits must not invalidate raster tiles.
+        if source.palette() != palette || source.range() != (min, max) {
+            let source = source.restyled(palette, (min, max))?;
+            self.replace_raster(source);
+        }
+        Ok(())
+    }
+
     fn apply_style(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.color_range().is_none() {
             return;
         }
-        let result = (|| -> anyhow::Result<()> {
-            let palette = match self.palette.read(cx).selected_value().copied() {
-                Some("Gray") => ColorMapPreset::Gray,
-                Some("Blues") => ColorMapPreset::Blues,
-                Some("Turbo") => ColorMapPreset::Turbo,
-                Some("Spectral") => ColorMapPreset::Spectral,
-                _ => ColorMapPreset::Terrain,
-            };
-            if let Some(source) = self.active() {
-                let min = self.min.read(cx).value().trim().parse::<f32>()?;
-                let max = self.max.read(cx).value().trim().parse::<f32>()?;
-                // Repeated commits must not invalidate raster tiles.
-                if source.palette() != palette || source.range() != (min, max) {
-                    let source = source.restyled(palette, (min, max))?;
-                    if let Some(current) = self
-                        .sources
-                        .iter_mut()
-                        .find(|current| Some(SelectionId::Raster(current.metadata().id)) == self.selected)
-                    {
-                        *current = source;
-                    }
-                }
-            } else if let Some(source) = self.active_vector() {
-                let min = self.min.read(cx).value().trim().parse::<f64>()?;
-                let max = self.max.read(cx).value().trim().parse::<f64>()?;
-                let source = source.restyled(palette, (min, max))?;
-                self.replace_vector(source);
-            }
-            Ok(())
-        })();
-        match result {
+        match self.restyle_active_source(cx) {
             Ok(()) => {
                 self.error = None;
                 self.watch_tile_errors(cx);
@@ -758,8 +766,8 @@ impl RasterPanel {
     }
 }
 
-impl Render for RasterPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl RasterPanel {
+    fn render_layers_card(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let focus_border = if self.focus.is_focused(window) { cx.theme().ring } else { cx.theme().border };
         let mut layers = overlay_card("raster-layers-card", cx).border_color(focus_border).child(
             div()
@@ -792,21 +800,7 @@ impl Render for RasterPanel {
                 );
             }
             if self.color_range().is_some() {
-                layers = layers
-                    .child(
-                        div().flex().flex_col().gap_1().child(field_label("Color map", cx)).child(
-                            div()
-                                .id("raster-palette-scroll")
-                                .on_scroll(cx.listener(Self::scroll_palette))
-                                .on_hover(cx.listener(|this, hovered, _, _| {
-                                    if !hovered {
-                                        this.palette_scroll = 0.0;
-                                    }
-                                }))
-                                .child(Select::new(&self.palette).id("raster-palette").accessibility_label("Color map")),
-                        ),
-                    )
-                    .child(self.render_legend(cx));
+                layers = layers.child(self.render_palette(cx)).child(self.render_legend(cx));
             }
             if self.selected.is_some() {
                 layers = layers.child(
@@ -823,7 +817,34 @@ impl Render for RasterPanel {
             }
         }
 
-        let mut panel = div().flex().flex_col().gap_3().w_full().h_auto().min_h_0().child(layers);
+        layers
+    }
+
+    fn render_palette(&self, cx: &Context<Self>) -> impl IntoElement {
+        div().flex().flex_col().gap_1().child(field_label("Color map", cx)).child(
+            div()
+                .id("raster-palette-scroll")
+                .on_scroll(cx.listener(Self::scroll_palette))
+                .on_hover(cx.listener(|this, hovered, _, _| {
+                    if !hovered {
+                        this.palette_scroll = 0.0;
+                    }
+                }))
+                .child(Select::new(&self.palette).id("raster-palette").accessibility_label("Color map")),
+        )
+    }
+}
+
+impl Render for RasterPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .w_full()
+            .h_auto()
+            .min_h_0()
+            .child(self.render_layers_card(window, cx));
         if !self.collapsed && self.color_range().is_some() {
             panel = panel.child(self.render_value_range(cx));
         }
@@ -845,16 +866,6 @@ impl RasterPanel {
     fn render_legend(&self, cx: &App) -> impl IntoElement {
         let mut legend = div().id("raster-legend").test_support().flex().flex_col().gap_1();
         if let Some(((min, max), palette)) = self.color_range().zip(self.color_palette()) {
-            let colors = ProcessedColorMap::<256>::create_for_preset(palette, ColorMapDirection::Regular);
-            let swatches = (0..256).map(|ix| {
-                let color = if let Some(source) = self.active() {
-                    source.legend().color_for_value(range_value((min, max), ix as f64 / 255.0) as f32, None)
-                } else {
-                    colors.get_color_by_value(ix as u8)
-                };
-                // These colors encode data, not application chrome.
-                div().flex_1().h_3().bg(rgba(u32::from_be_bytes([color.r, color.g, color.b, color.a])))
-            });
             legend = legend
                 .child(
                     div()
@@ -864,16 +875,28 @@ impl RasterPanel {
                         .text_color(cx.theme().muted_foreground)
                         .children((0..5).map(|ix| format_value(range_value((min, max), ix as f64 / 4.0)))),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .w_full()
-                        .rounded(cx.theme().radius_tokens().sm)
-                        .overflow_hidden()
-                        .children(swatches),
-                );
+                .child(self.render_legend_swatches((min, max), palette, cx));
         }
         legend
+    }
+
+    fn render_legend_swatches(&self, range: (f64, f64), palette: ColorMapPreset, cx: &App) -> impl IntoElement {
+        let colors = ProcessedColorMap::<256>::create_for_preset(palette, ColorMapDirection::Regular);
+        let swatches = (0..256).map(|ix| {
+            let color = if let Some(source) = self.active() {
+                source.legend().color_for_value(range_value(range, ix as f64 / 255.0) as f32, None)
+            } else {
+                colors.get_color_by_value(ix as u8)
+            };
+            // These colors encode data, not application chrome.
+            div().flex_1().h_3().bg(rgba(u32::from_be_bytes([color.r, color.g, color.b, color.a])))
+        });
+        div()
+            .flex()
+            .w_full()
+            .rounded(cx.theme().radius_tokens().sm)
+            .overflow_hidden()
+            .children(swatches)
     }
 
     fn render_value_range(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -927,48 +950,81 @@ impl RasterPanel {
     }
 }
 
+async fn receive_tile_errors(this: WeakEntity<RasterPanel>, errors: async_channel::Receiver<String>, cx: &mut AsyncApp) {
+    while let Ok(error) = errors.recv().await {
+        if this
+            .update(cx, |this, cx| {
+                this.load_error = Some(error.into());
+                cx.notify();
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+async fn receive_load_progress(
+    this: &WeakEntity<RasterPanel>,
+    generation: u64,
+    progress: async_channel::Receiver<LoadProgress>,
+    cx: &mut AsyncApp,
+) -> LoadedDatasets {
+    while let Ok(progress) = progress.recv().await {
+        if this.update(cx, |this, cx| this.update_load_progress(generation, progress, cx)).is_err() {
+            break;
+        }
+        cx.background_executor().timer(LOAD_PROGRESS_INTERVAL).await;
+    }
+    futures_lite::future::pending().await
+}
+
 fn load_paths(paths: Vec<PathBuf>, progress: async_channel::Sender<LoadProgress>) -> LoadedDatasets {
     let mut loaded = LoadedDatasets::default();
     let path_count = paths.len() as f64;
 
     for (index, path) in paths.into_iter().enumerate() {
-        let opened = Instant::now();
-        let _ = progress.force_send(LoadProgress::Opening);
-        let mut progress_bucket = None;
-        let mut report = |event| {
-            let event = match event {
-                VectorLoadProgress::Converting(fraction) if fraction.is_finite() => {
-                    let bucket = (fraction.clamp(0.0, 1.0) * 4.0) as u8;
-                    if progress_bucket != Some(bucket) {
-                        progress_bucket = Some(bucket);
-                        log::info!(target: "map::vector_load", "path={path:?} stage=gdal-progress fraction={fraction:.3} since_path_open={:?}", opened.elapsed());
-                    }
-                    LoadProgress::Converting((index as f64 + fraction.clamp(0.0, 1.0)) / path_count)
-                }
-                VectorLoadProgress::Converting(_) => return,
-                VectorLoadProgress::Preparing => LoadProgress::Preparing,
-            };
-            // Replace pending samples instead of blocking GDAL or queuing one
-            // UI event per feature. Percentages describe conversion only.
-            let _ = progress.force_send(event);
-        };
-        match VectorSource::open_with_load_progress(&path, &mut report) {
-            Ok(Some(opened)) => {
-                loaded.selected = opened.first().map(|source| SelectionId::Vector(source.id()));
-                loaded.vectors.extend(opened);
-            }
-            Ok(None) => match RasterSource::open(&path) {
-                Ok(opened) => {
-                    loaded.selected = opened.first().map(|source| SelectionId::Raster(source.metadata().id));
-                    loaded.sources.extend(opened);
-                }
-                Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
-            },
-            Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
-        }
-        log::info!(target: "map::vector_load", "path={path:?} stage=path-loaded elapsed={:?}", opened.elapsed());
+        load_path(path, index, path_count, &progress, &mut loaded);
     }
     loaded
+}
+
+fn load_path(path: PathBuf, index: usize, path_count: f64, progress: &async_channel::Sender<LoadProgress>, loaded: &mut LoadedDatasets) {
+    let opened = Instant::now();
+    let _ = progress.force_send(LoadProgress::Opening);
+    let mut progress_bucket = None;
+    let mut report = |event| {
+        let event = match event {
+            VectorLoadProgress::Converting(fraction) if fraction.is_finite() => {
+                let bucket = (fraction.clamp(0.0, 1.0) * 4.0) as u8;
+                if progress_bucket != Some(bucket) {
+                    progress_bucket = Some(bucket);
+                    log::info!(target: "map::vector_load", "path={path:?} stage=gdal-progress fraction={fraction:.3} since_path_open={:?}", opened.elapsed());
+                }
+                LoadProgress::Converting((index as f64 + fraction.clamp(0.0, 1.0)) / path_count)
+            }
+            VectorLoadProgress::Converting(_) => return,
+            VectorLoadProgress::Preparing => LoadProgress::Preparing,
+        };
+        // Replace pending samples instead of blocking GDAL or queuing one
+        // UI event per feature. Percentages describe conversion only.
+        let _ = progress.force_send(event);
+    };
+    match VectorSource::open_with_load_progress(&path, &mut report) {
+        Ok(Some(opened)) => {
+            loaded.selected = opened.first().map(|source| SelectionId::Vector(source.id()));
+            loaded.vectors.extend(opened);
+        }
+        Ok(None) => match RasterSource::open(&path) {
+            Ok(opened) => {
+                loaded.selected = opened.first().map(|source| SelectionId::Raster(source.metadata().id));
+                loaded.sources.extend(opened);
+            }
+            Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
+        },
+        Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
+    }
+    log::info!(target: "map::vector_load", "path={path:?} stage=path-loaded elapsed={:?}", opened.elapsed());
 }
 
 fn scroll_index(event: &ScrollEvent, scroll: &mut f32, ix: usize, count: usize, cx: &mut App) -> usize {
@@ -1070,6 +1126,34 @@ mod tests {
         }
     }
 
+    type PanelWindow = gpui_kit::WindowHandle<gpui_kit::base::Root>;
+
+    fn open_test_panel(cx: &mut TestAppContext, height: f32) -> (Entity<RasterPanel>, PanelWindow) {
+        let mut panel = None;
+        let handle = cx.open_window(size(px(900.0), px(height)), |window, cx| {
+            let view = cx.new(|cx| RasterPanel::new(window, cx));
+            panel = Some(view.clone());
+            let harness = cx.new(|_| PanelHarness(view));
+            gpui_kit::base::Root::new(harness, window, cx)
+        });
+        (panel.unwrap(), handle)
+    }
+
+    fn record_events(panel: &Entity<RasterPanel>, cx: &mut TestAppContext) -> Entity<Vec<RasterEvent>> {
+        cx.new(|cx: &mut Context<Vec<RasterEvent>>| {
+            cx.subscribe(panel, |events, _, event, _| {
+                events.push(RasterEvent {
+                    source: event.source(),
+                    vector_source: event.vector_source(),
+                    opacity: event.opacity(),
+                    fit: event.should_fit(),
+                });
+            })
+            .detach();
+            Vec::new()
+        })
+    }
+
     #[test]
     fn normalized_ranges_preserve_endpoints_and_remain_finite() {
         for range in [(1e-12, 9e-12), (-f64::MAX, f64::MAX), (0.0, f64::from_bits(1)), (1.0, 1.0 + f64::EPSILON)] {
@@ -1088,6 +1172,22 @@ mod tests {
             cx.set_reduce_motion(true);
         });
         let directory = tempfile::tempdir().unwrap();
+        let paths = numeric_vector_paths(&directory);
+        let (panel, handle) = open_test_panel(cx, 900.0);
+        let events = record_events(&panel, cx);
+        cx.update_window(handle.into(), |_, _, cx| panel.update(cx, |panel, cx| panel.open_paths(paths, cx)))
+            .unwrap();
+        cx.run_until_parked();
+        let original = open_numeric_property_search(&panel, handle, cx);
+        search_property(handle, "fraction", cx);
+        let styled = style_fraction_property(&panel, &original, handle, cx);
+        verify_vector_style_across_layers(&panel, &styled, handle, cx);
+        reset_vector_range_and_reopen_property(&panel, &styled, handle, cx);
+        search_property(handle, "tiny", cx);
+        verify_tiny_property_and_clear(&panel, &events, handle, cx);
+    }
+
+    fn numeric_vector_paths(directory: &tempfile::TempDir) -> Vec<PathBuf> {
         let raster = directory.path().join("raster.tif");
         crate::raster_source::test_support::write_raster(&raster, 4326, 1).unwrap();
         let plain = directory.path().join("plain.geojson");
@@ -1103,31 +1203,10 @@ mod tests {
             })).unwrap()).unwrap();
             paths.push(path);
         }
-        let mut panel = None;
-        let handle = cx.open_window(size(px(900.0), px(900.0)), |window, cx| {
-            let view = cx.new(|cx| RasterPanel::new(window, cx));
-            panel = Some(view.clone());
-            let harness = cx.new(|_| PanelHarness(view));
-            gpui_kit::base::Root::new(harness, window, cx)
-        });
-        let panel = panel.unwrap();
-        let events = cx.update(|cx| {
-            cx.new(|cx: &mut Context<Vec<RasterEvent>>| {
-                cx.subscribe(&panel, |events, _, event, _| {
-                    events.push(RasterEvent {
-                        source: event.source(),
-                        vector_source: event.vector_source(),
-                        opacity: event.opacity(),
-                        fit: event.should_fit(),
-                    });
-                })
-                .detach();
-                Vec::new()
-            })
-        });
-        cx.update_window(handle.into(), |_, _, cx| panel.update(cx, |panel, cx| panel.open_paths(paths, cx)))
-            .unwrap();
-        cx.run_until_parked();
+        paths
+    }
+
+    fn open_numeric_property_search(panel: &Entity<RasterPanel>, handle: PanelWindow, cx: &mut TestAppContext) -> Arc<VectorSource> {
         let original = cx
             .update_window(handle.into(), |_, window, cx| {
                 window.render_frame(cx);
@@ -1159,10 +1238,14 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
+        original
+    }
+
+    fn search_property(handle: PanelWindow, query: &str, cx: &mut TestAppContext) {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert_eq!(window.find("vector-property").expanded(), Some(true));
-            window.input("fraction", cx);
+            window.input(query, cx);
         })
         .unwrap();
         cx.run_until_parked();
@@ -1176,6 +1259,9 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
+    }
+
+    fn style_fraction_property(panel: &Entity<RasterPanel>, original: &VectorSource, handle: PanelWindow, cx: &mut TestAppContext) -> Arc<VectorSource> {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             let source = panel.read(cx).active_vector().unwrap();
@@ -1197,42 +1283,50 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
-        let styled = cx
-            .update_window(handle.into(), |_, window, cx| {
-                let source = panel.read(cx).active_vector().unwrap().clone();
-                assert_eq!(source.palette(), ColorMapPreset::Blues);
-                assert_eq!(source.range(), Some((0.200001, 0.800001)));
-                assert_eq!(source.source_json(), original.source_json());
-                assert_eq!(panel.read(cx).range_domain, (0.125, 0.875));
-                // Cross another numeric layer, a nonnumeric vector, and a raster.
-                window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
-                assert_eq!(panel.read(cx).active_vector().unwrap().property(), Some("a_count"));
-                assert_eq!(panel.read(cx).active_vector().unwrap().palette(), ColorMapPreset::Terrain);
-                window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
-                assert!(window.try_find("vector-property").is_none());
-                assert!(window.try_find("raster-palette").is_none());
-                assert!(window.try_find("raster-range-slider").is_none());
-                assert!(window.find("raster-opacity").visible());
-                window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
-                assert!(panel.read(cx).active().is_some());
-                assert!(window.try_find("vector-property").is_none());
-                assert!(window.find("raster-palette").visible());
-                for _ in 0..3 {
-                    window.scroll("raster-band", ScrollDelta::Lines(point(0.0, -1.0)), cx);
-                }
-                assert_eq!(panel.read(cx).active_vector().unwrap().style_id(), source.style_id());
-                assert_eq!(
-                    panel.read(cx).property.read(cx).selected_value().map(|value| value.as_str()),
-                    Some("b_fraction")
-                );
-                assert_eq!(panel.read(cx).min.read(cx).value().as_str(), "0.200001");
-                window.click("raster-min", cx);
-                window.press("secondary-a", cx);
-                window.input("2", cx);
-                source
-            })
-            .unwrap();
+        cx.update_window(handle.into(), |_, _, cx| {
+            let source = panel.read(cx).active_vector().unwrap().clone();
+            assert_eq!(source.palette(), ColorMapPreset::Blues);
+            assert_eq!(source.range(), Some((0.200001, 0.800001)));
+            assert_eq!(source.source_json(), original.source_json());
+            assert_eq!(panel.read(cx).range_domain, (0.125, 0.875));
+            source
+        })
+        .unwrap()
+    }
+
+    fn verify_vector_style_across_layers(panel: &Entity<RasterPanel>, source: &VectorSource, handle: PanelWindow, cx: &mut TestAppContext) {
+        cx.update_window(handle.into(), |_, window, cx| {
+            // Cross another numeric layer, a nonnumeric vector, and a raster.
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            assert_eq!(panel.read(cx).active_vector().unwrap().property(), Some("a_count"));
+            assert_eq!(panel.read(cx).active_vector().unwrap().palette(), ColorMapPreset::Terrain);
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            assert!(window.try_find("vector-property").is_none());
+            assert!(window.try_find("raster-palette").is_none());
+            assert!(window.try_find("raster-range-slider").is_none());
+            assert!(window.find("raster-opacity").visible());
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            assert!(panel.read(cx).active().is_some());
+            assert!(window.try_find("vector-property").is_none());
+            assert!(window.find("raster-palette").visible());
+            for _ in 0..3 {
+                window.scroll("raster-band", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+            }
+            assert_eq!(panel.read(cx).active_vector().unwrap().style_id(), source.style_id());
+            assert_eq!(
+                panel.read(cx).property.read(cx).selected_value().map(|value| value.as_str()),
+                Some("b_fraction")
+            );
+            assert_eq!(panel.read(cx).min.read(cx).value().as_str(), "0.200001");
+            window.click("raster-min", cx);
+            window.press("secondary-a", cx);
+            window.input("2", cx);
+        })
+        .unwrap();
         cx.run_until_parked();
+    }
+
+    fn reset_vector_range_and_reopen_property(panel: &Entity<RasterPanel>, styled: &VectorSource, handle: PanelWindow, cx: &mut TestAppContext) {
         cx.update_window(handle.into(), |_, window, cx| {
             assert!(panel.read(cx).error.is_some());
             assert_eq!(panel.read(cx).active_vector().unwrap().style_id(), styled.style_id());
@@ -1250,17 +1344,9 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| window.input("tiny", cx)).unwrap();
-        cx.run_until_parked();
-        cx.background_executor.advance_clock(std::time::Duration::from_millis(150));
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            window.press("down", cx);
-            window.press("enter", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
+    }
+
+    fn verify_tiny_property_and_clear(panel: &Entity<RasterPanel>, events: &Entity<Vec<RasterEvent>>, handle: PanelWindow, cx: &mut TestAppContext) {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert_eq!(panel.read(cx).active_vector().unwrap().property(), Some("tiny"));
@@ -1278,46 +1364,48 @@ mod tests {
         .unwrap();
     }
 
+    fn unscaling_paths(directory: &tempfile::TempDir) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for (name, coefficients) in [("plain", None), ("identity", Some((1.0, 0.0))), ("scaled", Some((0.5, -7.0)))] {
+            let path = directory.path().join(format!("{name}.tif"));
+            write_raster_with_coefficients(&path, coefficients);
+            paths.push(path);
+        }
+        paths
+    }
+
+    fn write_raster_with_coefficients(path: &std::path::Path, coefficients: Option<(f64, f64)>) {
+        crate::raster_source::test_support::write_raster(path, 4326, 1).unwrap();
+        if let Some((scale, offset)) = coefficients {
+            let dataset = gdal::Dataset::open_ex(
+                path,
+                gdal::DatasetOptions {
+                    open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut band = dataset.rasterband(1).unwrap();
+            band.set_scale(scale).unwrap();
+            band.set_offset(offset).unwrap();
+            dataset.close().unwrap();
+            if (scale, offset) == (1.0, 0.0) {
+                // GeoTIFF omits identity coefficients; PAM retains their explicit presence.
+                std::fs::write(
+                    path.with_extension("tif.aux.xml"),
+                    "<PAMDataset><PAMRasterBand band=\"1\"><Scale>1</Scale><Offset>0</Offset></PAMRasterBand></PAMDataset>",
+                )
+                .unwrap();
+            }
+        }
+    }
+
     #[gpui_kit::test]
     fn unscaling_checkbox_tracks_metadata_units_and_per_layer_state_through_the_ui(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
-        let mut paths = Vec::new();
-        for (name, coefficients) in [("plain", None), ("identity", Some((1.0, 0.0))), ("scaled", Some((0.5, -7.0)))] {
-            let path = dir.path().join(format!("{name}.tif"));
-            crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
-            if let Some((scale, offset)) = coefficients {
-                let dataset = gdal::Dataset::open_ex(
-                    &path,
-                    gdal::DatasetOptions {
-                        open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-                let mut band = dataset.rasterband(1).unwrap();
-                band.set_scale(scale).unwrap();
-                band.set_offset(offset).unwrap();
-                dataset.close().unwrap();
-                if (scale, offset) == (1.0, 0.0) {
-                    // GeoTIFF omits identity coefficients; PAM retains their explicit presence.
-                    std::fs::write(
-                        path.with_extension("tif.aux.xml"),
-                        "<PAMDataset><PAMRasterBand band=\"1\"><Scale>1</Scale><Offset>0</Offset></PAMRasterBand></PAMDataset>",
-                    )
-                    .unwrap();
-                }
-            }
-            paths.push(path);
-        }
-        let mut panel = None;
-        let handle = cx.open_window(size(px(900.0), px(760.0)), |window, cx| {
-            let view = cx.new(|cx| RasterPanel::new(window, cx));
-            panel = Some(view.clone());
-            let harness = cx.new(|_| PanelHarness(view));
-            gpui_kit::base::Root::new(harness, window, cx)
-        });
-        let panel = panel.unwrap();
+        let paths = unscaling_paths(&dir);
+        let (panel, handle) = open_test_panel(cx, 760.0);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("raster-unscaling").is_none());
@@ -1352,12 +1440,8 @@ mod tests {
             let id = panel.read(cx).active().unwrap().metadata().id;
             window.click("raster-unscaling", cx);
             assert_eq!(window.find("raster-unscaling").checked(), Some(false));
-            let state = panel.read(cx);
-            assert_eq!(state.active().unwrap().metadata().id, id);
-            assert_eq!(state.active().unwrap().range(), (24.0, 54.0));
-            assert_eq!(state.range_domain, (18.0, 136.0));
-            assert_eq!(state.min.read(cx).value().as_str(), "24.00");
-            assert_eq!(state.max.read(cx).value().as_str(), "54.00");
+            assert_eq!(panel.read(cx).active().unwrap().metadata().id, id);
+            assert_raw_range_controls(&panel, cx);
             window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
             assert!(
                 panel.read(cx).active().unwrap().has_scale_metadata(),
@@ -1371,17 +1455,7 @@ mod tests {
             assert_eq!(window.find("raster-unscaling").checked(), Some(false), "Mode must be retained per layer");
             window.click("raster-unscaling", cx);
             assert_eq!(window.find("raster-unscaling").checked(), Some(true));
-            for _ in 0..20 {
-                if window.find("raster-unscaling").focused() == Some(true) {
-                    break;
-                }
-                window.press("tab", cx);
-            }
-            assert_eq!(window.find("raster-unscaling").focused(), Some(true), "Checkbox must be reachable with Tab");
-            window.press("space", cx);
-            assert_eq!(window.find("raster-unscaling").checked(), Some(false), "Space must toggle the focused checkbox");
-            window.press("space", cx);
-            assert_eq!(window.find("raster-unscaling").checked(), Some(true));
+            verify_unscaling_keyboard_toggle(window, cx);
             assert_eq!(panel.read(cx).active().unwrap().range(), (5.0, 20.0));
             window.click("reset-raster-range", cx);
         })
@@ -1401,6 +1475,28 @@ mod tests {
         });
     }
 
+    fn assert_raw_range_controls(panel: &Entity<RasterPanel>, cx: &App) {
+        let state = panel.read(cx);
+        assert_eq!(state.active().unwrap().range(), (24.0, 54.0));
+        assert_eq!(state.range_domain, (18.0, 136.0));
+        assert_eq!(state.min.read(cx).value().as_str(), "24.00");
+        assert_eq!(state.max.read(cx).value().as_str(), "54.00");
+    }
+
+    fn verify_unscaling_keyboard_toggle(window: &mut Window, cx: &mut App) {
+        for _ in 0..20 {
+            if window.find("raster-unscaling").focused() == Some(true) {
+                break;
+            }
+            window.press("tab", cx);
+        }
+        assert_eq!(window.find("raster-unscaling").focused(), Some(true), "Checkbox must be reachable with Tab");
+        window.press("space", cx);
+        assert_eq!(window.find("raster-unscaling").checked(), Some(false), "Space must toggle the focused checkbox");
+        window.press("space", cx);
+        assert_eq!(window.find("raster-unscaling").checked(), Some(true));
+    }
+
     #[gpui_kit::test]
     fn mixed_datasets_support_selection_controls_opacity_and_clear_through_the_ui(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -1413,28 +1509,8 @@ mod tests {
             r#"{"type":"FeatureCollection","name":"Places","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[4,51]}}]}"#,
         )
         .unwrap();
-        let mut panel = None;
-        let handle = cx.open_window(size(px(900.0), px(760.0)), |window, cx| {
-            let view = cx.new(|cx| RasterPanel::new(window, cx));
-            panel = Some(view.clone());
-            let harness = cx.new(|_| PanelHarness(view));
-            gpui_kit::base::Root::new(harness, window, cx)
-        });
-        let panel = panel.unwrap();
-        let events = cx.update(|cx| {
-            cx.new(|cx: &mut Context<Vec<RasterEvent>>| {
-                cx.subscribe(&panel, |events, _, event, _| {
-                    events.push(RasterEvent {
-                        source: event.source(),
-                        vector_source: event.vector_source(),
-                        opacity: event.opacity(),
-                        fit: event.should_fit(),
-                    });
-                })
-                .detach();
-                Vec::new()
-            })
-        });
+        let (panel, handle) = open_test_panel(cx, 760.0);
+        let events = record_events(&panel, cx);
         cx.update_window(handle.into(), |_, _, cx| {
             panel.update(cx, |panel, cx| panel.prompt(cx));
         })
@@ -1445,18 +1521,41 @@ mod tests {
             Some(vec![vector, raster])
         });
         cx.run_until_parked();
+        cx.update(|cx| assert_mixed_datasets_loaded(&panel, &events, cx));
+        select_vector_and_change_opacity(&panel, handle, cx);
         cx.update(|cx| {
-            let panel = panel.read(cx);
-            assert!(!panel.loading);
-            assert!(panel.load_error.is_none());
-            assert_eq!(panel.sources.len(), 2);
-            assert_eq!(panel.vectors.len(), 1);
-            assert_eq!(panel.active().unwrap().metadata().band_nr, Some(1));
             let event = events.read(cx).last().unwrap();
-            assert!(event.source().is_some());
-            assert!(event.vector_source().is_none());
-            assert!(event.should_fit());
+            assert!(event.source().is_none());
+            assert_eq!(event.vector_source().unwrap().id(), panel.read(cx).active_vector().unwrap().id());
+            assert!((event.opacity() - 0.5).abs() < 0.05);
+            assert!(!event.should_fit());
+            assert!(events.read(cx).iter().all(|event| event.source().is_none() || event.vector_source().is_none()));
         });
+        verify_mixed_dataset_keyboard_selection_and_clear(&panel, &events, handle, cx);
+    }
+
+    fn assert_mixed_datasets_loaded(panel: &Entity<RasterPanel>, events: &Entity<Vec<RasterEvent>>, cx: &App) {
+        let panel = panel.read(cx);
+        assert!(!panel.loading);
+        assert!(panel.load_error.is_none());
+        assert_eq!(panel.sources.len(), 2);
+        assert_eq!(panel.vectors.len(), 1);
+        assert_eq!(panel.active().unwrap().metadata().band_nr, Some(1));
+        let event = events.read(cx).last().unwrap();
+        assert!(event.source().is_some());
+        assert!(event.vector_source().is_none());
+        assert!(event.should_fit());
+    }
+
+    fn assert_nonnumeric_vector_range_controls_absent(window: &Window) {
+        assert!(window.try_find("raster-palette").is_none());
+        assert!(window.try_find("raster-legend").is_none());
+        assert!(window.try_find("raster-range-slider").is_none());
+        assert!(window.try_find("raster-min").is_none());
+        assert!(window.try_find("raster-max").is_none());
+    }
+
+    fn select_vector_and_change_opacity(panel: &Entity<RasterPanel>, handle: PanelWindow, cx: &mut TestAppContext) {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert_eq!(window.find("raster-band").label(), Some("Layer"));
@@ -1469,11 +1568,7 @@ mod tests {
             assert!(panel.read(cx).active().is_none());
             assert!(panel.read(cx).active_vector().is_some());
             assert_eq!(panel.read(cx).bands.read(cx).selected_value().copied(), panel.read(cx).selected);
-            assert!(window.try_find("raster-palette").is_none());
-            assert!(window.try_find("raster-legend").is_none());
-            assert!(window.try_find("raster-range-slider").is_none());
-            assert!(window.try_find("raster-min").is_none());
-            assert!(window.try_find("raster-max").is_none());
+            assert_nonnumeric_vector_range_controls_absent(window);
             assert_eq!(window.find("toggle-raster-controls").label(), Some("Hide layer controls"));
             window.click("toggle-raster-controls", cx);
             assert!(window.try_find("raster-opacity").is_none());
@@ -1483,14 +1578,14 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
-        cx.update(|cx| {
-            let event = events.read(cx).last().unwrap();
-            assert!(event.source().is_none());
-            assert_eq!(event.vector_source().unwrap().id(), panel.read(cx).active_vector().unwrap().id());
-            assert!((event.opacity() - 0.5).abs() < 0.05);
-            assert!(!event.should_fit());
-            assert!(events.read(cx).iter().all(|event| event.source().is_none() || event.vector_source().is_none()));
-        });
+    }
+
+    fn verify_mixed_dataset_keyboard_selection_and_clear(
+        panel: &Entity<RasterPanel>,
+        events: &Entity<Vec<RasterEvent>>,
+        handle: PanelWindow,
+        cx: &mut TestAppContext,
+    ) {
         cx.update_window(handle.into(), |_, window, cx| {
             // Dropdown keyboard navigation must use the same order as scrolling.
             window.click("raster-band", cx);
@@ -1529,14 +1624,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bands.tif");
         crate::raster_source::test_support::write_raster(&path, 4326, 5).unwrap();
-        let mut panel = None;
-        let handle = cx.open_window(size(px(900.0), px(760.0)), |window, cx| {
-            let view = cx.new(|cx| RasterPanel::new(window, cx));
-            panel = Some(view.clone());
-            let harness = cx.new(|_| PanelHarness(view));
-            gpui_kit::base::Root::new(harness, window, cx)
-        });
-        let panel = panel.unwrap();
+        let (panel, handle) = open_test_panel(cx, 760.0);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             panel.update(cx, |panel, cx| panel.prompt(cx));
@@ -1567,14 +1655,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("raster.tif");
         crate::raster_source::test_support::write_raster(&path, 4326, 2).unwrap();
-        let mut panel = None;
-        let handle = cx.open_window(size(px(900.0), px(760.0)), |window, cx| {
-            let view = cx.new(|cx| RasterPanel::new(window, cx));
-            panel = Some(view.clone());
-            let harness = cx.new(|_| PanelHarness(view));
-            gpui_kit::base::Root::new(harness, window, cx)
-        });
-        let panel = panel.unwrap();
+        let (panel, handle) = open_test_panel(cx, 760.0);
+        verify_picker_cancel_and_open(&panel, handle, path, cx);
+        let original_band = cx.update(|cx| panel.read(cx).selected);
+        verify_band_navigation(&panel, handle, original_band, cx);
+        verify_raster_range_precision(&panel, handle, cx);
+        verify_raster_range_validation_and_repeated_commit(&panel, handle, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(window.try_find("fit-raster").is_none());
+            assert!(window.try_find("clear-rasters").is_none());
+            panel.update(cx, |panel, cx| panel.clear(window, cx));
+            window.render_frame(cx);
+            assert!(panel.read(cx).sources.is_empty());
+            assert!(panel.read(cx).selected.is_none());
+            assert!(window.try_find("raster-min").is_none());
+        })
+        .unwrap();
+    }
+
+    fn verify_picker_cancel_and_open(panel: &Entity<RasterPanel>, handle: PanelWindow, path: PathBuf, cx: &mut TestAppContext) {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("fit-raster").is_none());
@@ -1609,8 +1708,9 @@ mod tests {
                 "Opening a multiband raster must select its first band"
             );
         });
+    }
 
-        let original_band = cx.update(|cx| panel.read(cx).selected);
+    fn verify_band_navigation(panel: &Entity<RasterPanel>, handle: PanelWindow, original_band: Option<SelectionId>, cx: &mut TestAppContext) {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
@@ -1642,7 +1742,9 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         assert_ne!(cx.update(|cx| panel.read(cx).selected), original_band);
+    }
 
+    fn verify_raster_range_precision(panel: &Entity<RasterPanel>, handle: PanelWindow, cx: &mut TestAppContext) {
         cx.update_window(handle.into(), |_, window, cx| {
             for (id, value) in [("raster-min", "-1.23"), ("raster-max", "200.45")] {
                 window.render_frame(cx);
@@ -1682,7 +1784,9 @@ mod tests {
                 assert_eq!(input.read(cx).value().split_once('.').unwrap().1.len(), 2);
             }
         });
+    }
 
+    fn verify_raster_range_validation_and_repeated_commit(panel: &Entity<RasterPanel>, handle: PanelWindow, cx: &mut TestAppContext) {
         let original_id = cx.update(|cx| panel.read(cx).active().unwrap().id());
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
@@ -1729,16 +1833,5 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         assert_eq!(cx.update(|cx| panel.read(cx).active().unwrap().id()), applied_id);
-
-        cx.update_window(handle.into(), |_, window, cx| {
-            assert!(window.try_find("fit-raster").is_none());
-            assert!(window.try_find("clear-rasters").is_none());
-            panel.update(cx, |panel, cx| panel.clear(window, cx));
-            window.render_frame(cx);
-            assert!(panel.read(cx).sources.is_empty());
-            assert!(panel.read(cx).selected.is_none());
-            assert!(window.try_find("raster-min").is_none());
-        })
-        .unwrap();
     }
 }

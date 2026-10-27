@@ -246,8 +246,13 @@ fn run_renderer(
     let mut map = None;
     let mut current_request: Option<RenderRequest> = None;
     let mut next_frame = Instant::now();
-    let mut query = None;
-    let mut previous_features = None;
+    let mut query_progress = FeatureQueryProgress {
+        queries,
+        results: feature_results,
+        pending_result,
+        query: None,
+        previous_features: None,
+    };
     let mut progress = FrameProgress::default();
 
     loop {
@@ -257,14 +262,7 @@ fn run_renderer(
         };
         let request_changed = request.is_some();
         if let Some(request) = request {
-            if let Some(source) = &request.vector
-                && current_request.as_ref().and_then(|request| request.vector.as_ref().map(|source| source.id())) != Some(source.id())
-                && let Some(enqueued_at) = request.enqueued_at
-            {
-                log::info!(target: "map::vector_load",
-                    "source={} renderer received new vector request: layer={:?}, queue_delay={:?} (latest retained request)",
-                    source.id(), source.name(), enqueued_at.elapsed());
-            }
+            log_vector_request(&request, current_request.as_ref());
             // Even unchanged source IDs can accompany a new camera or style.
             progress.reset();
             current_request = Some(request);
@@ -273,49 +271,13 @@ fn run_renderer(
 
         let frame_started = Instant::now();
         let image = poll_map_image(&mut map, current_request, request_changed, next_frame, style_json.as_deref());
-        let mut query_changed = false;
-        while let Ok(latest) = queries.try_recv() {
-            query = latest;
-            previous_features = None;
-            query_changed = true;
-        }
-        // Re-query after streamed tiles repaint, even if the pointer is stationary.
-        if (query_changed || matches!(&image, Ok(Some(_))))
-            && let (Some(map), Some(query)) = (&mut map, &query)
-            && map.viewport == query.map.viewport
-            && map.camera == Some(query.map.camera)
-            && map.vector.as_ref().is_some_and(|source| source.id() == query.layer_id)
-        {
-            let features = map.query_vector_features(query.point).map_err(|error| format!("{error:#}"));
-            if previous_features.as_ref() != Some(&features) {
-                previous_features = Some(features.clone());
-                let result = FeatureQueryResult {
-                    revision: query.revision,
-                    features,
-                };
-                if let Err(async_channel::TrySendError::Full(result)) = feature_results.try_send(result) {
-                    let _ = pending_result.try_recv();
-                    let _ = feature_results.try_send(result);
-                }
+        query_progress.update(map.as_mut(), matches!(&image, Ok(Some(_))));
+        let Some((image, settled)) = progress.update_result(&mut map, image) else {
+            // Poll native resource/fade callbacks without busy-waiting.
+            if Instant::now() >= next_frame {
+                next_frame = Instant::now() + Duration::from_millis(16);
             }
-        }
-        let (image, settled) = match image {
-            Ok(image) => {
-                let settled = map.as_ref().is_some_and(NativeMap::is_settled);
-                let Some((image, settled)) = progress.update(image, settled) else {
-                    // Poll native resource/fade callbacks without busy-waiting.
-                    if Instant::now() >= next_frame {
-                        next_frame = Instant::now() + Duration::from_millis(16);
-                    }
-                    continue;
-                };
-                (Ok(image), settled)
-            }
-            Err(error) => {
-                map = None;
-                progress.reset();
-                (Err(error), false)
-            }
+            continue;
         };
         let frame = MapFrame {
             viewport: current_request.map.viewport,
@@ -335,6 +297,63 @@ fn run_renderer(
     }
 }
 
+fn log_vector_request(request: &RenderRequest, previous: Option<&RenderRequest>) {
+    if let Some(source) = &request.vector
+        && previous.and_then(|request| request.vector.as_ref().map(|source| source.id())) != Some(source.id())
+        && let Some(enqueued_at) = request.enqueued_at
+    {
+        log::info!(target: "map::vector_load",
+            "source={} renderer received new vector request: layer={:?}, queue_delay={:?} (latest retained request)",
+            source.id(), source.name(), enqueued_at.elapsed());
+    }
+}
+
+impl FeatureQuery {
+    fn matches_map(&self, map: &NativeMap) -> bool {
+        map.viewport == self.map.viewport && map.camera == Some(self.map.camera) && map.vector.as_ref().is_some_and(|source| source.id() == self.layer_id)
+    }
+}
+
+struct FeatureQueryProgress {
+    queries: async_channel::Receiver<Option<FeatureQuery>>,
+    results: async_channel::Sender<FeatureQueryResult>,
+    pending_result: async_channel::Receiver<FeatureQueryResult>,
+    query: Option<FeatureQuery>,
+    previous_features: Option<Result<Vec<serde_json::Value>, String>>,
+}
+
+impl FeatureQueryProgress {
+    fn update(&mut self, map: Option<&mut NativeMap>, image_changed: bool) {
+        let mut query_changed = false;
+        while let Ok(latest) = self.queries.try_recv() {
+            self.query = latest;
+            self.previous_features = None;
+            query_changed = true;
+        }
+        // Re-query after streamed tiles repaint, even if the pointer is stationary.
+        if !query_changed && !image_changed {
+            return;
+        }
+        let (Some(map), Some(query)) = (map, &self.query) else { return };
+        if !query.matches_map(map) {
+            return;
+        }
+        let features = map.query_vector_features(query.point).map_err(|error| format!("{error:#}"));
+        if self.previous_features.as_ref() == Some(&features) {
+            return;
+        }
+        self.previous_features = Some(features.clone());
+        let result = FeatureQueryResult {
+            revision: query.revision,
+            features,
+        };
+        if let Err(async_channel::TrySendError::Full(result)) = self.results.try_send(result) {
+            let _ = self.pending_result.try_recv();
+            let _ = self.results.try_send(result);
+        }
+    }
+}
+
 // Retain only the newest image for this request, sharing its pixels with GPUI.
 // An idle callback can arrive on a later tick without producing another texture.
 #[derive(Default)]
@@ -347,6 +366,19 @@ impl FrameProgress {
     fn reset(&mut self) {
         self.latest = None;
         self.settled = false;
+    }
+
+    fn update_result(&mut self, map: &mut Option<NativeMap>, image: Result<Option<Arc<RenderImage>>>) -> Option<(Result<Arc<RenderImage>>, bool)> {
+        match image {
+            Ok(image) => self
+                .update(image, map.as_ref().is_some_and(NativeMap::is_settled))
+                .map(|(image, settled)| (Ok(image), settled)),
+            Err(error) => {
+                *map = None;
+                self.reset();
+                Some((Err(error), false))
+            }
+        }
     }
 
     fn update(&mut self, image: Option<Arc<RenderImage>>, settled: bool) -> Option<(Arc<RenderImage>, bool)> {
@@ -387,33 +419,12 @@ fn poll_map_image(
     style_json: Option<&str>,
 ) -> Result<Option<Arc<RenderImage>>> {
     if map.as_ref().is_none_or(|map| map.viewport.scale != request.map.viewport.scale) {
-        let started = request.enqueued_at.map(|_| Instant::now());
-        *map = Some(match style_json {
-            Some(json) => NativeMap::with_style_source(request.map.viewport, request.basemap, Some(json))?,
-            None => NativeMap::with_basemap(request.map.viewport, request.basemap)?,
-        });
-        if let (Some(source), Some(started)) = (&request.vector, started) {
-            log::info!(target: "map::vector_load", "source={} renderer initialization and basemap style load: elapsed={:?}",
-                source.id(), started.elapsed());
-        }
+        *map = Some(initialize_map(request, style_json)?);
         request_changed = true;
     }
     let map = map.as_mut().context("Map renderer unavailable")?;
     if request_changed {
-        {
-            let mut numeric = map.numeric.borrow_mut();
-            numeric.set_reduce_motion(request.reduce_motion);
-            numeric.set_debug(request.tile_boundaries);
-        }
-        map.set_basemap(request.basemap)?;
-        map.renderer.set_debug_flags(if request.tile_boundaries {
-            MapDebugOptions::TileBorders
-        } else {
-            MapDebugOptions::NoDebug
-        });
-        map.set_raster(request.raster.clone(), request.opacity)?;
-        map.set_vector(request.vector.clone(), request.opacity, &request.vector_color)?;
-        map.apply_request(request.map);
+        map.apply_render_request(request)?;
     }
     if Instant::now() < next_frame {
         return Ok(None);
@@ -421,6 +432,19 @@ fn poll_map_image(
     let Some(texture) = map.poll_frame()? else { return Ok(None) };
     let pixels = map.read_frame(&texture)?;
     Ok(Some(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]))))
+}
+
+fn initialize_map(request: &RenderRequest, style_json: Option<&str>) -> Result<NativeMap> {
+    let started = request.enqueued_at.map(|_| Instant::now());
+    let map = match style_json {
+        Some(json) => NativeMap::with_style_source(request.map.viewport, request.basemap, Some(json))?,
+        None => NativeMap::with_basemap(request.map.viewport, request.basemap)?,
+    };
+    if let (Some(source), Some(started)) = (&request.vector, started) {
+        log::info!(target: "map::vector_load", "source={} renderer initialization and basemap style load: elapsed={:?}",
+            source.id(), started.elapsed());
+    }
+    Ok(map)
 }
 
 // Style reloads deinitialize native hosts, but this renderer keeps the same
@@ -590,6 +614,24 @@ impl NativeMap {
         Ok(())
     }
 
+    fn apply_render_request(&mut self, request: &RenderRequest) -> Result<()> {
+        {
+            let mut numeric = self.numeric.borrow_mut();
+            numeric.set_reduce_motion(request.reduce_motion);
+            numeric.set_debug(request.tile_boundaries);
+        }
+        self.set_basemap(request.basemap)?;
+        self.renderer.set_debug_flags(if request.tile_boundaries {
+            MapDebugOptions::TileBorders
+        } else {
+            MapDebugOptions::NoDebug
+        });
+        self.set_raster(request.raster.clone(), request.opacity)?;
+        self.set_vector(request.vector.clone(), request.opacity, &request.vector_color)?;
+        self.apply_request(request.map);
+        Ok(())
+    }
+
     fn set_raster(&mut self, raster: Option<Arc<RasterSource>>, opacity: f32) -> Result<()> {
         let style_changed = self.raster.as_ref().map(|source| source.id()) != raster.as_ref().map(|source| source.id());
         if !style_changed && self.opacity == opacity {
@@ -599,33 +641,41 @@ impl NativeMap {
         let retain_numeric = self.raster.as_ref().is_some_and(|source| source.is_numeric()) && raster.as_ref().is_some_and(|source| source.is_numeric());
         let dpi = (self.viewport.scale.ceil() as u8).clamp(1, 4);
         let numeric_source = raster.as_ref().filter(|source| source.is_numeric()).cloned();
-        if let Some(source) = raster.as_ref().filter(|source| !source.is_numeric()) {
-            RasterTiles::init()?.register(source)?;
-        }
-        if changed && !retain_numeric {
-            self.renderer.style().remove_layer("local-raster-layer");
-            self.renderer.style().remove_source("local-raster");
-            if let Some(source) = &raster {
-                if source.is_numeric() {
-                    self.renderer.style().add_wgpu_custom_layer(
-                        "local-raster-layer",
-                        RetainedRasterLayerHost(RasterLayerHost::new(self.numeric.clone())),
-                        None,
-                    )?;
-                } else {
-                    self.renderer
-                        .style()
-                        .add_source(AnySource::from_json_value("local-raster", &source.source_json(dpi))?)?;
-                    self.renderer.style().add_layer(AnyLayer::from_json_value(&source.layer_json(opacity))?)?;
-                }
-            }
-        } else if let Some(source) = raster.as_ref().filter(|source| !source.is_numeric()) {
-            self.renderer.style().remove_layer("local-raster-layer");
-            self.renderer.style().add_layer(AnyLayer::from_json_value(&source.layer_json(opacity))?)?;
-        }
+        self.update_raster_attachment(raster.as_ref(), opacity, dpi, changed && !retain_numeric)?;
         self.numeric.borrow_mut().set_source(numeric_source, opacity, dpi);
         self.raster = raster;
         self.opacity = opacity;
+        Ok(())
+    }
+
+    fn update_raster_attachment(&mut self, source: Option<&Arc<RasterSource>>, opacity: f32, dpi: u8, replace: bool) -> Result<()> {
+        if let Some(source) = source.filter(|source| !source.is_numeric()) {
+            RasterTiles::init()?.register(source)?;
+        }
+        if replace {
+            self.renderer.style().remove_layer("local-raster-layer");
+            self.renderer.style().remove_source("local-raster");
+            if let Some(source) = source {
+                self.add_raster_attachment(source, opacity, dpi)?;
+            }
+        } else if let Some(source) = source.filter(|source| !source.is_numeric()) {
+            self.renderer.style().remove_layer("local-raster-layer");
+            self.renderer.style().add_layer(AnyLayer::from_json_value(&source.layer_json(opacity))?)?;
+        }
+        Ok(())
+    }
+
+    fn add_raster_attachment(&mut self, source: &RasterSource, opacity: f32, dpi: u8) -> Result<()> {
+        if source.is_numeric() {
+            self.renderer
+                .style()
+                .add_wgpu_custom_layer("local-raster-layer", RetainedRasterLayerHost(RasterLayerHost::new(self.numeric.clone())), None)?;
+        } else {
+            self.renderer
+                .style()
+                .add_source(AnySource::from_json_value("local-raster", &source.source_json(dpi))?)?;
+            self.renderer.style().add_layer(AnyLayer::from_json_value(&source.layer_json(opacity))?)?;
+        }
         Ok(())
     }
 
@@ -657,49 +707,11 @@ impl NativeMap {
                 .map(VectorLoadTiming::new);
         }
         let installation_started = self.vector_phase_started().filter(|_| changed);
-        if let Some(source) = &self.vector {
-            for kind in ["fill", "line", "circle"] {
-                self.renderer.style().remove_layer(format!("local-vector-{}-{kind}", source.id()));
-            }
-        }
+        self.remove_vector_layers();
         if changed {
-            #[cfg(test)]
-            {
-                self.vector_source_updates += 1;
-            }
-            self.renderer.style().remove_source("local-vector");
-            if let Some(source) = &vector {
-                if let Some(json) = source.geojson() {
-                    let started = self.vector_phase_started();
-                    let data = GeoJson::from_json_str(json)?;
-                    self.log_vector_phase("GeoJson::from_json_str", started);
-                    let mut native_source = GeoJsonSource::new("local-vector");
-                    let started = self.vector_phase_started();
-                    native_source.set_geojson(&data);
-                    self.log_vector_phase("GeoJsonSource::set_geojson (including synchronous native copy)", started);
-                    let started = self.vector_phase_started();
-                    self.renderer.style().add_source(native_source)?;
-                    self.log_vector_phase("style source add", started);
-                    let started = self.vector_phase_started();
-                    drop(data);
-                    self.log_vector_phase("temporary native GeoJson drop", started);
-                } else if let Some(url) = source.tile_url() {
-                    let started = self.vector_phase_started();
-                    self.renderer.style().add_source(AnySource::from_json_value(
-                        "local-vector",
-                        &serde_json::json!({ "type": "vector", "url": url }),
-                    )?)?;
-                    self.log_vector_phase("tiled style source creation/add", started);
-                }
-            }
+            self.replace_vector_source(vector.as_deref())?;
         }
-        if let Some(source) = &vector {
-            let started = installation_started.map(|_| Instant::now());
-            for layer in source.layers_json(opacity, color) {
-                self.renderer.style().add_layer(AnyLayer::from_json_value(&layer)?)?;
-            }
-            self.log_vector_phase("layer creation/add", started);
-        }
+        self.add_vector_layers(vector.as_deref(), opacity, color, installation_started)?;
         self.log_vector_phase("vector installation complete (not yet rendered)", installation_started);
         self.vector = vector;
         self.vector_opacity = opacity;
@@ -707,10 +719,84 @@ impl NativeMap {
         Ok(())
     }
 
+    fn add_vector_layers(&mut self, source: Option<&VectorSource>, opacity: f32, color: &str, installation_started: Option<Instant>) -> Result<()> {
+        if let Some(source) = source {
+            let started = installation_started.map(|_| Instant::now());
+            for layer in source.layers_json(opacity, color) {
+                self.renderer.style().add_layer(AnyLayer::from_json_value(&layer)?)?;
+            }
+            self.log_vector_phase("layer creation/add", started);
+        }
+        Ok(())
+    }
+
+    fn remove_vector_layers(&mut self) {
+        if let Some(source) = &self.vector {
+            for kind in ["fill", "line", "circle"] {
+                self.renderer.style().remove_layer(format!("local-vector-{}-{kind}", source.id()));
+            }
+        }
+    }
+
+    fn replace_vector_source(&mut self, source: Option<&VectorSource>) -> Result<()> {
+        #[cfg(test)]
+        {
+            self.vector_source_updates += 1;
+        }
+        self.renderer.style().remove_source("local-vector");
+        let Some(source) = source else { return Ok(()) };
+        if let Some(json) = source.geojson() {
+            let started = self.vector_phase_started();
+            let data = GeoJson::from_json_str(json)?;
+            self.log_vector_phase("GeoJson::from_json_str", started);
+            let mut native_source = GeoJsonSource::new("local-vector");
+            let started = self.vector_phase_started();
+            native_source.set_geojson(&data);
+            self.log_vector_phase("GeoJsonSource::set_geojson (including synchronous native copy)", started);
+            let started = self.vector_phase_started();
+            self.renderer.style().add_source(native_source)?;
+            self.log_vector_phase("style source add", started);
+            let started = self.vector_phase_started();
+            drop(data);
+            self.log_vector_phase("temporary native GeoJson drop", started);
+        } else if let Some(url) = source.tile_url() {
+            let started = self.vector_phase_started();
+            self.renderer.style().add_source(AnySource::from_json_value(
+                "local-vector",
+                &serde_json::json!({ "type": "vector", "url": url }),
+            )?)?;
+            self.log_vector_phase("tiled style source creation/add", started);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn render(&mut self, request: MapRequest) -> Result<RgbaImage> {
         let texture = self.render_texture(request)?;
         self.read_frame(&texture)
+    }
+
+    #[cfg(test)]
+    fn render_raster(&mut self, request: MapRequest, source: Option<Arc<RasterSource>>, opacity: f32) -> Result<RgbaImage> {
+        self.set_raster(source, opacity)?;
+        self.render(request)
+    }
+
+    #[cfg(test)]
+    fn render_vector(&mut self, request: MapRequest, source: Option<Arc<VectorSource>>, opacity: f32, color: &str) -> Result<RgbaImage> {
+        self.set_vector(source, opacity, color)?;
+        self.render(request)
+    }
+
+    #[cfg(test)]
+    fn required_raster_image(&mut self, message: &str) -> Result<RgbaImage> {
+        self.poll_raster_image()?.context(message.to_owned())
+    }
+
+    #[cfg(test)]
+    fn poll_raster_image(&mut self) -> Result<Option<RgbaImage>> {
+        let Some(texture) = self.poll_frame()? else { return Ok(None) };
+        self.readback.read(&texture, &self.device, &self.queue).map(Some)
     }
 
     fn vector_phase_started(&self) -> Option<Instant> {
@@ -795,6 +881,19 @@ impl NativeMap {
         self.deadline = Instant::now() + Duration::from_secs(30);
     }
 
+    fn record_vector_render_time(&mut self, started: Option<Instant>) {
+        if let (Some(timing), Some(started)) = (&mut self.vector_load, started) {
+            let elapsed = started.elapsed();
+            timing.frames += 1;
+            timing.rendering += elapsed;
+            if timing.frames == 1 {
+                log::info!(target: "map::vector_load",
+                    "source={} first native frame render/take_texture (includes run-loop dispatch; vector pixels NOT verified): elapsed={:?}, since_install={:?}",
+                    timing.source_id, elapsed, timing.started.elapsed());
+            }
+        }
+    }
+
     fn poll_frame(&mut self) -> Result<Option<wgpu::Texture>> {
         let started = self.vector_phase_started();
         RunLoopHandle::current().tick();
@@ -808,16 +907,7 @@ impl NativeMap {
             self.idle.set(false);
             self.renderer.render_once();
             let texture = self.renderer.take_texture().context("MapLibre did not produce a wgpu texture")?;
-            if let (Some(timing), Some(started)) = (&mut self.vector_load, started) {
-                let elapsed = started.elapsed();
-                timing.frames += 1;
-                timing.rendering += elapsed;
-                if timing.frames == 1 {
-                    log::info!(target: "map::vector_load",
-                        "source={} first native frame render/take_texture (includes run-loop dispatch; vector pixels NOT verified): elapsed={:?}, since_install={:?}",
-                        timing.source_id, elapsed, timing.started.elapsed());
-                }
-            }
+            self.record_vector_render_time(started);
             return Ok(Some(texture));
         }
         self.finish_vector_timing_if_idle();
@@ -867,8 +957,7 @@ mod tests {
     fn basemap_reload_preserves_camera_and_cached_numeric_raster() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("raster.tif");
-        crate::raster_source::test_support::write_raster(&path, 4326, 1)?;
-        let source = RasterSource::open(&path)?.remove(0);
+        let source = open_raster_fixture(&path, 4326, 1)?.remove(0);
         let viewport = Viewport {
             width: NonZeroU32::new(512).unwrap(),
             height: NonZeroU32::new(512).unwrap(),
@@ -880,44 +969,10 @@ mod tests {
         };
         let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
         let dark_background = map.render(request)?;
-        map.set_raster(Some(source.clone()), 0.65)?;
-        let dark_raster = map.render(request)?;
-        let numeric = map.numeric.clone();
-        let device = map.device.clone();
-        let counts = numeric.borrow().tile_counts();
-        let camera_updates = map.camera_updates;
-        assert!(counts.0 > 0 && counts.1 > 0);
-        assert_ne!(dark_raster.as_raw(), dark_background.as_raw());
-        // A reload must reuse uploaded tiles even when their file is unavailable.
-        std::fs::rename(&path, path.with_extension("cached.tif"))?;
-
+        let dark_raster = map.render_raster(request, Some(source.clone()), 0.65)?;
+        let light_raster = assert_numeric_basemap_roundtrip(&mut map, request, &dark_raster, &dark_background, &path)?;
         map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
-        assert_eq!(map.basemap, BasemapStyle::Light);
-        assert!(map.camera == Some(request.camera));
-        assert_eq!(map.device, device);
-        assert!(Rc::ptr_eq(&map.numeric, &numeric));
-        let light_raster = map.render(request)?;
-        assert_ne!(
-            light_raster.as_raw(),
-            dark_raster.as_raw(),
-            "The new basemap must be visible through the overlay"
-        );
-        assert_eq!(numeric.borrow().tile_counts(), counts, "Reloading must not request or upload numeric tiles");
-
-        // Requesting the current basemap must not replace the offline style.
-        map.set_basemap(BasemapStyle::Light)?;
-        map.load_style(BasemapStyle::Dark, Some(DARK_STYLE))?;
-        assert_eq!(
-            map.render(request)?.as_raw(),
-            dark_raster.as_raw(),
-            "A round trip must preserve the native camera and overlay"
-        );
-        assert_eq!(map.camera_updates, camera_updates);
-        assert_eq!(numeric.borrow().tile_counts(), counts);
-
-        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
-        map.set_raster(None, 1.0)?;
-        let light_background = map.render(request)?;
+        let light_background = map.render_raster(request, None, 1.0)?;
         assert!(light_background.pixels().all(|pixel| pixel.0 == [240, 240, 240, 255]));
         let covered = light_raster.pixels().zip(light_background.pixels()).filter(|(a, b)| a != b).count();
         assert!(
@@ -932,19 +987,7 @@ mod tests {
     fn basemap_reload_reattaches_color_raster_source_and_layer() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("image.mbtiles");
-        let db = sqlite::Connection::new(&path, sqlite::AccessMode::Create)?;
-        db.execute_sql_statements(
-            "CREATE TABLE metadata (name TEXT, value TEXT);
-            INSERT INTO metadata VALUES ('format','png'), ('bounds','-180,-85,180,85'), ('minzoom','0'), ('maxzoom','0');
-            CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);",
-        )?;
-        let mut png = std::io::Cursor::new(Vec::new());
-        RgbaImage::from_pixel(256, 256, image::Rgba([0, 255, 0, 255])).write_to(&mut png, image::ImageFormat::Png)?;
-        let mut insert = db.prepare_statement("INSERT INTO tiles VALUES (0,0,0,?1) RETURNING zoom_level")?;
-        insert.bind_blob(1, png.get_ref())?;
-        ensure!(insert.next().is_some(), "Could not create fixture tile: {}", db.last_error());
-        drop(insert);
-        drop(db);
+        write_color_mbtiles_fixture(&path)?;
         let source = RasterSource::open(&path)?.remove(0);
         assert!(!source.is_numeric());
         let viewport = Viewport {
@@ -957,8 +1000,7 @@ mod tests {
             camera: MapCamera::default(),
         };
         let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
-        map.set_raster(Some(source), 1.0)?;
-        let before = map.render(request)?;
+        let before = map.render_raster(request, Some(source), 1.0)?;
         assert_eq!(before.get_pixel(128, 128).0, [0, 255, 0, 255]);
         let camera_updates = map.camera_updates;
 
@@ -970,35 +1012,80 @@ mod tests {
             "The color source and layer must survive a basemap change at the same camera"
         );
         assert_eq!(map.camera_updates, camera_updates);
-        map.set_raster(None, 1.0)?;
-        let cleared = map.render(request)?;
+        let cleared = map.render_raster(request, None, 1.0)?;
         assert!(cleared.pixels().all(|pixel| pixel.0 == [240, 240, 240, 255]));
         Ok(())
+    }
+
+    fn assert_mixed_vector_coverage(rendered: &RgbaImage, background: &RgbaImage, camera: MapCamera) {
+        let mut covered = [0; 3];
+        for (x, y, pixel) in rendered.enumerate_pixels() {
+            if pixel == background.get_pixel(x, y) {
+                continue;
+            }
+            let longitude = camera.coordinate_at((f64::from(x) - 256.0, f64::from(y) - 256.0)).longitude;
+            let geometry = if longitude < -1.0 {
+                0
+            } else if longitude > 1.0 {
+                2
+            } else {
+                1
+            };
+            covered[geometry] += 1;
+        }
+        assert!(covered[0] > 1_000, "Polygon fill must produce pixels: {covered:?}");
+        assert!(covered[1] > 100, "Line geometry must produce pixels: {covered:?}");
+        assert!(covered[2] > 10, "Point geometry must produce pixels: {covered:?}");
+    }
+
+    fn assert_vector_opacity_roundtrip(
+        map: &mut NativeMap,
+        request: MapRequest,
+        source: &Arc<VectorSource>,
+        color: &str,
+        translucent: &RgbaImage,
+        background: &RgbaImage,
+    ) -> Result<()> {
+        map.set_vector(Some(source.clone()), 0.0, color)?;
+        assert_eq!(map.render(request)?.as_raw(), background.as_raw(), "Zero opacity must reveal the basemap");
+        map.set_vector(Some(source.clone()), 0.5, color)?;
+        assert_eq!(map.render(request)?.as_raw(), translucent.as_raw());
+        Ok(())
+    }
+
+    fn count_color(image: &RgbaImage, color: [u8; 4]) -> usize {
+        image.pixels().filter(|pixel| pixel.0 == color).count()
+    }
+
+    fn assert_numeric_vector_palette(first: &RgbaImage) {
+        assert!(
+            count_color(first, [0, 0, 0, 255]) > 1_000,
+            "Low-value polygon must use the palette's first color"
+        );
+        assert!(
+            count_color(first, [255, 255, 255, 255]) > 5,
+            "High-value point must use the palette's last color"
+        );
+        assert!(
+            count_color(first, [255, 0, 255, 255]) > 10,
+            "Null and missing values must use the fallback color"
+        );
+    }
+
+    fn assert_numeric_vector_property_change(first: &RgbaImage, reversed: &RgbaImage) {
+        assert!(
+            count_color(reversed, [255, 255, 255, 255]) > 1_000,
+            "Changing property must recolor the polygon"
+        );
+        assert!(count_color(reversed, [0, 0, 0, 255]) > 5, "Changing property must recolor the point");
+        assert_eq!(count_color(first, [255, 0, 255, 255]), count_color(reversed, [255, 0, 255, 255]));
     }
 
     #[test]
     #[ignore = "requires a wgpu-compatible graphics device; uses only local vector data"]
     fn local_vectors_render_restyle_switch_clear_and_survive_basemap_reload_without_network() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let path = dir.path().join("mixed.geojson");
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&serde_json::json!({
-                "type": "FeatureCollection",
-                "features": [
-                    {"type": "Feature", "properties": {}, "geometry": {
-                        "type": "Polygon", "coordinates": [[[-5,-2],[-2,-2],[-2,2],[-5,2],[-5,-2]]]
-                    }},
-                    {"type": "Feature", "properties": {}, "geometry": {
-                        "type": "LineString", "coordinates": [[0,-2],[0,2]]
-                    }},
-                    {"type": "Feature", "properties": {}, "geometry": {
-                        "type": "Point", "coordinates": [5,0]
-                    }}
-                ]
-            }))?,
-        )?;
-        let source = VectorSource::open(&path)?.context("Expected mixed vector data")?.remove(0);
+        let source = open_mixed_vector_fixture(dir.path())?;
         let viewport = Viewport {
             width: NonZeroU32::new(512).unwrap(),
             height: NonZeroU32::new(512).unwrap(),
@@ -1010,94 +1097,18 @@ mod tests {
         };
         let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
         let background = map.render(request)?;
-        map.set_vector(Some(source.clone()), 1.0, "#3b82f6")?;
-        let rendered = map.render(request)?;
-        let mut covered = [0; 3];
-        for (x, y, pixel) in rendered.enumerate_pixels() {
-            if pixel != background.get_pixel(x, y) {
-                let longitude = request.camera.coordinate_at((f64::from(x) - 256.0, f64::from(y) - 256.0)).longitude;
-                let geometry = if longitude < -1.0 {
-                    0
-                } else if longitude > 1.0 {
-                    2
-                } else {
-                    1
-                };
-                covered[geometry] += 1;
-            }
-        }
-        assert!(covered[0] > 1_000, "Polygon fill must produce pixels: {covered:?}");
-        assert!(covered[1] > 100, "Line geometry must produce pixels: {covered:?}");
-        assert!(covered[2] > 10, "Point geometry must produce pixels: {covered:?}");
-        let camera_updates = map.camera_updates;
-
-        map.set_vector(Some(source.clone()), 0.5, "#3b82f6")?;
-        let translucent = map.render(request)?;
-        assert_ne!(translucent.as_raw(), rendered.as_raw(), "Opacity changes must repaint vector layers");
-        assert_ne!(translucent.as_raw(), background.as_raw());
-        map.set_vector(Some(source.clone()), 0.0, "#3b82f6")?;
-        assert_eq!(map.render(request)?.as_raw(), background.as_raw(), "Zero opacity must reveal the basemap");
-        map.set_vector(Some(source.clone()), 0.5, "#3b82f6")?;
-        assert_eq!(map.render(request)?.as_raw(), translucent.as_raw());
-
-        // Reattach at unchanged opacity and retain the native camera despite style defaults.
-        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
-        let light_vector = map.render(request)?;
-        assert_ne!(light_vector.as_raw(), translucent.as_raw());
-        map.load_style(BasemapStyle::Dark, Some(DARK_STYLE))?;
-        assert_eq!(
-            map.render(request)?.as_raw(),
-            translucent.as_raw(),
-            "A style round trip must restore all vector layers"
-        );
-        assert_eq!(map.camera_updates, camera_updates);
-
-        let replacement_path = dir.path().join("replacement.geojson");
-        std::fs::write(
-            &replacement_path,
-            r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[0,0]}}]}"#,
-        )?;
-        let replacement = VectorSource::open(&replacement_path)?.context("Expected replacement vector data")?.remove(0);
-        assert_ne!(source.id(), replacement.id());
-        map.set_vector(Some(replacement), 1.0, "#3b82f6")?;
-        let switched = map.render(request)?;
-        let changed = switched.pixels().zip(background.pixels()).filter(|(a, b)| a != b).count();
-        assert!(
-            changed > 10 && changed < 200,
-            "Switching must remove the previous source's polygon and line layers, got {changed} pixels"
-        );
-        map.set_vector(None, 1.0, "#3b82f6")?;
-        assert_eq!(
-            map.render(request)?.as_raw(),
-            background.as_raw(),
-            "Clearing must remove vector layers and their source"
-        );
-        map.set_vector(Some(source), 1.0, "#3b82f6")?;
-        assert_eq!(map.render(request)?.as_raw(), rendered.as_raw(), "A cleared source must be installable again");
+        let rendered = map.render_vector(request, Some(source.clone()), 1.0, "#3b82f6")?;
+        assert_mixed_vector_coverage(&rendered, &background, request.camera);
+        assert_vector_restyles_survive_basemap_reload(&mut map, request, &source, &rendered, &background)?;
+        assert_vector_switch_clear_and_reinstall(&mut map, request, source, dir.path(), &background, &rendered)?;
         Ok(())
     }
 
     #[test]
     #[ignore = "requires a wgpu-compatible graphics device; uses only local vector data"]
     fn numeric_vectors_render_property_palette_and_range_changes_without_reloading_sources() -> Result<()> {
-        use inf::colormap::ColorMapPreset;
-
         let directory = tempfile::tempdir()?;
-        let path = directory.path().join("numeric.geojson");
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&serde_json::json!({
-                "type": "FeatureCollection", "features": [
-                    {"type":"Feature","properties":{"a":0.0,"b":10},"geometry":{"type":"Polygon","coordinates":[[[-5,-2],[-2,-2],[-2,2],[-5,2],[-5,-2]]]}},
-                    {"type":"Feature","properties":{"a":10.0,"b":0},"geometry":{"type":"Point","coordinates":[0,0]}},
-                    {"type":"Feature","properties":{"a":null,"b":null},"geometry":{"type":"Point","coordinates":[4,0]}},
-                    {"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[6,0]}}
-                ]
-            }))?,
-        )?;
-        let source = VectorSource::open(&path)?.context("Expected numeric vector data")?.remove(0);
-        std::fs::remove_file(path)?;
-        let source = source.restyled(ColorMapPreset::Gray, (0.0, 10.0))?;
+        let source = open_numeric_vector_fixture(directory.path())?;
         let viewport = Viewport {
             width: NonZeroU32::new(512).unwrap(),
             height: NonZeroU32::new(512).unwrap(),
@@ -1109,50 +1120,20 @@ mod tests {
         };
         let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
         let background = map.render(request)?;
-        map.set_vector(Some(source.clone()), 1.0, "#ff00ff")?;
-        let first = map.render(request)?;
-        let pixels = |image: &RgbaImage, color: [u8; 4]| image.pixels().filter(|pixel| pixel.0 == color).count();
-        assert!(pixels(&first, [0, 0, 0, 255]) > 1_000, "Low-value polygon must use the palette's first color");
-        assert!(pixels(&first, [255, 255, 255, 255]) > 5, "High-value point must use the palette's last color");
-        assert!(pixels(&first, [255, 0, 255, 255]) > 10, "Null and missing values must use the fallback color");
+        let first = map.render_vector(request, Some(source.clone()), 1.0, "#ff00ff")?;
+
+        assert_numeric_vector_palette(&first);
         let camera_updates = map.camera_updates;
         let source_updates = map.vector_source_updates;
 
-        let selected = source.with_property("b")?;
-        map.set_vector(Some(selected.clone()), 1.0, "#ff00ff")?;
-        let reversed = map.render(request)?;
-        assert!(pixels(&reversed, [255, 255, 255, 255]) > 1_000, "Changing property must recolor the polygon");
-        assert!(pixels(&reversed, [0, 0, 0, 255]) > 5, "Changing property must recolor the point");
-        assert_eq!(pixels(&first, [255, 0, 255, 255]), pixels(&reversed, [255, 0, 255, 255]));
-
-        let widened = selected.restyled(ColorMapPreset::Gray, (0.0, 20.0))?;
-        map.set_vector(Some(widened.clone()), 1.0, "#ff00ff")?;
-        let ranged = map.render(request)?;
-        assert_ne!(ranged.as_raw(), reversed.as_raw(), "Range changes must affect numeric colors");
-        assert!(pixels(&ranged, [255, 255, 255, 255]) < 100);
-        let colored = widened.restyled(ColorMapPreset::Turbo, widened.range().unwrap())?;
-        map.set_vector(Some(colored.clone()), 1.0, "#ff00ff")?;
-        let palette_changed = map.render(request)?;
-        assert_ne!(palette_changed.as_raw(), ranged.as_raw(), "Palette changes must repaint");
-        map.set_vector(Some(colored.clone()), 0.5, "#ff00ff")?;
-        let translucent = map.render(request)?;
+        let (colored, palette_changed) = assert_numeric_vector_color_restyles(&mut map, request, &source, &first)?;
+        let translucent = map.render_vector(request, Some(colored.clone()), 0.5, "#ff00ff")?;
         assert_ne!(translucent.as_raw(), palette_changed.as_raw());
-        map.set_vector(Some(colored.clone()), 0.0, "#ff00ff")?;
-        assert_eq!(map.render(request)?.as_raw(), background.as_raw());
-        map.set_vector(Some(colored), 0.5, "#ff00ff")?;
-        assert_eq!(map.render(request)?.as_raw(), translucent.as_raw());
+        assert_vector_opacity_roundtrip(&mut map, request, &colored, "#ff00ff", &translucent, &background)?;
         assert_eq!(map.vector_source_updates, source_updates, "Restyling must not replace the native source");
         assert_eq!(map.camera_updates, camera_updates, "Restyling must not move the native camera");
 
-        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
-        map.render(request)?;
-        map.load_style(BasemapStyle::Dark, Some(DARK_STYLE))?;
-        assert_eq!(
-            map.render(request)?.as_raw(),
-            translucent.as_raw(),
-            "Basemap reload must preserve numeric styling"
-        );
-        assert_eq!(map.camera_updates, camera_updates);
+        assert_numeric_vector_basemap_reload(&mut map, request, &translucent, camera_updates)?;
         Ok(())
     }
 
@@ -1189,49 +1170,24 @@ mod tests {
         assert!(renderer.pending_query.try_recv().unwrap().is_none());
     }
 
-    #[test]
-    #[ignore = "requires a wgpu-compatible graphics device; uses only local vector data"]
-    fn local_vector_queries_use_logical_pixels_and_only_the_active_layer_without_network() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let open_source = |name: &str, features: serde_json::Value| -> Result<Arc<VectorSource>> {
-            let path = dir.path().join(name);
-            std::fs::write(
-                &path,
-                serde_json::to_vec(&serde_json::json!({
-                    "type": "FeatureCollection", "features": features
-                }))?,
-            )?;
-            Ok(VectorSource::open(&path)?.context("Expected query fixture vector data")?.remove(0))
-        };
-        let properties = |name: &str| {
-            serde_json::json!({
-                "name": name, "number": 42.5, "boolean": true, "nullable": null
-            })
-        };
-        let source = open_source(
-            "mixed.geojson",
-            serde_json::json!([
-                {"type": "Feature", "properties": properties("point"), "geometry": {
-                    "type": "Point", "coordinates": [0,0]
-                }},
-                {"type": "Feature", "properties": properties("line"), "geometry": {
-                    "type": "LineString", "coordinates": [[-2,0],[2,0]]
-                }},
-                {"type": "Feature", "properties": properties("polygon"), "geometry": {
-                    "type": "Polygon", "coordinates": [[[-2,-2],[2,-2],[2,2],[-2,2],[-2,-2]]]
-                }}
-            ]),
+    fn open_query_fixture(directory: &std::path::Path, name: &str, features: serde_json::Value) -> Result<Arc<VectorSource>> {
+        let path = directory.join(name);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "type": "FeatureCollection", "features": features
+            }))?,
         )?;
-        let viewport = Viewport {
-            width: NonZeroU32::new(256).unwrap(),
-            height: NonZeroU32::new(256).unwrap(),
-            scale: 2.0,
-        };
-        let request = MapRequest {
-            viewport,
-            camera: MapCamera::fit_bounds([-4.0, -4.0, 4.0, 4.0], 256.0, 256.0),
-        };
-        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
+        Ok(VectorSource::open(&path)?.context("Expected query fixture vector data")?.remove(0))
+    }
+
+    fn query_fixture_properties(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name, "number": 42.5, "boolean": true, "nullable": null
+        })
+    }
+
+    fn add_query_basemap_decoy(map: &mut NativeMap) -> Result<()> {
         map.renderer.style().add_source(AnySource::from_json_value(
             "basemap-decoy",
             &serde_json::json!({
@@ -1245,16 +1201,10 @@ mod tests {
             "id": "basemap-decoy", "type": "circle", "source": "basemap-decoy",
             "paint": {"circle-radius": 8, "circle-color": "#ff0000"}
         }))?)?;
-        map.set_vector(Some(source), 1.0, "#3b82f6")?;
-        let rendered = map.render(request)?;
-        assert_eq!(rendered.dimensions(), (512, 512), "HiDPI readback must use physical pixels");
-        let center = (128.0, 128.0);
-        let decoy = map
-            .renderer
-            .query_rendered_features(ScreenCoordinate { x: center.0, y: center.1 }, &["basemap-decoy".to_owned()])?;
-        assert_eq!(decoy.len(), 1, "The excluded basemap feature must really be queryable");
-        assert_eq!(decoy[0]["properties"]["name"], "basemap-decoy");
+        Ok(())
+    }
 
+    fn assert_overlapping_vector_queries(map: &mut NativeMap, center: (f64, f64)) -> Result<()> {
         let features = map.query_vector_features(center)?;
         // Native queries may return the same geometry from multiple tiles.
         let names: std::collections::BTreeSet<_> = features
@@ -1268,7 +1218,11 @@ mod tests {
         );
         for feature in &features {
             let name = feature["properties"]["name"].as_str().unwrap();
-            assert_eq!(feature["properties"], properties(name), "Native queries must preserve property types");
+            assert_eq!(
+                feature["properties"],
+                query_fixture_properties(name),
+                "Native queries must preserve property types"
+            );
         }
         for (name, geometry) in [("point", "Point"), ("line", "LineString"), ("polygon", "Polygon")] {
             let feature = features
@@ -1284,55 +1238,46 @@ mod tests {
                 .all(|feature| feature["properties"]["name"] != "point"),
             "Points in mixed layers must not receive the extra hit tolerance"
         );
+        Ok(())
+    }
 
-        for mixed in [false, true] {
-            let mut adjacent = serde_json::json!([
-                {"type": "Feature", "properties": {"name": "left"}, "geometry": {
-                    "type": "Polygon", "coordinates": [[[-2,-2],[0,-2],[0,2],[-2,2],[-2,-2]]]
-                }},
-                {"type": "Feature", "properties": {"name": "right"}, "geometry": {
-                    "type": "Polygon", "coordinates": [[[0,-2],[2,-2],[2,2],[0,2],[0,-2]]]
-                }}
-            ]);
-            if mixed {
-                adjacent.as_array_mut().unwrap().push(serde_json::json!({
-                    "type": "Feature", "properties": {"name": "point"},
-                    "geometry": {"type": "Point", "coordinates": [0,1.5]}
-                }));
-            }
-            let source = open_source(if mixed { "adjacent-mixed.geojson" } else { "adjacent-polygons.geojson" }, adjacent)?;
-            let layers = [format!("local-vector-{}-fill", source.id())];
-            map.set_vector(Some(source), 1.0, "#3b82f6")?;
-            let _ = map.render(request)?;
-            let near_edge = ScreenCoordinate {
-                x: center.0 - 3.0,
-                y: center.1,
-            };
-            let expanded = map.renderer.query_rendered_features_with_tolerance(near_edge, 4.0, &layers)?;
-            assert!(
-                expanded.iter().any(|feature| feature["properties"]["name"] == "right"),
-                "The fixture must reproduce the neighboring polygon hit from expanded queries"
-            );
-            let hits = map.query_vector_features((near_edge.x, near_edge.y))?;
-            assert!(!hits.is_empty(), "The pointer must hit the left polygon");
-            assert!(
-                hits.iter().all(|feature| feature["properties"]["name"] == "left"),
-                "Polygon and mixed layers must not hit the neighboring polygon near its edge: {hits:?}"
-            );
+    fn assert_adjacent_polygon_queries(map: &mut NativeMap, request: MapRequest, directory: &std::path::Path, center: (f64, f64), mixed: bool) -> Result<()> {
+        let mut adjacent = serde_json::json!([
+            {"type": "Feature", "properties": {"name": "left"}, "geometry": {
+                "type": "Polygon", "coordinates": [[[-2,-2],[0,-2],[0,2],[-2,2],[-2,-2]]]
+            }},
+            {"type": "Feature", "properties": {"name": "right"}, "geometry": {
+                "type": "Polygon", "coordinates": [[[0,-2],[2,-2],[2,2],[0,2],[0,-2]]]
+            }}
+        ]);
+        if mixed {
+            adjacent.as_array_mut().unwrap().push(serde_json::json!({
+                "type": "Feature", "properties": {"name": "point"},
+                "geometry": {"type": "Point", "coordinates": [0,1.5]}
+            }));
         }
+        let source = open_query_fixture(directory, if mixed { "adjacent-mixed.geojson" } else { "adjacent-polygons.geojson" }, adjacent)?;
+        let layers = [format!("local-vector-{}-fill", source.id())];
+        let _ = map.render_vector(request, Some(source), 1.0, "#3b82f6")?;
+        let near_edge = ScreenCoordinate {
+            x: center.0 - 3.0,
+            y: center.1,
+        };
+        let expanded = map.renderer.query_rendered_features_with_tolerance(near_edge, 4.0, &layers)?;
+        assert!(
+            expanded.iter().any(|feature| feature["properties"]["name"] == "right"),
+            "The fixture must reproduce the neighboring polygon hit from expanded queries"
+        );
+        let hits = map.query_vector_features((near_edge.x, near_edge.y))?;
+        assert!(!hits.is_empty(), "The pointer must hit the left polygon");
+        assert!(
+            hits.iter().all(|feature| feature["properties"]["name"] == "left"),
+            "Polygon and mixed layers must not hit the neighboring polygon near its edge: {hits:?}"
+        );
+        Ok(())
+    }
 
-        let replacement = open_source(
-            "replacement.geojson",
-            serde_json::json!([
-                {"type": "Feature", "properties": {"name": "replacement", "new_attribute": "active"},
-                 "geometry": {"type": "Point", "coordinates": [0,0]}}
-            ]),
-        )?;
-        map.set_vector(Some(replacement), 1.0, "#3b82f6")?;
-        let _ = map.render(request)?;
-        let switched = map.query_vector_features(center)?;
-        assert_eq!(switched.len(), 1, "Switching must exclude the old vector and basemap features: {switched:?}");
-        assert_eq!(switched[0]["properties"], serde_json::json!({"name": "replacement", "new_attribute": "active"}));
+    fn assert_point_query_tolerance(map: &mut NativeMap, center: (f64, f64)) -> Result<()> {
         let near = ScreenCoordinate {
             x: center.0 + 7.0,
             y: center.1,
@@ -1350,20 +1295,46 @@ mod tests {
             map.query_vector_features((center.0 + 10.0, center.1))?.is_empty(),
             "The tolerance must not extend beyond four logical pixels"
         );
+        Ok(())
+    }
 
-        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
-        let _ = map.render(request)?;
-        assert_eq!(
-            map.query_vector_features(center)?,
-            switched,
-            "Active feature queries must survive a style reload"
-        );
-        map.set_vector(None, 1.0, "#3b82f6")?;
-        let _ = map.render(request)?;
-        assert!(
-            map.query_vector_features(center)?.is_empty(),
-            "Clearing must leave no queryable vector features"
-        );
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local vector data"]
+    fn local_vector_queries_use_logical_pixels_and_only_the_active_layer_without_network() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = open_query_fixture(
+            dir.path(),
+            "mixed.geojson",
+            serde_json::json!([
+                {"type": "Feature", "properties": query_fixture_properties("point"), "geometry": {
+                    "type": "Point", "coordinates": [0,0]
+                }},
+                {"type": "Feature", "properties": query_fixture_properties("line"), "geometry": {
+                    "type": "LineString", "coordinates": [[-2,0],[2,0]]
+                }},
+                {"type": "Feature", "properties": query_fixture_properties("polygon"), "geometry": {
+                    "type": "Polygon", "coordinates": [[[-2,-2],[2,-2],[2,2],[-2,2],[-2,-2]]]
+                }}
+            ]),
+        )?;
+        let viewport = Viewport {
+            width: NonZeroU32::new(256).unwrap(),
+            height: NonZeroU32::new(256).unwrap(),
+            scale: 2.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::fit_bounds([-4.0, -4.0, 4.0, 4.0], 256.0, 256.0),
+        };
+        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
+        assert_active_query_geometry(&mut map, request, source)?;
+        let center = (128.0, 128.0);
+        for mixed in [false, true] {
+            assert_adjacent_polygon_queries(&mut map, request, dir.path(), center, mixed)?;
+        }
+
+        let switched = install_and_query_replacement_point(&mut map, request, dir.path(), center)?;
+        assert_queries_survive_reload_and_clear(&mut map, request, center, switched)?;
         Ok(())
     }
 
@@ -1372,8 +1343,7 @@ mod tests {
     fn local_raster_tiles_render_restyle_and_clear_without_network() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("raster.tif");
-        crate::raster_source::test_support::write_raster(&path, 4326, 1)?;
-        let source = RasterSource::open(&path)?.remove(0);
+        let source = open_raster_fixture(&path, 4326, 1)?.remove(0);
         let viewport = Viewport {
             width: NonZeroU32::new(512).unwrap(),
             height: NonZeroU32::new(512).unwrap(),
@@ -1386,54 +1356,70 @@ mod tests {
             Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##),
         )?;
         let background = map.render(request)?;
-        map.set_raster(Some(source.clone()), 1.0)?;
-        let rendered = map.render(request)?;
-        assert_eq!(rendered.dimensions(), (1024, 1024));
-        let changed_pixels = rendered.pixels().zip(background.pixels()).filter(|(a, b)| a != b).count();
-        assert!(
-            changed_pixels > 100_000,
-            "Raster tiles must visibly cover their geographic footprint, got {changed_pixels} pixels"
-        );
-        // Check both the geographic footprint and the fixture's nodata strip.
-        for x in 0..rendered.width() {
-            let longitude = camera.coordinate_at((f64::from(x) / 2.0 - 256.0, 0.0)).longitude;
-            if !(-8.0..=10.5).contains(&longitude) {
-                assert_eq!(
-                    rendered.get_pixel(x, 512),
-                    background.get_pixel(x, 512),
-                    "Nodata/outside at {longitude} must be transparent"
-                );
-            } else if longitude > -6.0 && longitude < 9.0 {
-                assert_ne!(rendered.get_pixel(x, 512), background.get_pixel(x, 512), "Data at {longitude} must be visible");
+        let rendered = map.render_raster(request, Some(source.clone()), 1.0)?;
+        assert_raster_geographic_coverage(&rendered, &background, camera);
+        assert_cached_raster_restyles(&mut map, request, &source, &path, &rendered, &background)?;
+        Ok(())
+    }
+
+    fn assert_queued_band_fade(
+        map: &mut NativeMap,
+        request: MapRequest,
+        sources: &[Arc<RasterSource>],
+        fourth: &Arc<RasterSource>,
+        first_image: &RgbaImage,
+        deadline: Instant,
+    ) -> Result<RgbaImage> {
+        let mut intermediate = false;
+        let mut queued = false;
+        let mut previous = *first_image.get_pixel(256, 256);
+        let replacement = loop {
+            ensure!(Instant::now() < deadline, "Replacement band did not become ready");
+            let Some(image) = map.poll_raster_image()? else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            let pixel = *image.get_pixel(256, 256);
+            if !queued {
+                assert!(pixel[0] >= previous[0], "Fading must not flash the basemap or reverse direction");
             }
+            assert_eq!(pixel[3], 255, "Blending two opaque bands must stay opaque");
+            if !map.numeric.borrow().is_loading() {
+                break image;
+            }
+            intermediate |= pixel != *first_image.get_pixel(256, 256);
+            previous = pixel;
+            if intermediate && !queued {
+                map.set_raster(Some(sources[3].clone()), 1.0)?;
+                map.set_raster(Some(fourth.clone()), 1.0)?;
+                map.apply_request(request);
+                queued = true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(intermediate, "The shader must produce intermediate band colors, not an atomic swap");
+        assert!(queued, "Exercise selection and styling during an active fade");
+        Ok(replacement)
+    }
+
+    fn assert_reduced_motion_band_swap(map: &mut NativeMap, reference: &RgbaImage, first_image: &RgbaImage) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            ensure!(Instant::now() < deadline, "Reduced-motion band swap did not complete");
+            let Some(image) = map.poll_raster_image()? else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            assert!(
+                image.as_raw() == reference.as_raw() || image.as_raw() == first_image.as_raw(),
+                "Reduced motion must display an endpoint, never an interpolated band"
+            );
+            if !map.numeric.borrow().is_loading() {
+                assert_eq!(image.as_raw(), first_image.as_raw());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
-        let gray = source.restyled(inf::colormap::ColorMapPreset::Gray, source.range())?;
-        let (requests, uploads) = map.numeric.borrow().tile_counts();
-        let camera_updates = map.camera_updates;
-        assert!(requests > 0 && uploads > 0, "The custom layer must load and upload numeric tiles");
-        // The following restyles must work even if the data is no longer readable.
-        std::fs::rename(&path, path.with_extension("cached.tif"))?;
-        map.set_raster(Some(gray.clone()), 1.0)?;
-        let restyled = map.render(request)?;
-        assert_ne!(rendered.as_raw(), restyled.as_raw(), "A palette change must recolor cached numeric tiles");
-        let range = gray.restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 200.0))?;
-        map.set_raster(Some(range), 1.0)?;
-        let rescaled = map.render(request)?;
-        assert_ne!(restyled.as_raw(), rescaled.as_raw(), "A range change must update the shader mapping");
-        assert_eq!(
-            map.numeric.borrow().tile_counts(),
-            (requests, uploads),
-            "Restyling must not request or upload tile data"
-        );
-        assert_eq!(map.camera_updates, camera_updates, "Restyling must not reset the native camera");
-        map.set_raster(Some(gray), 0.0)?;
-        assert_eq!(map.render(request)?.as_raw(), background.as_raw(), "Zero opacity must reveal the basemap");
-        map.set_raster(None, 1.0)?;
-        assert_eq!(
-            map.render(request)?.as_raw(),
-            background.as_raw(),
-            "Clearing the raster must remove its source and layer"
-        );
         Ok(())
     }
 
@@ -1442,8 +1428,7 @@ mod tests {
     fn band_changes_keep_the_outgoing_band_visible_then_crossfade() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("bands.tif");
-        crate::raster_source::test_support::write_raster(&path, 4326, 4)?;
-        let sources = RasterSource::open(&path)?;
+        let sources = open_raster_fixture(&path, 4326, 4)?;
         let viewport = Viewport {
             width: NonZeroU32::new(512).unwrap(),
             height: NonZeroU32::new(512).unwrap(),
@@ -1457,89 +1442,16 @@ mod tests {
             viewport,
             Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##),
         )?;
-        let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
-        map.set_raster(Some(first), 1.0)?;
-        let first_image = map.render(request)?;
+        let first_image = render_gray_raster(&mut map, request, &sources[0], (0.0, 160.0))?;
 
-        map.set_raster(Some(sources[1].clone()), 1.0)?;
-        map.apply_request(request);
-        // The first render schedules new tiles, but still draws the old slot.
-        let texture = map.poll_frame()?.context("The outgoing slot must remain renderable")?;
-        let loading = map.readback.read(&texture, &map.device, &map.queue)?;
-        assert_eq!(first_image.as_raw(), loading.as_raw(), "Loading a band must not expose missing tiles");
-
-        // Supersede in-flight work, then restyle only the incoming slot.
-        let third = sources[2].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
-        map.set_raster(Some(sources[2].clone()), 1.0)?;
-        map.set_raster(Some(third), 1.0)?;
-        map.apply_request(request);
-        let texture = map.poll_frame()?.context("Rapid band changes must keep drawing")?;
-        assert_eq!(first_image.as_raw(), map.readback.read(&texture, &map.device, &map.queue)?.as_raw());
+        assert_band_loading_and_supersession(&mut map, request, &sources, &first_image)?;
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut intermediate = false;
-        let mut queued = false;
         let fourth = sources[3].restyled(inf::colormap::ColorMapPreset::Terrain, (20.0, 180.0))?;
-        let mut previous = *first_image.get_pixel(256, 256);
-        let replacement = loop {
-            ensure!(Instant::now() < deadline, "Replacement band did not become ready");
-            if let Some(texture) = map.poll_frame()? {
-                let image = map.readback.read(&texture, &map.device, &map.queue)?;
-                let pixel = *image.get_pixel(256, 256);
-                if !queued {
-                    assert!(pixel[0] >= previous[0], "Fading must not flash the basemap or reverse direction");
-                }
-                assert_eq!(pixel[3], 255, "Blending two opaque bands must stay opaque");
-                if !map.numeric.borrow().is_loading() {
-                    break image;
-                }
-                intermediate |= pixel != *first_image.get_pixel(256, 256);
-                previous = pixel;
-                if intermediate && !queued {
-                    map.set_raster(Some(sources[3].clone()), 1.0)?;
-                    map.set_raster(Some(fourth.clone()), 1.0)?;
-                    map.apply_request(request);
-                    queued = true;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        assert!(intermediate, "The shader must produce intermediate band colors, not an atomic swap");
-        assert!(queued, "Exercise selection and styling during an active fade");
+        let replacement = assert_queued_band_fade(&mut map, request, &sources, &fourth, &first_image, deadline)?;
         assert_ne!(first_image.as_raw(), replacement.as_raw(), "The new band must eventually replace the old image");
         assert_eq!(replacement.as_raw(), map.render(request)?.as_raw());
 
-        // Clearing while a replacement is pending must immediately reveal the map.
-        map.set_raster(Some(sources[0].clone()), 1.0)?;
-        map.apply_request(request);
-        assert!(map.poll_frame()?.is_some());
-        map.set_raster(None, 1.0)?;
-        map.apply_request(request);
-        assert!(map.poll_frame()?.is_some(), "Clearing must not wait for cancelled band jobs");
-        assert!(!map.numeric.borrow().is_loading());
-
-        map.set_raster(Some(fourth), 1.0)?;
-        let reference = map.render(request)?;
-        assert_eq!(replacement.as_raw(), reference.as_raw(), "The latest queued band and style must win");
-        map.numeric.borrow_mut().set_reduce_motion(true);
-        let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
-        map.set_raster(Some(first), 1.0)?;
-        map.apply_request(request);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            ensure!(Instant::now() < deadline, "Reduced-motion band swap did not complete");
-            if let Some(texture) = map.poll_frame()? {
-                let image = map.readback.read(&texture, &map.device, &map.queue)?;
-                assert!(
-                    image.as_raw() == reference.as_raw() || image.as_raw() == first_image.as_raw(),
-                    "Reduced motion must display an endpoint, never an interpolated band"
-                );
-                if !map.numeric.borrow().is_loading() {
-                    assert_eq!(image.as_raw(), first_image.as_raw());
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        assert_band_clear_and_reduced_motion(&mut map, request, &sources, fourth, &first_image, &replacement)?;
         Ok(())
     }
 
@@ -1566,16 +1478,7 @@ mod tests {
             viewport,
             Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##),
         )?;
-        map.render(request)?;
-        map.set_raster(Some(sources[0].clone()), 1.0)?;
-        map.apply_request(request);
-        assert!(map.poll_frame()?.is_some());
-        assert!(
-            map.numeric.borrow().pending_fallback_count() > 0,
-            "Initial loading still needs coarse tiles for progressive display"
-        );
-        map.render(request)?;
-
+        assert_initial_fallback_loading(&mut map, request, &sources)?;
         map.set_raster(Some(sources[1].clone()), 1.0)?;
         map.apply_request(request);
         assert!(map.poll_frame()?.is_some());
@@ -1588,20 +1491,15 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
-    fn single_band_dataset_changes_keep_outgoing_coverage_and_crossfade_independent_grids() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+    fn independent_grid_sources(directory: &std::path::Path) -> Result<Vec<Arc<RasterSource>>> {
         let mut sources = Vec::new();
         for (name, bounds, value, palette) in [
             ("coarse", [-40.0, -20.0, 40.0, 20.0], 64.0, inf::colormap::ColorMapPreset::Gray),
             ("fine", [-8.0, -8.0, 8.0, 8.0], 192.0, inf::colormap::ColorMapPreset::Terrain),
             ("shifted", [0.0, -16.0, 32.0, 16.0], 128.0, inf::colormap::ColorMapPreset::Gray),
         ] {
-            let path = dir.path().join(format!("{name}.tif"));
-            let mut dataset = gdal::DriverManager::get_driver_by_name("GTiff")?.create_with_band_type::<f32, _>(&path, 64, 64, 1)?;
-            dataset.set_geo_transform(&[bounds[0], (bounds[2] - bounds[0]) / 64.0, 0.0, bounds[3], 0.0, -(bounds[3] - bounds[1]) / 64.0])?;
-            dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(4326)?)?;
+            let path = directory.join(format!("{name}.tif"));
+            let mut dataset = new_fixture_dataset(&path, bounds, 1)?;
             let mut band = dataset.rasterband(1)?;
             band.set_no_data_value(Some(-9999.0))?;
             let values = (0..4096).map(|ix| if ix % 64 < 8 { -9999.0 } else { value }).collect();
@@ -1612,6 +1510,69 @@ mod tests {
             assert_eq!(opened.len(), 1, "Each fixture must be a separate single-band dataset");
             sources.push(opened[0].restyled(palette, (0.0, 255.0))?);
         }
+        Ok(sources)
+    }
+
+    fn assert_dataset_crossfade(
+        map: &mut NativeMap,
+        request: MapRequest,
+        source: &Arc<RasterSource>,
+        outgoing: &RgbaImage,
+        incoming: &RgbaImage,
+        (from, to): (usize, usize),
+    ) -> Result<()> {
+        let (probe, _) = outgoing
+            .pixels()
+            .zip(incoming.pixels())
+            .enumerate()
+            .max_by_key(|(_, (old, new))| old[0].abs_diff(new[0]))
+            .context("The fixture must contain pixels")?;
+        let old = outgoing.as_raw()[probe * 4];
+        let new = incoming.as_raw()[probe * 4];
+        assert!(
+            old.abs_diff(new) > 15,
+            "Dataset endpoints {from} -> {to} must be visibly different: {old} vs {new}"
+        );
+        map.set_raster(Some(source.clone()), 0.6)?;
+        map.apply_request(request);
+        let loading = map.required_raster_image("The outgoing dataset must remain renderable")?;
+        assert_eq!(
+            loading.as_raw(),
+            outgoing.as_raw(),
+            "Loading a dataset must preserve the entire outgoing footprint"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut intermediate = false;
+        loop {
+            ensure!(Instant::now() < deadline, "Dataset crossfade did not complete");
+            let Some(image) = map.poll_raster_image()? else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            let blend = ((f32::from(image.as_raw()[probe * 4]) - f32::from(old)) / (f32::from(new) - f32::from(old))).clamp(0.0, 1.0);
+            intermediate |= (0.1..0.9).contains(&blend);
+            for ((actual, old), new) in image.as_raw().iter().zip(outgoing.as_raw()).zip(incoming.as_raw()) {
+                let expected = f32::from(*old) * (1.0 - blend) + f32::from(*new) * blend;
+                assert!(
+                    (f32::from(*actual) - expected).abs() <= 3.0,
+                    "Dataset footprints, palettes, nodata and opacity must blend without a flash: {actual} vs {expected}"
+                );
+            }
+            if !map.numeric.borrow().is_loading() {
+                assert_eq!(image.as_raw(), incoming.as_raw());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(intermediate, "Dataset changes must interpolate rather than swap atomically");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
+    fn single_band_dataset_changes_keep_outgoing_coverage_and_crossfade_independent_grids() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sources = independent_grid_sources(dir.path())?;
         assert!(sources[0].metadata().max_zoom < sources[1].metadata().max_zoom);
         let viewport = Viewport {
             width: NonZeroU32::new(256).unwrap(),
@@ -1627,65 +1588,11 @@ mod tests {
             Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##),
         )?;
         let background = map.render(request)?;
-        map.numeric.borrow_mut().set_reduce_motion(true);
-        let mut endpoints = Vec::new();
-        for source in &sources {
-            map.set_raster(Some(source.clone()), 0.6)?;
-            endpoints.push(map.render(request)?);
-        }
-        map.set_raster(Some(sources[0].clone()), 0.6)?;
-        map.render(request)?;
-        map.numeric.borrow_mut().set_reduce_motion(false);
-
+        let endpoints = raster_fade_endpoints(&mut map, request, &sources)?;
         // Exercise finer, shifted, and coarser replacements, including pixels
         // covered by only one dataset and independent nodata masks/palettes.
         for (from, to) in [(0, 1), (1, 2), (2, 0)] {
-            let outgoing = &endpoints[from];
-            let incoming = &endpoints[to];
-            let (probe, _) = outgoing
-                .pixels()
-                .zip(incoming.pixels())
-                .enumerate()
-                .max_by_key(|(_, (old, new))| old[0].abs_diff(new[0]))
-                .context("The fixture must contain pixels")?;
-            let old = outgoing.as_raw()[probe * 4];
-            let new = incoming.as_raw()[probe * 4];
-            assert!(
-                old.abs_diff(new) > 15,
-                "Dataset endpoints {from} -> {to} must be visibly different: {old} vs {new}"
-            );
-            map.set_raster(Some(sources[to].clone()), 0.6)?;
-            map.apply_request(request);
-            let texture = map.poll_frame()?.context("The outgoing dataset must remain renderable")?;
-            let loading = map.readback.read(&texture, &map.device, &map.queue)?;
-            assert_eq!(
-                loading.as_raw(),
-                outgoing.as_raw(),
-                "Loading a dataset must preserve the entire outgoing footprint"
-            );
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut intermediate = false;
-            loop {
-                ensure!(Instant::now() < deadline, "Dataset crossfade did not complete");
-                if let Some(texture) = map.poll_frame()? {
-                    let image = map.readback.read(&texture, &map.device, &map.queue)?;
-                    let blend = ((f32::from(image.as_raw()[probe * 4]) - f32::from(old)) / (f32::from(new) - f32::from(old))).clamp(0.0, 1.0);
-                    intermediate |= (0.1..0.9).contains(&blend);
-                    for ((actual, old), new) in image.as_raw().iter().zip(outgoing.as_raw()).zip(incoming.as_raw()) {
-                        let expected = f32::from(*old) * (1.0 - blend) + f32::from(*new) * blend;
-                        assert!(
-                            (f32::from(*actual) - expected).abs() <= 3.0,
-                            "Dataset footprints, palettes, nodata and opacity must blend without a flash: {actual} vs {expected}"
-                        );
-                    }
-                    if !map.numeric.borrow().is_loading() {
-                        assert_eq!(image.as_raw(), incoming.as_raw());
-                        break;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            assert!(intermediate, "Dataset changes must interpolate rather than swap atomically");
+            assert_dataset_crossfade(&mut map, request, &sources[to], &endpoints[from], &endpoints[to], (from, to))?;
         }
         map.set_raster(None, 0.6)?;
         assert_eq!(map.render(request)?.as_raw(), background.as_raw());
@@ -1697,24 +1604,7 @@ mod tests {
     fn band_fades_blend_independent_nodata_masks_and_opacity() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("nodata-bands.tif");
-        let mut dataset = gdal::DriverManager::get_driver_by_name("GTiff")?.create_with_band_type::<f32, _>(&path, 64, 64, 2)?;
-        dataset.set_geo_transform(&[-10.0, 20.0 / 64.0, 0.0, 10.0, 0.0, -20.0 / 64.0])?;
-        dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(4326)?)?;
-        for nr in 1..=2 {
-            let mut band = dataset.rasterband(nr)?;
-            band.set_no_data_value(Some(-9999.0))?;
-            let values = (0..4096)
-                .map(|ix| match (nr, ix % 64) {
-                    (1, 0..16) | (2, 48..64) => -9999.0,
-                    (1, _) => 64.0,
-                    _ => 192.0,
-                })
-                .collect();
-            band.write((0, 0), (64, 64), &mut gdal::raster::Buffer::new((64, 64), values))?;
-        }
-        dataset.flush_cache()?;
-        drop(dataset);
-        let sources = RasterSource::open(&path)?;
+        let sources = open_nodata_band_fixture(&path)?;
         let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
         let second = sources[1].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
         let viewport = Viewport {
@@ -1730,53 +1620,17 @@ mod tests {
             viewport,
             Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##),
         )?;
-        map.numeric.borrow_mut().set_reduce_motion(true);
-        map.set_raster(Some(first.clone()), 0.6)?;
-        let outgoing = map.render(request)?;
-        map.set_raster(Some(second.clone()), 0.6)?;
-        let incoming = map.render(request)?;
-        map.set_raster(Some(first), 0.6)?;
-        map.render(request)?;
-        map.numeric.borrow_mut().set_reduce_motion(false);
+        let (outgoing, incoming) = nodata_fade_endpoints(&mut map, request, first, &second)?;
         map.set_raster(Some(second), 0.6)?;
         map.apply_request(request);
-        let a = f32::from(outgoing.get_pixel(128, 128)[0]);
-        let b = f32::from(incoming.get_pixel(128, 128)[0]);
-        assert!(b - a > 50.0, "The fixture needs distinguishable endpoint colors");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut intermediate = false;
-        loop {
-            ensure!(Instant::now() < deadline, "Nodata band fade did not complete");
-            if let Some(texture) = map.poll_frame()? {
-                let image = map.readback.read(&texture, &map.device, &map.queue)?;
-                let blend = ((f32::from(image.get_pixel(128, 128)[0]) - a) / (b - a)).clamp(0.0, 1.0);
-                intermediate |= (0.1..0.9).contains(&blend);
-                for ((actual, old), new) in image.as_raw().iter().zip(outgoing.as_raw()).zip(incoming.as_raw()) {
-                    let expected = f32::from(*old) * (1.0 - blend) + f32::from(*new) * blend;
-                    assert!(
-                        (f32::from(*actual) - expected).abs() <= 3.0,
-                        "Nodata/opacity must blend endpoint colors without a dark dip: {actual} vs {expected}"
-                    );
-                }
-                if !map.numeric.borrow().is_loading() {
-                    assert_eq!(image.as_raw(), incoming.as_raw());
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(intermediate, "Exercise fractional shader blending, not only endpoints");
+        assert_nodata_band_fade(&mut map, &outgoing, &incoming)?;
         Ok(())
     }
 
-    #[test]
-    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
-    fn scaled_bands_render_physical_legend_colors_through_loading_and_fades() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("scaled-bands.tif");
-        crate::raster_source::test_support::write_raster(&path, 4326, 2)?;
+    fn scaled_band_sources(path: &std::path::Path) -> Result<Vec<Arc<RasterSource>>> {
+        crate::raster_source::test_support::write_raster(path, 4326, 2)?;
         let mut dataset = gdal::Dataset::open_ex(
-            &path,
+            path,
             gdal::DatasetOptions {
                 open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE,
                 ..Default::default()
@@ -1791,95 +1645,86 @@ mod tests {
         }
         dataset.flush_cache()?;
         drop(dataset);
-        let sources = RasterSource::open(&path)?;
-        let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
-        let second = sources[1].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
-        let legend_pixel = |source: &RasterSource, physical: f32| {
-            let color = source.legend().color_for_value(physical, None);
-            image::Rgba([color.b, color.g, color.r, 255])
-        };
-        let first_color = legend_pixel(&first, 43.0);
-        let second_color = legend_pixel(&second, 120.0);
-        let assert_center = |image: &RgbaImage, expected: image::Rgba<u8>| {
-            for (actual, expected) in image.get_pixel(128, 128).0.into_iter().zip(expected.0) {
-                assert!(
-                    actual.abs_diff(expected) <= 1,
-                    "Rendered center must match the active-unit legend: {actual} vs {expected}"
-                );
-            }
-        };
-        let viewport = Viewport {
-            width: NonZeroU32::new(256).unwrap(),
-            height: NonZeroU32::new(256).unwrap(),
-            scale: 1.0,
-        };
-        let request = MapRequest {
-            viewport,
-            camera: MapCamera::fit_bounds(first.metadata().bounds, 256.0, 256.0),
-        };
-        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
-        let background = map.render(request)?;
-        map.set_raster(Some(first.clone()), 1.0)?;
-        let mut outgoing = map.render(request)?;
-        assert_center(&outgoing, first_color);
-        assert_eq!(
-            outgoing.get_pixel(16, 128),
-            background.get_pixel(16, 128),
-            "Scaled nodata must remain transparent"
-        );
+        RasterSource::open(path)
+    }
 
-        // Exercise both uniform slots, then return with reduced motion. No
-        // particular intermediate blend is required on a slow graphics device.
-        for (incoming, expected, reduce_motion) in [(second.clone(), second_color, false), (first.clone(), first_color, true)] {
-            map.numeric.borrow_mut().set_reduce_motion(reduce_motion);
-            map.set_raster(Some(incoming), 1.0)?;
-            map.apply_request(request);
-            let texture = map.poll_frame()?.context("The scaled outgoing band must remain renderable while loading")?;
-            let loading = map.readback.read(&texture, &map.device, &map.queue)?;
-            assert_eq!(
-                loading.as_raw(),
-                outgoing.as_raw(),
-                "Loading must retain the outgoing band's own scale and offset"
+    fn legend_pixel(source: &RasterSource, physical: f32) -> image::Rgba<u8> {
+        let color = source.legend().color_for_value(physical, None);
+        image::Rgba([color.b, color.g, color.r, 255])
+    }
+
+    fn assert_legend_center(image: &RgbaImage, expected: image::Rgba<u8>) {
+        for (actual, expected) in image.get_pixel(128, 128).0.into_iter().zip(expected.0) {
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "Rendered center must match the active-unit legend: {actual} vs {expected}"
             );
-            let start = *outgoing.get_pixel(128, 128);
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut previous = start[0];
-            outgoing = loop {
-                ensure!(Instant::now() < deadline, "Scaled band transition did not complete");
-                if let Some(texture) = map.poll_frame()? {
-                    let image = map.readback.read(&texture, &map.device, &map.queue)?;
-                    let pixel = *image.get_pixel(128, 128);
-                    assert_eq!(pixel[3], 255, "Scaled opaque bands must remain opaque during a fade");
-                    for (actual, (old, new)) in pixel.0.into_iter().zip(start.0.into_iter().zip(expected.0)) {
-                        assert!(
-                            actual >= old.min(new).saturating_sub(1) && actual <= old.max(new).saturating_add(1),
-                            "Fade must stay between independently unscaled legend colors: {pixel:?}"
-                        );
-                    }
-                    assert_eq!(
-                        image.get_pixel(16, 128),
-                        background.get_pixel(16, 128),
-                        "Nodata must not acquire the band's offset"
-                    );
-                    if reduce_motion {
-                        assert!(
-                            pixel == start || pixel.0.into_iter().zip(expected.0).all(|(a, b)| a.abs_diff(b) <= 1),
-                            "Reduced motion must show only a physical-color endpoint"
-                        );
-                    } else {
-                        assert!(pixel[0].saturating_add(1) >= previous, "Per-band transforms must not cause the fade to reverse");
-                    }
-                    previous = pixel[0];
-                    if !map.numeric.borrow().is_loading() {
-                        assert_center(&image, expected);
-                        break image;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            };
         }
+    }
 
-        for (source, raw) in [(&first, 100.0_f32), (&second, 40.0)] {
+    fn assert_scaled_fade_pixel(pixel: image::Rgba<u8>, start: image::Rgba<u8>, expected: image::Rgba<u8>, reduce_motion: bool, previous: u8) {
+        assert_eq!(pixel[3], 255, "Scaled opaque bands must remain opaque during a fade");
+        for (actual, (old, new)) in pixel.0.into_iter().zip(start.0.into_iter().zip(expected.0)) {
+            assert!(
+                actual >= old.min(new).saturating_sub(1) && actual <= old.max(new).saturating_add(1),
+                "Fade must stay between independently unscaled legend colors: {pixel:?}"
+            );
+        }
+        if reduce_motion {
+            assert!(
+                pixel == start || pixel.0.into_iter().zip(expected.0).all(|(a, b)| a.abs_diff(b) <= 1),
+                "Reduced motion must show only a physical-color endpoint"
+            );
+        } else {
+            assert!(pixel[0].saturating_add(1) >= previous, "Per-band transforms must not cause the fade to reverse");
+        }
+    }
+
+    fn assert_scaled_band_transition(
+        map: &mut NativeMap,
+        request: MapRequest,
+        incoming: Arc<RasterSource>,
+        outgoing: &RgbaImage,
+        expected: image::Rgba<u8>,
+        background: &RgbaImage,
+        reduce_motion: bool,
+    ) -> Result<RgbaImage> {
+        map.numeric.borrow_mut().set_reduce_motion(reduce_motion);
+        map.set_raster(Some(incoming), 1.0)?;
+        map.apply_request(request);
+        let loading = map.required_raster_image("The scaled outgoing band must remain renderable while loading")?;
+        assert_eq!(
+            loading.as_raw(),
+            outgoing.as_raw(),
+            "Loading must retain the outgoing band's own scale and offset"
+        );
+        let start = *outgoing.get_pixel(128, 128);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut previous = start[0];
+        loop {
+            ensure!(Instant::now() < deadline, "Scaled band transition did not complete");
+            let Some(image) = map.poll_raster_image()? else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            let pixel = *image.get_pixel(128, 128);
+            assert_scaled_fade_pixel(pixel, start, expected, reduce_motion, previous);
+            assert_eq!(
+                image.get_pixel(16, 128),
+                background.get_pixel(16, 128),
+                "Nodata must not acquire the band's offset"
+            );
+            previous = pixel[0];
+            if !map.numeric.borrow().is_loading() {
+                assert_legend_center(&image, expected);
+                return Ok(image);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn assert_scaled_tiles_store_raw_values(first: &RasterSource, second: &RasterSource) -> Result<()> {
+        for (source, raw) in [(first, 100.0_f32), (second, 40.0)] {
             let tile = geo::Tile::for_coordinate(geo::Coordinate::latlon(1.0, 1.0), source.metadata().max_zoom.clamp(0, 22));
             let numeric = source.numeric_tile(tile, 1)?.context("Missing scaled numeric tile")?;
             assert!(numeric.values.iter().any(|value| value.is_finite()), "The fixture must contain numeric data");
@@ -1892,50 +1737,65 @@ mod tests {
                 "Numeric tiles must retain stored values, not physical legend values"
             );
         }
+        Ok(())
+    }
 
+    fn assert_unit_snapshot_metadata(snapshot: &RasterSource, first: &RasterSource, enabled: bool, range: (f32, f32)) {
+        assert!(snapshot.has_scale_metadata());
+        assert_eq!(snapshot.unscaling_enabled(), enabled, "Restyling must retain the snapshot's unit mode");
+        assert_eq!(
+            snapshot.scale(),
+            if enabled {
+                geo::RasterScale { scale: 0.5, offset: -7.0 }
+            } else {
+                geo::RasterScale::default()
+            }
+        );
+        assert_eq!(snapshot.range(), range);
+        assert_eq!(snapshot.palette(), inf::colormap::ColorMapPreset::Gray);
+        assert_eq!(snapshot.metadata().id, first.metadata().id, "Unit changes must retain raw cache identity");
+        assert_eq!(snapshot.metadata().scale, Some(geo::RasterScale { scale: 0.5, offset: -7.0 }));
+        assert_ne!(snapshot.id(), first.id(), "Unit/style snapshots need their own style identity");
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
+    fn scaled_bands_render_physical_legend_colors_through_loading_and_fades() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("scaled-bands.tif");
+        let sources = scaled_band_sources(&path)?;
+        let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
+        let second = sources[1].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
+        let (mut map, request, outgoing, background) = assert_scaled_band_display(&first, &second)?;
+        assert_cached_unit_restyles(&mut map, request, &first, &path, &outgoing, &background)?;
+        Ok(())
+    }
+
+    fn assert_cached_unit_restyles(
+        map: &mut NativeMap,
+        request: MapRequest,
+        first: &Arc<RasterSource>,
+        path: &std::path::Path,
+        outgoing: &RgbaImage,
+        background: &RgbaImage,
+    ) -> Result<()> {
         let counts = map.numeric.borrow().tile_counts();
         assert!(counts.0 > 0 && counts.1 > 0, "Warm the numeric tile cache before toggling units");
         let camera_updates = map.camera_updates;
         // Every following snapshot and render must use metadata and cached raw tiles only.
-        std::fs::rename(&path, path.with_extension("cached.tif"))?;
-        let raw_equivalent = first.with_unscaling(false)?;
-        let physical_roundtrip = raw_equivalent.with_unscaling(true)?;
-        let raw_gray = raw_equivalent.restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
-        let physical_equivalent = raw_gray.with_unscaling(true)?;
-        let physical_gray = physical_equivalent.restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
-        let raw_again = physical_gray.with_unscaling(false)?;
-        let raw_clipped = raw_gray.restyled(inf::colormap::ColorMapPreset::Gray, (110.0, 200.0))?;
-        let physical_clipped = raw_clipped.with_unscaling(true)?;
-        let clipped_roundtrip = physical_clipped.with_unscaling(false)?;
-        for (snapshot, enabled, range, expected, unchanged) in [
-            (&raw_equivalent, false, (14.0, 524.0), 43, true),
-            (&physical_roundtrip, true, (0.0, 255.0), 43, true),
-            (&raw_gray, false, (0.0, 255.0), 100, false),
-            (&physical_equivalent, true, (-7.0, 120.5), 100, false),
-            (&physical_gray, true, (0.0, 255.0), 43, true),
-            (&raw_again, false, (14.0, 524.0), 43, true),
-            (&raw_clipped, false, (110.0, 200.0), 0, false),
-            (&physical_clipped, true, (48.0, 93.0), 0, false),
-            (&clipped_roundtrip, false, (110.0, 200.0), 0, false),
-        ] {
-            assert!(snapshot.has_scale_metadata());
-            assert_eq!(snapshot.unscaling_enabled(), enabled, "Restyling must retain the snapshot's unit mode");
-            assert_eq!(
-                snapshot.scale(),
-                if enabled {
-                    geo::RasterScale { scale: 0.5, offset: -7.0 }
-                } else {
-                    geo::RasterScale::default()
-                }
-            );
-            assert_eq!(snapshot.range(), range);
-            assert_eq!(snapshot.palette(), inf::colormap::ColorMapPreset::Gray);
-            assert_eq!(snapshot.metadata().id, first.metadata().id, "Unit changes must retain raw cache identity");
-            assert_eq!(snapshot.metadata().scale, Some(geo::RasterScale { scale: 0.5, offset: -7.0 }));
-            assert_ne!(snapshot.id(), first.id(), "Unit/style snapshots need their own style identity");
-            map.set_raster(Some(snapshot.clone()), 1.0)?;
-            let image = map.render(request)?;
-            assert_center(&image, image::Rgba([expected, expected, expected, 255]));
+        std::fs::rename(path, path.with_extension("cached.tif"))?;
+        let (cases, raw_gray) = unit_style_cases(first)?;
+        for UnitStyleCase {
+            snapshot,
+            enabled,
+            range,
+            expected,
+            unchanged,
+        } in cases
+        {
+            assert_unit_snapshot_metadata(&snapshot, first, enabled, range);
+            let image = map.render_raster(request, Some(snapshot.clone()), 1.0)?;
+            assert_legend_center(&image, image::Rgba([expected, expected, expected, 255]));
             if unchanged {
                 assert_eq!(
                     image.as_raw(),
@@ -1967,8 +1827,7 @@ mod tests {
     fn custom_raster_respects_native_layer_order_and_band_changes() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("bands.tif");
-        crate::raster_source::test_support::write_raster(&path, 4326, 2)?;
-        let sources = RasterSource::open(&path)?;
+        let sources = open_raster_fixture(&path, 4326, 2)?;
         let viewport = Viewport {
             width: NonZeroU32::new(256).unwrap(),
             height: NonZeroU32::new(256).unwrap(),
@@ -1984,53 +1843,14 @@ mod tests {
         )?;
         let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
         let second = sources[1].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
-        map.set_raster(Some(first.clone()), 1.0)?;
-        let first_image = map.render(request)?;
+        let first_image = map.render_raster(request, Some(first.clone()), 1.0)?;
         let requests = map.numeric.borrow().tile_counts().0;
-        map.set_raster(Some(second), 1.0)?;
-        let second_image = map.render(request)?;
+        let second_image = map.render_raster(request, Some(second), 1.0)?;
         assert_ne!(first_image.as_raw(), second_image.as_raw(), "A different band must load different values");
         assert!(map.numeric.borrow().tile_counts().0 > requests, "Band changes need new raw tiles");
 
-        // A native opaque layer above the custom layer must cover it even when
-        // MapLibre draws opaque geometry before its translucent/custom pass.
-        map.renderer.style().add_source(AnySource::from_json_str(
-            "cover",
-            r##"{"type":"geojson","data":{"type":"Polygon","coordinates":[[[-20,-20],[20,-20],[20,20],[-20,20],[-20,-20]]]}}"##,
-        )?)?;
-        map.renderer.style().add_layer(AnyLayer::from_json_str(
-            r##"{"id":"cover","type":"fill","source":"cover","paint":{"fill-color":"#00ff00","fill-antialias":false}}"##,
-        )?)?;
-        let covered = map.render(request)?;
-        assert_eq!(*covered.get_pixel(128, 128), image::Rgba([0, 255, 0, 255]));
-        map.set_raster(Some(first.clone()), 1.0)?;
-        assert_eq!(
-            *map.render(request)?.get_pixel(128, 128),
-            image::Rgba([0, 255, 0, 255]),
-            "Band changes must preserve the custom layer's position below native layers"
-        );
-
-        // The same host API supports explicit insertion before a native layer.
-        map.set_raster(None, 1.0)?;
-        map.numeric.borrow_mut().set_source(Some(first), 1.0, 1);
-        map.renderer
-            .style()
-            .add_wgpu_custom_layer("below-cover", RasterLayerHost::new(map.numeric.clone()), Some("cover"))?;
-        let below = map.render(request)?;
-        assert_eq!(*below.get_pixel(128, 128), image::Rgba([0, 255, 0, 255]));
-        map.renderer.style().remove_layer("cover");
-        map.renderer.style().add_layer(AnyLayer::from_json_str(
-            r##"{"id":"cover","type":"fill","source":"cover","paint":{"fill-color":"#00ff00","fill-opacity":0.5,"fill-antialias":false}}"##,
-        )?)?;
-        let blended = map.render(request)?;
-        let raster_pixel = first_image.get_pixel(128, 128);
-        let expected = [raster_pixel[0] / 2, 128 + raster_pixel[1] / 2, raster_pixel[2] / 2, 255];
-        for (actual, expected) in blended.get_pixel(128, 128).0.into_iter().zip(expected) {
-            assert!(
-                actual.abs_diff(expected) <= 1,
-                "Native translucent layers must still draw correctly after the custom callback"
-            );
-        }
+        assert_native_cover_occludes_band_changes(&mut map, request, &first)?;
+        assert_explicit_raster_layer_insertion(&mut map, request, first, &first_image)?;
         Ok(())
     }
 
@@ -2050,8 +1870,7 @@ mod tests {
             viewport,
             Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#ff00ff"}}]}"##),
         )?;
-        map.set_raster(Some(source.clone()), 1.0)?;
-        let image = map.render(request)?;
+        let image = map.render_raster(request, Some(source.clone()), 1.0)?;
         let origin = geo::crs::lat_lon_to_web_mercator(camera.coordinate_at((-256.0, -256.0)));
         let step = geo::crs::lat_lon_to_web_mercator(camera.coordinate_at((-255.0, -255.0)));
         for (coordinate, has_data) in [(geo::Coordinate::latlon(25.0, 54.37), false), (geo::Coordinate::latlon(23.14, 53.78), true)] {
@@ -2097,8 +1916,7 @@ mod tests {
                 r##"{"version":8,"sources":{"water":{"type":"geojson","data":{"type":"Polygon","coordinates":[[[60,-20],[70,-20],[70,20],[60,20],[60,-20]]]}}},"layers":[{"id":"background","type":"background","paint":{"background-color":"#ff00ff"}},{"id":"water","type":"fill","source":"water","paint":{"fill-color":"#102030","fill-antialias":false}}]}"##,
             ),
         )?;
-        map.set_raster(Some(source.clone()), 1.0)?;
-        let image = map.render(request)?;
+        let image = map.render_raster(request, Some(source.clone()), 1.0)?;
         for value in 0..255 {
             let color = source.legend().color_for_value(value, None);
             let expected = image::Rgba([color.b, color.g, color.r, 255]);
@@ -2134,32 +1952,8 @@ mod tests {
         };
         let mut map = NativeMap::new(viewport)?;
         let background = map.render(request)?;
-        map.set_raster(Some(source.clone()), 1.0)?;
-        let rendered = map.render(request)?;
-        let mut tiles = std::collections::HashMap::new();
-        let mut checked = 0;
-        for y in (0..rendered.height()).step_by(8) {
-            for x in (0..rendered.width()).step_by(8) {
-                let coordinate = request.camera.coordinate_at((f64::from(x) / 2.0 - 600.0, f64::from(y) / 2.0 - 380.0));
-                let tile = geo::Tile::for_coordinate(coordinate, source.metadata().max_zoom);
-                if let std::collections::hash_map::Entry::Vacant(entry) = tiles.entry(tile) {
-                    entry.insert(source.numeric_tile(tile, 2)?.context("Missing landuse tile")?);
-                }
-                let data = &tiles[&tile];
-                let grid = geo::GeoReference::from_tile(&tile, data.width as usize, 1);
-                let cell = grid.point_to_cell(geo::crs::lat_lon_to_web_mercator(coordinate));
-                let value = data.values[(cell.row as u32 * data.width + cell.col as u32) as usize];
-                if value == 173.0 || value == 174.0 {
-                    checked += 1;
-                    assert_ne!(
-                        rendered.get_pixel(x, y),
-                        background.get_pixel(x, y),
-                        "Landuse {value} at {coordinate:?} must not reveal the basemap"
-                    );
-                }
-            }
-        }
-        assert!(checked > 100, "The test must exercise the reported water values, checked {checked}");
+        let rendered = map.render_raster(request, Some(source.clone()), 1.0)?;
+        assert_landuse_water_coverage(&source, request, &rendered, &background)?;
         Ok(())
     }
 
@@ -2168,8 +1962,7 @@ mod tests {
     fn raster_style_frame_timings() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("raster.tif");
-        crate::raster_source::test_support::write_raster(&path, 4326, 1)?;
-        let source = RasterSource::open(&path)?.remove(0);
+        let source = open_raster_fixture(&path, 4326, 1)?.remove(0);
         let viewport = Viewport {
             width: NonZeroU32::new(1200).unwrap(),
             height: NonZeroU32::new(760).unwrap(),
@@ -2183,34 +1976,10 @@ mod tests {
             viewport,
             Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##),
         )?;
-        map.set_raster(Some(source.clone()), 1.0)?;
-        map.render(request)?;
+        map.render_raster(request, Some(source.clone()), 1.0)?;
         let counts = map.numeric.borrow().tile_counts();
         let camera_updates = map.camera_updates;
-        let mut styling = Duration::ZERO;
-        let mut rendering = Duration::ZERO;
-        let mut readback = Duration::ZERO;
-        for ix in 0..30 {
-            let start = Instant::now();
-            let source = source.restyled(source.palette(), (ix as f32, 160.0))?;
-            map.set_raster(Some(source), 1.0)?;
-            let styled = Instant::now();
-            // Follow the production path: publish the first available frame,
-            // rather than waiting for all native fades to become idle.
-            map.apply_request(request);
-            let texture = map.poll_frame()?.context("Range update did not produce a frame")?;
-            let rendered = Instant::now();
-            let _image = map.readback.read(&texture, &map.device, &map.queue)?;
-            styling += styled - start;
-            rendering += rendered - styled;
-            readback += rendered.elapsed();
-        }
-        eprintln!(
-            "Range update at 2400×1520: style {:?}, render {:?}, GPU wait/readback {:?} per frame",
-            styling / 30,
-            rendering / 30,
-            readback / 30
-        );
+        measure_raster_restyles(&mut map, request, &source)?;
         assert_eq!(map.numeric.borrow().tile_counts(), counts);
         assert_eq!(map.camera_updates, camera_updates);
         Ok(())
@@ -2237,11 +2006,7 @@ mod tests {
             camera.zoom_at(0.01, (0.0, 0.0));
             let start = Instant::now();
             map.apply_request(MapRequest { viewport, camera });
-            let texture = loop {
-                if let Some(texture) = map.poll_frame()? {
-                    break texture;
-                }
-            };
+            let texture = wait_for_native_texture(&mut map)?;
             let rendered = Instant::now();
             let image = map.readback.read(&texture, &map.device, &map.queue)?;
             rendering += rendered - start;
@@ -2282,20 +2047,7 @@ mod tests {
                 BasemapStyle::Light,
                 false,
             )?;
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                ensure!(Instant::now() < deadline, "Local-style worker frame timed out");
-                if let Ok(frame) = frames.try_recv()
-                    && frame.viewport == viewport
-                {
-                    assert_eq!(frame.basemap, BasemapStyle::Light);
-                    let image = frame.image?;
-                    assert_eq!(image.size(0).width.0, (32.0 * scale) as i32);
-                    assert!(image.as_bytes(0).unwrap().chunks_exact(4).all(|pixel| pixel == [32, 32, 32, 255]));
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            assert_local_style_worker_frame(&frames, viewport, scale)?;
         }
         drop(renderer);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2320,29 +2072,13 @@ mod tests {
             viewport,
             camera: MapCamera::default(),
         })?;
-        let wait_for_frame = |viewport: Viewport| -> Result<Arc<RenderImage>> {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                ensure!(Instant::now() < deadline, "Streaming map frame timed out");
-                if let Ok(frame) = frames.try_recv() {
-                    let image = frame.image?;
-                    if frame.viewport == viewport {
-                        let colors: std::collections::HashSet<_> = image.as_bytes(0).unwrap().chunks_exact(4).collect();
-                        if colors.len() > 100 {
-                            return Ok(image);
-                        }
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        };
-        let first = wait_for_frame(viewport)?;
+        let first = wait_for_geographic_worker_frame(&frames, viewport)?;
         assert_eq!(first.size(0).width.0, 800);
         viewport.width = NonZeroU32::new(1000).unwrap();
         let mut camera = MapCamera::default();
         camera.zoom_at(1.0, (0.0, 0.0));
         renderer.render(MapRequest { viewport, camera })?;
-        let resized = wait_for_frame(viewport)?;
+        let resized = wait_for_geographic_worker_frame(&frames, viewport)?;
         assert_eq!(resized.size(0).width.0, 1000);
         drop(renderer);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2391,6 +2127,693 @@ mod tests {
         viewport.width = NonZeroU32::new(1000).unwrap();
         let resized = map.render(MapRequest { viewport, camera })?;
         assert_eq!(resized.dimensions(), (1000, 600));
+        Ok(())
+    }
+
+    fn new_fixture_dataset(path: &std::path::Path, bounds: [f64; 4], bands: usize) -> Result<gdal::Dataset> {
+        let mut dataset = gdal::DriverManager::get_driver_by_name("GTiff")?.create_with_band_type::<f32, _>(path, 64, 64, bands)?;
+        dataset.set_geo_transform(&[bounds[0], (bounds[2] - bounds[0]) / 64.0, 0.0, bounds[3], 0.0, -(bounds[3] - bounds[1]) / 64.0])?;
+        dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(4326)?)?;
+        Ok(dataset)
+    }
+
+    fn render_gray_raster(map: &mut NativeMap, request: MapRequest, source: &RasterSource, range: (f32, f32)) -> Result<RgbaImage> {
+        let source = source.restyled(inf::colormap::ColorMapPreset::Gray, range)?;
+        map.render_raster(request, Some(source), 1.0)
+    }
+
+    fn open_raster_fixture(path: &std::path::Path, epsg: u32, bands: usize) -> Result<Vec<Arc<RasterSource>>> {
+        crate::raster_source::test_support::write_raster(path, epsg, bands)?;
+        RasterSource::open(path)
+    }
+
+    fn assert_numeric_basemap_roundtrip(
+        map: &mut NativeMap,
+        request: MapRequest,
+        dark_raster: &RgbaImage,
+        dark_background: &RgbaImage,
+        path: &std::path::Path,
+    ) -> Result<RgbaImage> {
+        let numeric = map.numeric.clone();
+        let device = map.device.clone();
+        let counts = numeric.borrow().tile_counts();
+        let camera_updates = map.camera_updates;
+        assert!(counts.0 > 0 && counts.1 > 0);
+        assert_ne!(dark_raster.as_raw(), dark_background.as_raw());
+        // A reload must reuse uploaded tiles even when their file is unavailable.
+        std::fs::rename(path, path.with_extension("cached.tif"))?;
+
+        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
+        assert_eq!(map.basemap, BasemapStyle::Light);
+        assert!(map.camera == Some(request.camera));
+        assert_eq!(map.device, device);
+        assert!(Rc::ptr_eq(&map.numeric, &numeric));
+        let light_raster = map.render(request)?;
+        assert_ne!(
+            light_raster.as_raw(),
+            dark_raster.as_raw(),
+            "The new basemap must be visible through the overlay"
+        );
+        assert_eq!(numeric.borrow().tile_counts(), counts, "Reloading must not request or upload numeric tiles");
+
+        // Requesting the current basemap must not replace the offline style.
+        map.set_basemap(BasemapStyle::Light)?;
+        map.load_style(BasemapStyle::Dark, Some(DARK_STYLE))?;
+        assert_eq!(
+            map.render(request)?.as_raw(),
+            dark_raster.as_raw(),
+            "A round trip must preserve the native camera and overlay"
+        );
+        assert_eq!(map.camera_updates, camera_updates);
+        assert_eq!(numeric.borrow().tile_counts(), counts);
+        Ok(light_raster)
+    }
+
+    fn write_color_mbtiles_fixture(path: &std::path::Path) -> Result<()> {
+        let db = sqlite::Connection::new(path, sqlite::AccessMode::Create)?;
+        db.execute_sql_statements(
+            "CREATE TABLE metadata (name TEXT, value TEXT);
+            INSERT INTO metadata VALUES ('format','png'), ('bounds','-180,-85,180,85'), ('minzoom','0'), ('maxzoom','0');
+            CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);",
+        )?;
+        let mut png = std::io::Cursor::new(Vec::new());
+        RgbaImage::from_pixel(256, 256, image::Rgba([0, 255, 0, 255])).write_to(&mut png, image::ImageFormat::Png)?;
+        let mut insert = db.prepare_statement("INSERT INTO tiles VALUES (0,0,0,?1) RETURNING zoom_level")?;
+        insert.bind_blob(1, png.get_ref())?;
+        ensure!(insert.next().is_some(), "Could not create fixture tile: {}", db.last_error());
+        drop(insert);
+        drop(db);
+        Ok(())
+    }
+
+    fn open_mixed_vector_fixture(dir: &std::path::Path) -> Result<Arc<VectorSource>> {
+        let path = dir.join("mixed.geojson");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "type": "FeatureCollection",
+                "features": [
+                    {"type": "Feature", "properties": {}, "geometry": {
+                        "type": "Polygon", "coordinates": [[[-5,-2],[-2,-2],[-2,2],[-5,2],[-5,-2]]]
+                    }},
+                    {"type": "Feature", "properties": {}, "geometry": {
+                        "type": "LineString", "coordinates": [[0,-2],[0,2]]
+                    }},
+                    {"type": "Feature", "properties": {}, "geometry": {
+                        "type": "Point", "coordinates": [5,0]
+                    }}
+                ]
+            }))?,
+        )?;
+        let source = VectorSource::open(&path)?.context("Expected mixed vector data")?.remove(0);
+        Ok(source)
+    }
+
+    fn assert_vector_restyles_survive_basemap_reload(
+        map: &mut NativeMap,
+        request: MapRequest,
+        source: &Arc<VectorSource>,
+        rendered: &RgbaImage,
+        background: &RgbaImage,
+    ) -> Result<()> {
+        let camera_updates = map.camera_updates;
+
+        let translucent = map.render_vector(request, Some(source.clone()), 0.5, "#3b82f6")?;
+        assert_ne!(translucent.as_raw(), rendered.as_raw(), "Opacity changes must repaint vector layers");
+        assert_ne!(translucent.as_raw(), background.as_raw());
+        assert_vector_opacity_roundtrip(map, request, source, "#3b82f6", &translucent, background)?;
+
+        // Reattach at unchanged opacity and retain the native camera despite style defaults.
+        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
+        let light_vector = map.render(request)?;
+        assert_ne!(light_vector.as_raw(), translucent.as_raw());
+        map.load_style(BasemapStyle::Dark, Some(DARK_STYLE))?;
+        assert_eq!(
+            map.render(request)?.as_raw(),
+            translucent.as_raw(),
+            "A style round trip must restore all vector layers"
+        );
+        assert_eq!(map.camera_updates, camera_updates);
+        Ok(())
+    }
+
+    fn assert_vector_switch_clear_and_reinstall(
+        map: &mut NativeMap,
+        request: MapRequest,
+        source: Arc<VectorSource>,
+        dir: &std::path::Path,
+        background: &RgbaImage,
+        rendered: &RgbaImage,
+    ) -> Result<()> {
+        let replacement_path = dir.join("replacement.geojson");
+        std::fs::write(
+            &replacement_path,
+            r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[0,0]}}]}"#,
+        )?;
+        let replacement = VectorSource::open(&replacement_path)?.context("Expected replacement vector data")?.remove(0);
+        assert_ne!(source.id(), replacement.id());
+        let switched = map.render_vector(request, Some(replacement), 1.0, "#3b82f6")?;
+        let changed = switched.pixels().zip(background.pixels()).filter(|(a, b)| a != b).count();
+        assert!(
+            changed > 10 && changed < 200,
+            "Switching must remove the previous source's polygon and line layers, got {changed} pixels"
+        );
+        map.set_vector(None, 1.0, "#3b82f6")?;
+        assert_eq!(
+            map.render(request)?.as_raw(),
+            background.as_raw(),
+            "Clearing must remove vector layers and their source"
+        );
+        map.set_vector(Some(source), 1.0, "#3b82f6")?;
+        assert_eq!(map.render(request)?.as_raw(), rendered.as_raw(), "A cleared source must be installable again");
+        Ok(())
+    }
+
+    fn open_numeric_vector_fixture(directory: &std::path::Path) -> Result<Arc<VectorSource>> {
+        let path = directory.join("numeric.geojson");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "type": "FeatureCollection", "features": [
+                    {"type":"Feature","properties":{"a":0.0,"b":10},"geometry":{"type":"Polygon","coordinates":[[[-5,-2],[-2,-2],[-2,2],[-5,2],[-5,-2]]]}},
+                    {"type":"Feature","properties":{"a":10.0,"b":0},"geometry":{"type":"Point","coordinates":[0,0]}},
+                    {"type":"Feature","properties":{"a":null,"b":null},"geometry":{"type":"Point","coordinates":[4,0]}},
+                    {"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[6,0]}}
+                ]
+            }))?,
+        )?;
+        let source = VectorSource::open(&path)?.context("Expected numeric vector data")?.remove(0);
+        std::fs::remove_file(path)?;
+        let source = source.restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 10.0))?;
+        Ok(source)
+    }
+
+    fn assert_numeric_vector_color_restyles(
+        map: &mut NativeMap,
+        request: MapRequest,
+        source: &VectorSource,
+        first: &RgbaImage,
+    ) -> Result<(Arc<VectorSource>, RgbaImage)> {
+        let selected = source.with_property("b")?;
+        let reversed = map.render_vector(request, Some(selected.clone()), 1.0, "#ff00ff")?;
+        assert_numeric_vector_property_change(first, &reversed);
+
+        let widened = selected.restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 20.0))?;
+        let ranged = map.render_vector(request, Some(widened.clone()), 1.0, "#ff00ff")?;
+        assert_ne!(ranged.as_raw(), reversed.as_raw(), "Range changes must affect numeric colors");
+        assert!(count_color(&ranged, [255, 255, 255, 255]) < 100);
+        let colored = widened.restyled(inf::colormap::ColorMapPreset::Turbo, widened.range().unwrap())?;
+        let palette_changed = map.render_vector(request, Some(colored.clone()), 1.0, "#ff00ff")?;
+        assert_ne!(palette_changed.as_raw(), ranged.as_raw(), "Palette changes must repaint");
+        Ok((colored, palette_changed))
+    }
+
+    fn assert_numeric_vector_basemap_reload(map: &mut NativeMap, request: MapRequest, translucent: &RgbaImage, camera_updates: u64) -> Result<()> {
+        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
+        map.render(request)?;
+        map.load_style(BasemapStyle::Dark, Some(DARK_STYLE))?;
+        assert_eq!(
+            map.render(request)?.as_raw(),
+            translucent.as_raw(),
+            "Basemap reload must preserve numeric styling"
+        );
+        assert_eq!(map.camera_updates, camera_updates);
+        Ok(())
+    }
+
+    fn assert_active_query_geometry(map: &mut NativeMap, request: MapRequest, source: Arc<VectorSource>) -> Result<()> {
+        add_query_basemap_decoy(map)?;
+        let rendered = map.render_vector(request, Some(source), 1.0, "#3b82f6")?;
+        assert_eq!(rendered.dimensions(), (512, 512), "HiDPI readback must use physical pixels");
+        let center = (128.0, 128.0);
+        let decoy = map
+            .renderer
+            .query_rendered_features(ScreenCoordinate { x: center.0, y: center.1 }, &["basemap-decoy".to_owned()])?;
+        assert_eq!(decoy.len(), 1, "The excluded basemap feature must really be queryable");
+        assert_eq!(decoy[0]["properties"]["name"], "basemap-decoy");
+
+        assert_overlapping_vector_queries(map, center)?;
+        Ok(())
+    }
+
+    fn install_and_query_replacement_point(
+        map: &mut NativeMap,
+        request: MapRequest,
+        dir: &std::path::Path,
+        center: (f64, f64),
+    ) -> Result<Vec<serde_json::Value>> {
+        let replacement = open_query_fixture(
+            dir,
+            "replacement.geojson",
+            serde_json::json!([
+                {"type": "Feature", "properties": {"name": "replacement", "new_attribute": "active"},
+                 "geometry": {"type": "Point", "coordinates": [0,0]}}
+            ]),
+        )?;
+        let _ = map.render_vector(request, Some(replacement), 1.0, "#3b82f6")?;
+        let switched = map.query_vector_features(center)?;
+        assert_eq!(switched.len(), 1, "Switching must exclude the old vector and basemap features: {switched:?}");
+        assert_eq!(switched[0]["properties"], serde_json::json!({"name": "replacement", "new_attribute": "active"}));
+        assert_point_query_tolerance(map, center)?;
+        Ok(switched)
+    }
+
+    fn assert_queries_survive_reload_and_clear(map: &mut NativeMap, request: MapRequest, center: (f64, f64), switched: Vec<serde_json::Value>) -> Result<()> {
+        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
+        let _ = map.render(request)?;
+        assert_eq!(
+            map.query_vector_features(center)?,
+            switched,
+            "Active feature queries must survive a style reload"
+        );
+        let _ = map.render_vector(request, None, 1.0, "#3b82f6")?;
+        assert!(
+            map.query_vector_features(center)?.is_empty(),
+            "Clearing must leave no queryable vector features"
+        );
+        Ok(())
+    }
+
+    fn assert_raster_geographic_coverage(rendered: &RgbaImage, background: &RgbaImage, camera: MapCamera) {
+        assert_eq!(rendered.dimensions(), (1024, 1024));
+        let changed_pixels = rendered.pixels().zip(background.pixels()).filter(|(a, b)| a != b).count();
+        assert!(
+            changed_pixels > 100_000,
+            "Raster tiles must visibly cover their geographic footprint, got {changed_pixels} pixels"
+        );
+        // Check both the geographic footprint and the fixture's nodata strip.
+        for x in 0..rendered.width() {
+            let longitude = camera.coordinate_at((f64::from(x) / 2.0 - 256.0, 0.0)).longitude;
+            if !(-8.0..=10.5).contains(&longitude) {
+                assert_eq!(
+                    rendered.get_pixel(x, 512),
+                    background.get_pixel(x, 512),
+                    "Nodata/outside at {longitude} must be transparent"
+                );
+            } else if longitude > -6.0 && longitude < 9.0 {
+                assert_ne!(rendered.get_pixel(x, 512), background.get_pixel(x, 512), "Data at {longitude} must be visible");
+            }
+        }
+    }
+
+    fn assert_cached_raster_restyles(
+        map: &mut NativeMap,
+        request: MapRequest,
+        source: &RasterSource,
+        path: &std::path::Path,
+        rendered: &RgbaImage,
+        background: &RgbaImage,
+    ) -> Result<()> {
+        let gray = source.restyled(inf::colormap::ColorMapPreset::Gray, source.range())?;
+        let (requests, uploads) = map.numeric.borrow().tile_counts();
+        let camera_updates = map.camera_updates;
+        assert!(requests > 0 && uploads > 0, "The custom layer must load and upload numeric tiles");
+        // The following restyles must work even if the data is no longer readable.
+        std::fs::rename(path, path.with_extension("cached.tif"))?;
+        let restyled = map.render_raster(request, Some(gray.clone()), 1.0)?;
+        assert_ne!(rendered.as_raw(), restyled.as_raw(), "A palette change must recolor cached numeric tiles");
+        let range = gray.restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 200.0))?;
+        let rescaled = map.render_raster(request, Some(range), 1.0)?;
+        assert_ne!(restyled.as_raw(), rescaled.as_raw(), "A range change must update the shader mapping");
+        assert_eq!(
+            map.numeric.borrow().tile_counts(),
+            (requests, uploads),
+            "Restyling must not request or upload tile data"
+        );
+        assert_eq!(map.camera_updates, camera_updates, "Restyling must not reset the native camera");
+        assert_raster_hidden_and_cleared(map, request, gray, background)?;
+        Ok(())
+    }
+
+    fn assert_raster_hidden_and_cleared(map: &mut NativeMap, request: MapRequest, gray: Arc<RasterSource>, background: &RgbaImage) -> Result<()> {
+        map.set_raster(Some(gray), 0.0)?;
+        assert_eq!(map.render(request)?.as_raw(), background.as_raw(), "Zero opacity must reveal the basemap");
+        map.set_raster(None, 1.0)?;
+        assert_eq!(
+            map.render(request)?.as_raw(),
+            background.as_raw(),
+            "Clearing the raster must remove its source and layer"
+        );
+        Ok(())
+    }
+
+    fn assert_band_loading_and_supersession(map: &mut NativeMap, request: MapRequest, sources: &[Arc<RasterSource>], first_image: &RgbaImage) -> Result<()> {
+        map.set_raster(Some(sources[1].clone()), 1.0)?;
+        map.apply_request(request);
+        // The first render schedules new tiles, but still draws the old slot.
+        let loading = map.required_raster_image("The outgoing slot must remain renderable")?;
+        assert_eq!(first_image.as_raw(), loading.as_raw(), "Loading a band must not expose missing tiles");
+
+        // Supersede in-flight work, then restyle only the incoming slot.
+        let third = sources[2].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
+        map.set_raster(Some(sources[2].clone()), 1.0)?;
+        map.set_raster(Some(third), 1.0)?;
+        map.apply_request(request);
+        assert_eq!(
+            first_image.as_raw(),
+            map.required_raster_image("Rapid band changes must keep drawing")?.as_raw()
+        );
+        Ok(())
+    }
+
+    fn assert_band_clear_and_reduced_motion(
+        map: &mut NativeMap,
+        request: MapRequest,
+        sources: &[Arc<RasterSource>],
+        fourth: Arc<RasterSource>,
+        first_image: &RgbaImage,
+        replacement: &RgbaImage,
+    ) -> Result<()> {
+        // Clearing while a replacement is pending must immediately reveal the map.
+        map.set_raster(Some(sources[0].clone()), 1.0)?;
+        map.apply_request(request);
+        assert!(map.poll_frame()?.is_some());
+        map.set_raster(None, 1.0)?;
+        map.apply_request(request);
+        assert!(map.poll_frame()?.is_some(), "Clearing must not wait for cancelled band jobs");
+        assert!(!map.numeric.borrow().is_loading());
+
+        let reference = map.render_raster(request, Some(fourth), 1.0)?;
+        assert_eq!(replacement.as_raw(), reference.as_raw(), "The latest queued band and style must win");
+        map.numeric.borrow_mut().set_reduce_motion(true);
+        let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
+        map.set_raster(Some(first), 1.0)?;
+        map.apply_request(request);
+        assert_reduced_motion_band_swap(map, &reference, first_image)?;
+        Ok(())
+    }
+
+    fn assert_initial_fallback_loading(map: &mut NativeMap, request: MapRequest, sources: &[Arc<RasterSource>]) -> Result<()> {
+        map.render(request)?;
+        map.set_raster(Some(sources[0].clone()), 1.0)?;
+        map.apply_request(request);
+        assert!(map.poll_frame()?.is_some());
+        assert!(
+            map.numeric.borrow().pending_fallback_count() > 0,
+            "Initial loading still needs coarse tiles for progressive display"
+        );
+        map.render(request)?;
+        Ok(())
+    }
+
+    fn raster_fade_endpoints(map: &mut NativeMap, request: MapRequest, sources: &[Arc<RasterSource>]) -> Result<Vec<RgbaImage>> {
+        map.numeric.borrow_mut().set_reduce_motion(true);
+        let mut endpoints = Vec::new();
+        for source in sources {
+            map.set_raster(Some(source.clone()), 0.6)?;
+            endpoints.push(map.render(request)?);
+        }
+        map.render_raster(request, Some(sources[0].clone()), 0.6)?;
+        map.numeric.borrow_mut().set_reduce_motion(false);
+        Ok(endpoints)
+    }
+
+    fn nodata_band_values(nr: usize) -> Vec<f32> {
+        (0..4096)
+            .map(|ix| match (nr, ix % 64) {
+                (1, 0..16) | (2, 48..64) => -9999.0,
+                (1, _) => 64.0,
+                _ => 192.0,
+            })
+            .collect()
+    }
+
+    fn open_nodata_band_fixture(path: &std::path::Path) -> Result<Vec<Arc<RasterSource>>> {
+        let mut dataset = new_fixture_dataset(path, [-10.0, -10.0, 10.0, 10.0], 2)?;
+        for nr in 1..=2 {
+            let mut band = dataset.rasterband(nr)?;
+            band.set_no_data_value(Some(-9999.0))?;
+            let values = nodata_band_values(nr);
+            band.write((0, 0), (64, 64), &mut gdal::raster::Buffer::new((64, 64), values))?;
+        }
+        dataset.flush_cache()?;
+        drop(dataset);
+        let sources = RasterSource::open(path)?;
+        Ok(sources)
+    }
+
+    fn nodata_fade_endpoints(map: &mut NativeMap, request: MapRequest, first: Arc<RasterSource>, second: &Arc<RasterSource>) -> Result<(RgbaImage, RgbaImage)> {
+        map.numeric.borrow_mut().set_reduce_motion(true);
+        let outgoing = map.render_raster(request, Some(first.clone()), 0.6)?;
+        let incoming = map.render_raster(request, Some(second.clone()), 0.6)?;
+        map.render_raster(request, Some(first), 0.6)?;
+        map.numeric.borrow_mut().set_reduce_motion(false);
+        Ok((outgoing, incoming))
+    }
+
+    fn assert_nodata_band_fade(map: &mut NativeMap, outgoing: &RgbaImage, incoming: &RgbaImage) -> Result<()> {
+        let a = f32::from(outgoing.get_pixel(128, 128)[0]);
+        let b = f32::from(incoming.get_pixel(128, 128)[0]);
+        assert!(b - a > 50.0, "The fixture needs distinguishable endpoint colors");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut intermediate = false;
+        loop {
+            ensure!(Instant::now() < deadline, "Nodata band fade did not complete");
+            let Some(image) = map.poll_raster_image()? else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            let blend = ((f32::from(image.get_pixel(128, 128)[0]) - a) / (b - a)).clamp(0.0, 1.0);
+            intermediate |= (0.1..0.9).contains(&blend);
+            for ((actual, old), new) in image.as_raw().iter().zip(outgoing.as_raw()).zip(incoming.as_raw()) {
+                let expected = f32::from(*old) * (1.0 - blend) + f32::from(*new) * blend;
+                assert!(
+                    (f32::from(*actual) - expected).abs() <= 3.0,
+                    "Nodata/opacity must blend endpoint colors without a dark dip: {actual} vs {expected}"
+                );
+            }
+            if !map.numeric.borrow().is_loading() {
+                assert_eq!(image.as_raw(), incoming.as_raw());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(intermediate, "Exercise fractional shader blending, not only endpoints");
+        Ok(())
+    }
+
+    fn assert_scaled_band_display(first: &Arc<RasterSource>, second: &Arc<RasterSource>) -> Result<(NativeMap, MapRequest, RgbaImage, RgbaImage)> {
+        let first_color = legend_pixel(first, 43.0);
+        let second_color = legend_pixel(second, 120.0);
+        let viewport = Viewport {
+            width: NonZeroU32::new(256).unwrap(),
+            height: NonZeroU32::new(256).unwrap(),
+            scale: 1.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::fit_bounds(first.metadata().bounds, 256.0, 256.0),
+        };
+        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
+        let background = map.render(request)?;
+        let mut outgoing = map.render_raster(request, Some(first.clone()), 1.0)?;
+        assert_legend_center(&outgoing, first_color);
+        assert_eq!(
+            outgoing.get_pixel(16, 128),
+            background.get_pixel(16, 128),
+            "Scaled nodata must remain transparent"
+        );
+
+        // Exercise both uniform slots, then return with reduced motion. No
+        // particular intermediate blend is required on a slow graphics device.
+        for (incoming, expected, reduce_motion) in [(second.clone(), second_color, false), (first.clone(), first_color, true)] {
+            outgoing = assert_scaled_band_transition(&mut map, request, incoming, &outgoing, expected, &background, reduce_motion)?;
+        }
+
+        assert_scaled_tiles_store_raw_values(first, second)?;
+        Ok((map, request, outgoing, background))
+    }
+
+    fn assert_native_cover_occludes_band_changes(map: &mut NativeMap, request: MapRequest, first: &Arc<RasterSource>) -> Result<()> {
+        // A native opaque layer above the custom layer must cover it even when
+        // MapLibre draws opaque geometry before its translucent/custom pass.
+        map.renderer.style().add_source(AnySource::from_json_str(
+            "cover",
+            r##"{"type":"geojson","data":{"type":"Polygon","coordinates":[[[-20,-20],[20,-20],[20,20],[-20,20],[-20,-20]]]}}"##,
+        )?)?;
+        map.renderer.style().add_layer(AnyLayer::from_json_str(
+            r##"{"id":"cover","type":"fill","source":"cover","paint":{"fill-color":"#00ff00","fill-antialias":false}}"##,
+        )?)?;
+        let covered = map.render(request)?;
+        assert_eq!(*covered.get_pixel(128, 128), image::Rgba([0, 255, 0, 255]));
+        map.set_raster(Some(first.clone()), 1.0)?;
+        assert_eq!(
+            *map.render(request)?.get_pixel(128, 128),
+            image::Rgba([0, 255, 0, 255]),
+            "Band changes must preserve the custom layer's position below native layers"
+        );
+        Ok(())
+    }
+
+    fn assert_explicit_raster_layer_insertion(map: &mut NativeMap, request: MapRequest, first: Arc<RasterSource>, first_image: &RgbaImage) -> Result<()> {
+        // The same host API supports explicit insertion before a native layer.
+        map.set_raster(None, 1.0)?;
+        map.numeric.borrow_mut().set_source(Some(first), 1.0, 1);
+        map.renderer
+            .style()
+            .add_wgpu_custom_layer("below-cover", RasterLayerHost::new(map.numeric.clone()), Some("cover"))?;
+        let below = map.render(request)?;
+        assert_eq!(*below.get_pixel(128, 128), image::Rgba([0, 255, 0, 255]));
+        map.renderer.style().remove_layer("cover");
+        map.renderer.style().add_layer(AnyLayer::from_json_str(
+            r##"{"id":"cover","type":"fill","source":"cover","paint":{"fill-color":"#00ff00","fill-opacity":0.5,"fill-antialias":false}}"##,
+        )?)?;
+        let blended = map.render(request)?;
+        let raster_pixel = first_image.get_pixel(128, 128);
+        let expected = [raster_pixel[0] / 2, 128 + raster_pixel[1] / 2, raster_pixel[2] / 2, 255];
+        for (actual, expected) in blended.get_pixel(128, 128).0.into_iter().zip(expected) {
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "Native translucent layers must still draw correctly after the custom callback"
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_landuse_water_coverage(source: &RasterSource, request: MapRequest, rendered: &RgbaImage, background: &RgbaImage) -> Result<()> {
+        let mut tiles = std::collections::HashMap::new();
+        let mut checked = 0;
+        let coordinates = (0..rendered.height())
+            .step_by(8)
+            .flat_map(|y| (0..rendered.width()).step_by(8).map(move |x| (x, y)));
+        for (x, y) in coordinates {
+            let coordinate = request.camera.coordinate_at((f64::from(x) / 2.0 - 600.0, f64::from(y) / 2.0 - 380.0));
+            let tile = geo::Tile::for_coordinate(coordinate, source.metadata().max_zoom);
+            if let std::collections::hash_map::Entry::Vacant(entry) = tiles.entry(tile) {
+                entry.insert(source.numeric_tile(tile, 2)?.context("Missing landuse tile")?);
+            }
+            let data = &tiles[&tile];
+            let grid = geo::GeoReference::from_tile(&tile, data.width as usize, 1);
+            let cell = grid.point_to_cell(geo::crs::lat_lon_to_web_mercator(coordinate));
+            let value = data.values[(cell.row as u32 * data.width + cell.col as u32) as usize];
+            if value == 173.0 || value == 174.0 {
+                checked += 1;
+                assert_ne!(
+                    rendered.get_pixel(x, y),
+                    background.get_pixel(x, y),
+                    "Landuse {value} at {coordinate:?} must not reveal the basemap"
+                );
+            }
+        }
+        assert!(checked > 100, "The test must exercise the reported water values, checked {checked}");
+        Ok(())
+    }
+
+    fn measure_raster_restyles(map: &mut NativeMap, request: MapRequest, source: &Arc<RasterSource>) -> Result<()> {
+        let mut styling = Duration::ZERO;
+        let mut rendering = Duration::ZERO;
+        let mut readback = Duration::ZERO;
+        for ix in 0..30 {
+            let start = Instant::now();
+            let source = source.restyled(source.palette(), (ix as f32, 160.0))?;
+            map.set_raster(Some(source), 1.0)?;
+            let styled = Instant::now();
+            // Follow the production path: publish the first available frame,
+            // rather than waiting for all native fades to become idle.
+            map.apply_request(request);
+            let texture = map.poll_frame()?.context("Range update did not produce a frame")?;
+            let rendered = Instant::now();
+            let _image = map.readback.read(&texture, &map.device, &map.queue)?;
+            styling += styled - start;
+            rendering += rendered - styled;
+            readback += rendered.elapsed();
+        }
+        eprintln!(
+            "Range update at 2400×1520: style {:?}, render {:?}, GPU wait/readback {:?} per frame",
+            styling / 30,
+            rendering / 30,
+            readback / 30
+        );
+        Ok(())
+    }
+
+    fn wait_for_geographic_worker_frame(frames: &async_channel::Receiver<MapFrame>, viewport: Viewport) -> Result<Arc<RenderImage>> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            ensure!(Instant::now() < deadline, "Streaming map frame timed out");
+            let Ok(frame) = frames.try_recv() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            let image = frame.image?;
+            if worker_frame_has_geography(&image, frame.viewport, viewport) {
+                return Ok(image);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_native_texture(map: &mut NativeMap) -> Result<wgpu::Texture> {
+        loop {
+            if let Some(texture) = map.poll_frame()? {
+                return Ok(texture);
+            }
+        }
+    }
+
+    fn worker_frame_has_geography(image: &RenderImage, actual: Viewport, requested: Viewport) -> bool {
+        if actual != requested {
+            return false;
+        }
+        let colors: std::collections::HashSet<_> = image.as_bytes(0).unwrap().as_chunks::<4>().0.iter().collect();
+        colors.len() > 100
+    }
+
+    struct UnitStyleCase {
+        snapshot: Arc<RasterSource>,
+        enabled: bool,
+        range: (f32, f32),
+        expected: u8,
+        unchanged: bool,
+    }
+
+    fn unit_style_cases(first: &RasterSource) -> Result<([UnitStyleCase; 9], Arc<RasterSource>)> {
+        let raw_equivalent = first.with_unscaling(false)?;
+        let physical_roundtrip = raw_equivalent.with_unscaling(true)?;
+        let raw_gray = raw_equivalent.restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
+        let physical_equivalent = raw_gray.with_unscaling(true)?;
+        let physical_gray = physical_equivalent.restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
+        let raw_again = physical_gray.with_unscaling(false)?;
+        let raw_clipped = raw_gray.restyled(inf::colormap::ColorMapPreset::Gray, (110.0, 200.0))?;
+        let physical_clipped = raw_clipped.with_unscaling(true)?;
+        let clipped_roundtrip = physical_clipped.with_unscaling(false)?;
+        let cases = [
+            (raw_equivalent, false, (14.0, 524.0), 43, true),
+            (physical_roundtrip, true, (0.0, 255.0), 43, true),
+            (raw_gray.clone(), false, (0.0, 255.0), 100, false),
+            (physical_equivalent, true, (-7.0, 120.5), 100, false),
+            (physical_gray, true, (0.0, 255.0), 43, true),
+            (raw_again, false, (14.0, 524.0), 43, true),
+            (raw_clipped, false, (110.0, 200.0), 0, false),
+            (physical_clipped, true, (48.0, 93.0), 0, false),
+            (clipped_roundtrip, false, (110.0, 200.0), 0, false),
+        ]
+        .map(|(snapshot, enabled, range, expected, unchanged)| UnitStyleCase {
+            snapshot,
+            enabled,
+            range,
+            expected,
+            unchanged,
+        });
+
+        Ok((cases, raw_gray))
+    }
+
+    fn assert_local_style_worker_frame(frames: &async_channel::Receiver<MapFrame>, viewport: Viewport, scale: f32) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            ensure!(Instant::now() < deadline, "Local-style worker frame timed out");
+            if let Ok(frame) = frames.try_recv()
+                && frame.viewport == viewport
+            {
+                assert_eq!(frame.basemap, BasemapStyle::Light);
+                let image = frame.image?;
+                assert_eq!(image.size(0).width.0, (32.0 * scale) as i32);
+                assert!(image.as_bytes(0).unwrap().as_chunks::<4>().0.iter().all(|pixel| *pixel == [32, 32, 32, 255]));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         Ok(())
     }
 }

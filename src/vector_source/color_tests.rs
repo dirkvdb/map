@@ -111,19 +111,7 @@ fn restyling_shares_data_and_metadata_without_changing_layer_identity() -> Resul
     let styled = source.restyled(ColorMapPreset::Rainbow, (-1.0, 10.0))?;
     let selected = styled.with_property("b")?;
     for snapshot in [&*styled, &*selected] {
-        assert_eq!(snapshot.id(), source.id());
-        assert_eq!(snapshot.name(), source.name());
-        assert_eq!(snapshot.bounds(), source.bounds());
-        assert_eq!(snapshot.source_json(), source.source_json());
-        assert!(Arc::ptr_eq(&snapshot.numeric_properties, &source.numeric_properties));
-        match (&snapshot.data, &source.data) {
-            (VectorData::GeoJson(actual), VectorData::GeoJson(original)) => assert!(Arc::ptr_eq(actual, original)),
-            _ => panic!("Expected shared GeoJSON"),
-        }
-        assert_eq!(
-            snapshot.layers_json(1.0, "red").iter().map(|layer| layer["id"].clone()).collect::<Vec<_>>(),
-            source.layers_json(1.0, "red").iter().map(|layer| layer["id"].clone()).collect::<Vec<_>>()
-        );
+        assert_shared_geojson_snapshot(snapshot, &source);
     }
     assert_ne!(styled.style_id(), source.style_id());
     assert_ne!(selected.style_id(), styled.style_id());
@@ -137,6 +125,22 @@ fn restyling_shares_data_and_metadata_without_changing_layer_identity() -> Resul
     assert_eq!(selected.range(), Some((-8.0, -2.0)));
     assert_eq!(selected.data_range(), Some((-8.0, -2.0)));
     Ok(())
+}
+
+fn assert_shared_geojson_snapshot(snapshot: &VectorSource, source: &VectorSource) {
+    assert_eq!(snapshot.id(), source.id());
+    assert_eq!(snapshot.name(), source.name());
+    assert_eq!(snapshot.bounds(), source.bounds());
+    assert_eq!(snapshot.source_json(), source.source_json());
+    assert!(Arc::ptr_eq(&snapshot.numeric_properties, &source.numeric_properties));
+    match (&snapshot.data, &source.data) {
+        (VectorData::GeoJson(actual), VectorData::GeoJson(original)) => assert!(Arc::ptr_eq(actual, original)),
+        _ => panic!("Expected shared GeoJSON"),
+    }
+    assert_eq!(
+        snapshot.layers_json(1.0, "red").iter().map(|layer| layer["id"].clone()).collect::<Vec<_>>(),
+        source.layers_json(1.0, "red").iter().map(|layer| layer["id"].clone()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -345,28 +349,45 @@ fn write_tiled_fixture(path: &Path, pmtiles: bool) -> Result<()> {
         bytes.extend(metadata);
         std::fs::write(path, bytes)?;
     } else {
-        let connection = sqlite::Connection::new(path, sqlite::AccessMode::Create)?;
-        connection.execute("CREATE TABLE metadata (name TEXT, value TEXT)")?;
-        connection.execute("CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")?;
-        let mut insert = connection.prepare_statement("INSERT INTO tiles VALUES (0,0,0,?1) RETURNING zoom_level")?;
-        insert.bind_blob(1, &[0x1a, 0x0e, 0x0a, 0x06, b'v', b'a', b'l', b'u', b'e', b's', 0x28, 0x80, 0x20, 0x78, 0x02])?;
-        ensure!(insert.next().is_some(), "Could not insert empty fixture tile");
-        drop(insert);
-        let metadata = metadata.to_string();
-        for (name, value) in [
-            ("format", "pbf"),
-            ("json", metadata.as_str()),
-            ("minzoom", "0"),
-            ("maxzoom", "0"),
-            ("bounds", "-4,49,6,53"),
-        ] {
-            let statement = connection.prepare_statement("INSERT INTO metadata VALUES (?, ?)")?;
-            statement.bind_text(1, name)?;
-            statement.bind_text(2, value)?;
-            statement.step();
-        }
+        write_mbtiles_fixture(path, &metadata)?;
     }
     Ok(())
+}
+
+fn write_mbtiles_fixture(path: &Path, metadata: &Value) -> Result<()> {
+    let connection = sqlite::Connection::new(path, sqlite::AccessMode::Create)?;
+    connection.execute("CREATE TABLE metadata (name TEXT, value TEXT)")?;
+    connection.execute("CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")?;
+    let mut insert = connection.prepare_statement("INSERT INTO tiles VALUES (0,0,0,?1) RETURNING zoom_level")?;
+    insert.bind_blob(1, &[0x1a, 0x0e, 0x0a, 0x06, b'v', b'a', b'l', b'u', b'e', b's', 0x28, 0x80, 0x20, 0x78, 0x02])?;
+    ensure!(insert.next().is_some(), "Could not insert empty fixture tile");
+    drop(insert);
+    let metadata = metadata.to_string();
+    for (name, value) in [
+        ("format", "pbf"),
+        ("json", metadata.as_str()),
+        ("minzoom", "0"),
+        ("maxzoom", "0"),
+        ("bounds", "-4,49,6,53"),
+    ] {
+        let statement = connection.prepare_statement("INSERT INTO metadata VALUES (?, ?)")?;
+        statement.bind_text(1, name)?;
+        statement.bind_text(2, value)?;
+        statement.step();
+    }
+    Ok(())
+}
+
+fn assert_tiled_numeric_schema(source: &VectorSource) {
+    assert!(matches!(source.data, VectorData::Tiled { .. }));
+    assert!(!source.points_only(), "Archive schema does not declare a point geometry type");
+    assert!(source.numeric_properties().iter().any(|property| property.name() == "value"));
+    assert!(
+        source
+            .numeric_properties()
+            .iter()
+            .all(|property| property.range() == (0.0, 1.0) && property.name() != "label")
+    );
 }
 
 #[test]
@@ -376,15 +397,7 @@ fn tiled_archives_use_schema_ranges_and_remain_native_after_styling() -> Result<
         let path = directory.path().join(format!("values.{extension}"));
         write_tiled_fixture(&path, pmtiles)?;
         let source = VectorSource::open(&path)?.context("Expected tiled vector source")?.remove(0);
-        assert!(matches!(source.data, VectorData::Tiled { .. }));
-        assert!(!source.points_only(), "Archive schema does not declare a point geometry type");
-        assert!(source.numeric_properties().iter().any(|property| property.name() == "value"));
-        assert!(
-            source
-                .numeric_properties()
-                .iter()
-                .all(|property| property.range() == (0.0, 1.0) && property.name() != "label")
-        );
+        assert_tiled_numeric_schema(&source);
         // GDAL may also expose the native numeric `mvt_id` feature identifier.
         let source = source.with_property("value")?;
         assert!(!source.points_only());

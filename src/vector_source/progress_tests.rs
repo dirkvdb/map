@@ -12,18 +12,28 @@ fn write_projected_gpkg(path: &Path, names: &[&str]) -> Result<()> {
             srs: Some(&srs),
             ..Default::default()
         })?;
-        FieldDefn::new("ratio", OGRFieldType::OFTReal)?.add_to_layer(&layer)?;
-        FieldDefn::new("code", OGRFieldType::OFTString)?.add_to_layer(&layer)?;
-        // Intentionally much smaller than a single default GDAL Arrow batch.
-        for index in 0..128 {
-            let mut feature = Feature::new(layer.defn())?;
-            feature.set_geometry(Geometry::from_wkt("POINT (445277.96317309426 6621293.722740169)")?)?;
-            feature.set_field_double(0, index as f64 + 0.125)?;
-            feature.set_field_string(1, "00123")?;
-            feature.create(&layer)?;
-        }
+        add_progress_fields(&layer)?;
+        write_progress_features(&layer)?;
     }
     dataset.close()?;
+    Ok(())
+}
+
+fn add_progress_fields(layer: &gdal::vector::Layer<'_>) -> Result<()> {
+    FieldDefn::new("ratio", OGRFieldType::OFTReal)?.add_to_layer(layer)?;
+    FieldDefn::new("code", OGRFieldType::OFTString)?.add_to_layer(layer)?;
+    Ok(())
+}
+
+fn write_progress_features(layer: &gdal::vector::Layer<'_>) -> Result<()> {
+    // Intentionally much smaller than a single default GDAL Arrow batch.
+    for index in 0..128 {
+        let mut feature = Feature::new(layer.defn())?;
+        feature.set_geometry(Geometry::from_wkt("POINT (445277.96317309426 6621293.722740169)")?)?;
+        feature.set_field_double(0, index as f64 + 0.125)?;
+        feature.set_field_string(1, "00123")?;
+        feature.create(layer)?;
+    }
     Ok(())
 }
 
@@ -235,24 +245,28 @@ fn callback_panics_restore_thread_local_values_without_unwinding_through_gdal() 
     for previous in [None, Some(c""), Some(c"YES")] {
         let _restore = ScopedArrowApi::set(previous);
         for panic_on_preparing in [false, true] {
-            let mut panics = 0;
-            let error = VectorSource::open_with_load_progress(&path, &mut |event| {
-                if if panic_on_preparing {
-                    event == VectorLoadProgress::Preparing
-                } else {
-                    matches!(event, VectorLoadProgress::Converting(fraction) if fraction > 0.0)
-                } {
-                    panics += 1;
-                    panic!("Callback panic during {event:?}");
-                }
-            })
-            .expect_err("GDAL callback panics must become errors");
-            assert!(format!("{error:#}").contains("progress callback panicked"));
-            assert_eq!(panics, 1);
-            assert_eq!(ScopedArrowApi::current().as_deref(), previous);
+            assert_callback_panic(&path, panic_on_preparing, previous);
         }
     }
     Ok(())
+}
+
+fn assert_callback_panic(path: &Path, panic_on_preparing: bool, previous: Option<&CStr>) {
+    let mut panics = 0;
+    let error = VectorSource::open_with_load_progress(path, &mut |event| {
+        let should_panic = match event {
+            VectorLoadProgress::Preparing => panic_on_preparing,
+            VectorLoadProgress::Converting(fraction) => !panic_on_preparing && fraction > 0.0,
+        };
+        if should_panic {
+            panics += 1;
+            panic!("Callback panic during {event:?}");
+        }
+    })
+    .expect_err("GDAL callback panics must become errors");
+    assert!(format!("{error:#}").contains("progress callback panicked"));
+    assert_eq!(panics, 1);
+    assert_eq!(ScopedArrowApi::current().as_deref(), previous);
 }
 
 #[test]

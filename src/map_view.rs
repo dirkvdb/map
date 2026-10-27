@@ -25,7 +25,14 @@ use crate::vector_source::VectorSource;
 gpui_kit::actions!(map, [ZoomIn, ZoomOut, PanLeft, PanRight, PanUp, PanDown, ToggleTileBoundaries]);
 
 pub fn init(cx: &mut App) -> anyhow::Result<()> {
-    cx.bind_keys([
+    let workspace = workspace_key_bindings(cx)?;
+    let navigation = navigation_key_bindings(cx)?;
+    cx.bind_keys(workspace.into_iter().chain(navigation));
+    Ok(())
+}
+
+fn workspace_key_bindings(cx: &App) -> anyhow::Result<[gpui_kit::KeyBinding; 7]> {
+    Ok([
         key_binding("?", crate::shortcuts::ShowShortcuts, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-,", crate::settings::OpenSettings, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-\\", crate::appearance::CycleAppearance, Some("RasterWorkspace"), cx)?,
@@ -33,6 +40,11 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
         key_binding("secondary-0", FitRaster, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-l", ToggleRasterControls, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-shift-d", ToggleTileBoundaries, Some("RasterWorkspace"), cx)?,
+    ])
+}
+
+fn navigation_key_bindings(cx: &App) -> anyhow::Result<[gpui_kit::KeyBinding; 7]> {
+    Ok([
         key_binding("+", ZoomIn, Some("MapNavigation"), cx)?,
         key_binding("=", ZoomIn, Some("MapNavigation"), cx)?,
         key_binding("-", ZoomOut, Some("MapNavigation"), cx)?,
@@ -40,8 +52,7 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
         key_binding("right", PanRight, Some("MapNavigation"), cx)?,
         key_binding("up", PanUp, Some("MapNavigation"), cx)?,
         key_binding("down", PanDown, Some("MapNavigation"), cx)?,
-    ]);
-    Ok(())
+    ])
 }
 
 const DRAG_SAMPLE_WINDOW: Duration = Duration::from_millis(100);
@@ -181,28 +192,7 @@ impl MapView {
 
         let raster_observation = cx.observe(&raster_panel, |_, _, cx| cx.notify());
         let theme_observation = cx.observe_global::<Theme>(|view, cx| view.request_render(cx));
-        let raster_subscription = cx.subscribe(&raster_panel, |view, _, event: &crate::raster_panel::RasterEvent, cx| {
-            let raster = event.source();
-            let vector = event.vector_source();
-            let selection_changed = view.raster.as_ref().map(|source| source.metadata().id) != raster.as_ref().map(|source| source.metadata().id)
-                || view.vector.as_ref().map(|source| source.id()) != vector.as_ref().map(|source| source.id());
-            view.raster = raster;
-            view.vector = vector;
-            view.opacity = event.opacity();
-            view.coast = None;
-            view.drag = None;
-            view.fit_pending = event.should_fit()
-                || (selection_changed
-                    && view.source_bounds().is_some_and(|bounds| {
-                        view.viewport.is_none_or(|viewport| {
-                            !view
-                                .camera
-                                .intersects_bounds(bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get()))
-                        })
-                    }));
-            view.fit_raster();
-            view.request_render(cx);
-        });
+        let raster_subscription = cx.subscribe(&raster_panel, |view, _, event, cx| view.apply_raster_event(event, cx));
         cx.on_release_in(window, |view, window, cx| {
             if let Some(image) = view.image.take() {
                 cx.drop_image(image, Some(window));
@@ -243,6 +233,30 @@ impl MapView {
         }
     }
 
+    fn apply_raster_event(&mut self, event: &crate::raster_panel::RasterEvent, cx: &mut Context<Self>) {
+        let raster = event.source();
+        let vector = event.vector_source();
+        let selection_changed = self.raster.as_ref().map(|source| source.metadata().id) != raster.as_ref().map(|source| source.metadata().id)
+            || self.vector.as_ref().map(|source| source.id()) != vector.as_ref().map(|source| source.id());
+        self.raster = raster;
+        self.vector = vector;
+        self.opacity = event.opacity();
+        self.coast = None;
+        self.drag = None;
+        self.fit_pending = event.should_fit() || (selection_changed && self.source_is_offscreen());
+        self.fit_raster();
+        self.request_render(cx);
+    }
+
+    fn source_is_offscreen(&self) -> bool {
+        let Some(bounds) = self.source_bounds() else { return false };
+        self.viewport.is_none_or(|viewport| {
+            !self
+                .camera
+                .intersects_bounds(bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get()))
+        })
+    }
+
     pub fn open_paths(&self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.raster_panel.update(cx, |panel, cx| panel.open_paths(paths, cx));
     }
@@ -266,27 +280,20 @@ impl MapView {
     fn watch_frames(renderer: &MapRenderer, cx: &mut Context<Self>) -> Task<()> {
         let frames = renderer.frames();
         cx.spawn(async move |this, cx| {
-            while let Ok(frame) = frames.recv().await {
-                if this.update_in(cx, |view, window, cx| view.apply_frame(frame, window, cx)).is_err() {
-                    break;
-                }
-            }
+            while let Ok(frame) = frames.recv().await
+                && this.update_in(cx, |view, window, cx| view.apply_frame(frame, window, cx)).is_ok()
+            {}
         })
     }
 
     fn watch_feature_results(renderer: &MapRenderer, cx: &mut Context<Self>) -> Task<()> {
         let results = renderer.feature_results();
         cx.spawn(async move |this, cx| {
-            while let Ok(result) = results.recv().await {
-                if this
-                    .update(cx, |view, cx| {
-                        view.apply_feature_result(result.revision(), result.into_features(), cx);
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
+            while let Ok(result) = results.recv().await
+                && this
+                    .update(cx, |view, cx| view.apply_feature_result(result.revision(), result.into_features(), cx))
+                    .is_ok()
+            {}
         })
     }
 
@@ -324,31 +331,13 @@ impl MapView {
     }
 
     fn apply_frame(&mut self, frame: MapFrame, window: &mut Window, cx: &mut Context<Self>) {
-        // The worker completes frames in order. Show progress for this band
-        // even if another range/palette update arrived while it was rendering;
-        // requiring an exact style revision starves the display during dragging.
-        if self.viewport != Some(frame.viewport)
-            || frame.basemap != basemap_style(cx)
-            || frame.tile_boundaries != self.tile_boundaries
-            || self.raster.as_ref().map(|source| source.metadata().id) != frame.raster_layer_id
-            || self.vector.as_ref().map(|source| source.id()) != frame.vector_layer_id
-        {
+        if !self.frame_is_current(&frame, cx) {
             return;
         }
         match frame.image {
             Ok(image) => {
-                if frame.vector_layer_id != self.traced_frame_vector {
-                    if let Some(source) = frame.vector_layer_id {
-                        log::info!(target: "map::vector_load", "source={source} stage=ui-first-requested-source-frame-applied since_last_open_request={:?} (may still be background-only)", self.raster_panel.read(cx).load_started().map(|started| started.elapsed()));
-                    }
-                    self.traced_frame_vector = frame.vector_layer_id;
-                }
-                if self.image.as_ref().is_none_or(|previous| !Arc::ptr_eq(previous, &image))
-                    && let Some(previous) = self.image.replace(image)
-                {
-                    // Dropping the Arc does not evict GPUI's uploaded texture.
-                    cx.drop_image(previous, Some(window));
-                }
+                self.trace_vector_frame(frame.vector_layer_id, cx);
+                self.replace_image(image, window, cx);
                 if frame.settled
                     && let Some(source) = frame.vector_layer_id
                 {
@@ -365,6 +354,36 @@ impl MapView {
             }
         }
         cx.notify();
+    }
+
+    fn frame_is_current(&self, frame: &MapFrame, cx: &App) -> bool {
+        // The worker completes frames in order. Show progress for this band
+        // even if another range/palette update arrived while it was rendering;
+        // requiring an exact style revision starves the display during dragging.
+        self.viewport == Some(frame.viewport)
+            && frame.basemap == basemap_style(cx)
+            && frame.tile_boundaries == self.tile_boundaries
+            && self.raster.as_ref().map(|source| source.metadata().id) == frame.raster_layer_id
+            && self.vector.as_ref().map(|source| source.id()) == frame.vector_layer_id
+    }
+
+    fn trace_vector_frame(&mut self, layer_id: Option<u64>, cx: &App) {
+        if layer_id == self.traced_frame_vector {
+            return;
+        }
+        if let Some(source) = layer_id {
+            log::info!(target: "map::vector_load", "source={source} stage=ui-first-requested-source-frame-applied since_last_open_request={:?} (may still be background-only)", self.raster_panel.read(cx).load_started().map(|started| started.elapsed()));
+        }
+        self.traced_frame_vector = layer_id;
+    }
+
+    fn replace_image(&mut self, image: Arc<RenderImage>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.image.as_ref().is_none_or(|previous| !Arc::ptr_eq(previous, &image))
+            && let Some(previous) = self.image.replace(image)
+        {
+            // Dropping the Arc does not evict GPUI's uploaded texture.
+            cx.drop_image(previous, Some(window));
+        }
     }
 
     fn request_render(&mut self, cx: &mut Context<Self>) {
@@ -503,19 +522,7 @@ impl MapView {
                 layer_id: source.id(),
                 point: (f64::from(f32::from(offset.x)), f64::from(f32::from(offset.y))),
             };
-            if self.vector_hover != Some(hover) {
-                let same_layer = self.vector_hover.is_some_and(|previous| previous.layer_id == hover.layer_id);
-                self.hover_revision = self.hover_revision.wrapping_add(1);
-                self.vector_hover = Some(hover);
-                // Retain the last hit while refreshing this layer, including
-                // camera changes, so pending queries do not flash an empty pane.
-                if !same_layer {
-                    self.show_vector_features(Vec::new(), cx);
-                }
-                if let Some(renderer) = &self.renderer {
-                    renderer.query_features(self.hover_revision, hover.map, hover.layer_id, hover.point);
-                }
-            }
+            self.update_vector_hover(hover, cx);
             return;
         }
         self.clear_vector_hover(cx);
@@ -524,10 +531,27 @@ impl MapView {
         let dpi = self.viewport.map_or(1, |viewport| viewport.scale.round().clamp(1.0, 4.0) as u8);
         self.pixel_info.update(cx, |info, cx| info.show(coordinate, self.raster.clone(), dpi, cx));
     }
+
+    fn update_vector_hover(&mut self, hover: VectorHover, cx: &mut Context<Self>) {
+        if self.vector_hover == Some(hover) {
+            return;
+        }
+        let same_layer = self.vector_hover.is_some_and(|previous| previous.layer_id == hover.layer_id);
+        self.hover_revision = self.hover_revision.wrapping_add(1);
+        self.vector_hover = Some(hover);
+        // Retain the last hit while refreshing this layer, including
+        // camera changes, so pending queries do not flash an empty pane.
+        if !same_layer {
+            self.show_vector_features(Vec::new(), cx);
+        }
+        if let Some(renderer) = &self.renderer {
+            renderer.query_features(self.hover_revision, hover.map, hover.layer_id, hover.point);
+        }
+    }
 }
 
-impl Render for MapView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl MapView {
+    fn render_map_canvas(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
         let previous_bounds = self.bounds;
         let previous_viewport = self.viewport;
@@ -537,6 +561,70 @@ impl Render for MapView {
                 view.end_drag(window, cx)
             }
         });
+
+        canvas(
+            move |bounds, window, cx| Self::measure_map(view, bounds, previous_bounds, previous_viewport, window, cx),
+            move |_, _, window, _| Self::track_map_drag(window, drag_move, drag_end),
+        )
+        .absolute()
+        .size_full()
+    }
+
+    fn measure_map(
+        view: gpui_kit::WeakEntity<Self>,
+        bounds: Bounds<Pixels>,
+        previous_bounds: Option<Bounds<Pixels>>,
+        previous_viewport: Option<Viewport>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // Native raster dimensions follow resolved layout and display DPI,
+        // rather than the application's rem-based control scale.
+        let Some(width) = NonZeroU32::new(f32::from(bounds.size.width).round() as u32) else {
+            return;
+        };
+        let Some(height) = NonZeroU32::new(f32::from(bounds.size.height).round() as u32) else {
+            return;
+        };
+        let viewport = Viewport {
+            width,
+            height,
+            scale: window.scale_factor(),
+        };
+        if previous_viewport != Some(viewport) || previous_bounds != Some(bounds) {
+            window.defer(cx, move |_, cx| {
+                let _ = view.update(cx, |view, cx| view.apply_viewport(bounds, viewport, cx));
+            });
+        }
+    }
+
+    fn apply_viewport(&mut self, bounds: Bounds<Pixels>, viewport: Viewport, cx: &mut Context<Self>) {
+        self.bounds = Some(bounds);
+        self.viewport = Some(viewport);
+        self.fit_raster();
+        self.request_render(cx);
+    }
+
+    fn track_map_drag(
+        window: &mut Window,
+        drag_move: impl Fn(&MouseMoveEvent, &mut Window, &mut App) + 'static,
+        drag_end: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    ) {
+        // Register window-wide drag tracking each frame so dragging
+        // and release continue across the map's boundary.
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble {
+                drag_move(event, window, cx)
+            }
+        });
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if phase == DispatchPhase::Capture {
+                drag_end(event, window, cx)
+            }
+        });
+    }
+
+    fn render_surface(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let focus_ring = cx.theme().ring;
         let mut surface = div()
             .id("map-surface")
@@ -589,52 +677,7 @@ impl Render for MapView {
                     view.pixel_info.update(cx, |info, cx| info.clear(cx));
                 }
             }))
-            .child(
-                canvas(
-                    move |bounds, window, cx| {
-                        // Native raster dimensions follow resolved layout and display DPI,
-                        // rather than the application's rem-based control scale.
-                        let Some(width) = NonZeroU32::new(f32::from(bounds.size.width).round() as u32) else {
-                            return;
-                        };
-                        let Some(height) = NonZeroU32::new(f32::from(bounds.size.height).round() as u32) else {
-                            return;
-                        };
-                        let viewport = Viewport {
-                            width,
-                            height,
-                            scale: window.scale_factor(),
-                        };
-                        if previous_viewport != Some(viewport) || previous_bounds != Some(bounds) {
-                            window.defer(cx, move |_, cx| {
-                                let _ = view.update(cx, |view, cx| {
-                                    view.bounds = Some(bounds);
-                                    view.viewport = Some(viewport);
-                                    view.fit_raster();
-                                    view.request_render(cx);
-                                });
-                            });
-                        }
-                    },
-                    move |_, _, window, _| {
-                        // Register window-wide drag tracking each frame so dragging
-                        // and release continue across the map's boundary.
-                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-                            if phase == DispatchPhase::Bubble {
-                                drag_move(event, window, cx)
-                            }
-                        });
-                        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-                            if phase == DispatchPhase::Capture {
-                                drag_end(event, window, cx)
-                            }
-                        });
-                    },
-                )
-                .absolute()
-                .size_full(),
-            );
-
+            .child(self.render_map_canvas(cx));
         if let Some(image) = &self.image {
             surface = surface.child(img(image.clone()).absolute().size_full().object_fit(ObjectFit::Fill));
         }
@@ -651,6 +694,10 @@ impl Render for MapView {
             );
         }
 
+        surface
+    }
+
+    fn render_alerts(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let load_error = self.raster_panel.read(cx).load_error();
         let mut alerts = div().absolute().bottom_0().left_0().flex().flex_col().gap_3().w_full();
         if self.error.is_some() || load_error.is_some() {
@@ -686,7 +733,117 @@ impl Render for MapView {
                 })),
             ));
         }
+        alerts
+    }
 
+    fn render_title_sources(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                Button::new("open-raster")
+                    .small()
+                    .ghost()
+                    .icon(IconName::FolderOpen)
+                    .accessibility_label("Open dataset")
+                    .tooltip_with_action("Open dataset", &OpenDataset, Some("RasterWorkspace"))
+                    .loading(self.raster_panel.read(cx).is_loading())
+                    .disabled(self.raster_panel.read(cx).is_loading())
+                    .on_click(cx.listener(|view, _, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx)))),
+            )
+            .child(self.raster_panel.update(cx, |panel, cx| panel.render_layer_selector(window, cx)))
+            .children(self.raster_panel.read(cx).load_status().map(|status| {
+                div()
+                    .id("vector-load-status")
+                    .role(gpui_kit::Role::Status)
+                    .aria_label(status.clone())
+                    .test_support()
+                    .min_w_0()
+                    .max_w(rems(12.0))
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .truncate()
+                    .child(status)
+            }))
+    }
+
+    fn render_title_actions(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .pr_2()
+            .child(
+                Button::new("toggle-tile-boundaries")
+                    .small()
+                    .ghost()
+                    .icon(IconName::Bug)
+                    .accessibility_label("Debug mode")
+                    .tooltip_with_action("Debug mode: tile boundaries, tile IDs, and FPS", &ToggleTileBoundaries, Some("RasterWorkspace"))
+                    .selected(self.tile_boundaries)
+                    .toggled(self.tile_boundaries)
+                    .on_click(cx.listener(|view, _, _, cx| view.toggle_tile_boundaries(cx))),
+            )
+            .child(
+                Button::new("open-settings")
+                    .small()
+                    .ghost()
+                    .icon(IconName::Settings)
+                    .accessibility_label("Settings")
+                    .tooltip_with_action("Settings…", &crate::settings::OpenSettings, Some("RasterWorkspace"))
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::settings::OpenSettings), cx)),
+            )
+    }
+
+    fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        TitleBar::new()
+            .child(self.render_title_sources(window, cx))
+            .child(self.render_title_actions(cx))
+    }
+
+    fn render_map_content(&self, surface: impl IntoElement, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(surface)
+            .child(div().absolute().bottom_3().left_3().max_w_full().child(self.pixel_info.clone()))
+            .children(self.vector.is_some().then(|| {
+                div()
+                    .absolute()
+                    .top_3()
+                    .left_3()
+                    // Leave the right-hand controls and their gap unobstructed.
+                    .right(rems(21.5))
+                    .bottom_12()
+                    .flex()
+                    .flex_col()
+                    .max_w(rems(24.0))
+                    .child(self.feature_info.clone())
+            }))
+            .children((self.raster.is_some() || self.vector.is_some()).then(|| {
+                div()
+                    .absolute()
+                    .top_3()
+                    .right_3()
+                    .bottom_3()
+                    .flex()
+                    .flex_col()
+                    .w_80()
+                    .max_w_full()
+                    .child(self.raster_panel.clone())
+            }))
+            .children(self.tile_boundaries.then(|| gpui_fps::fps_monitor(window, cx).anchor(Anchor::TopLeft)))
+            .children(self.raster_panel.read(cx).render_load_progress())
+    }
+}
+
+impl Render for MapView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let surface = self.render_surface(cx);
+        let alerts = self.render_alerts(cx);
         div()
             .id("raster-workspace")
             .key_context("RasterWorkspace")
@@ -716,103 +873,8 @@ impl Render for MapView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(
-                TitleBar::new()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new("open-raster")
-                                    .small()
-                                    .ghost()
-                                    .icon(IconName::FolderOpen)
-                                    .accessibility_label("Open dataset")
-                                    .tooltip_with_action("Open dataset", &OpenDataset, Some("RasterWorkspace"))
-                                    .loading(self.raster_panel.read(cx).is_loading())
-                                    .disabled(self.raster_panel.read(cx).is_loading())
-                                    .on_click(cx.listener(|view, _, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx)))),
-                            )
-                            .child(self.raster_panel.update(cx, |panel, cx| panel.render_layer_selector(window, cx)))
-                            .children(self.raster_panel.read(cx).load_status().map(|status| {
-                                div()
-                                    .id("vector-load-status")
-                                    .role(gpui_kit::Role::Status)
-                                    .aria_label(status.clone())
-                                    .test_support()
-                                    .min_w_0()
-                                    .max_w(rems(12.0))
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .truncate()
-                                    .child(status)
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .pr_2()
-                            .child(
-                                Button::new("toggle-tile-boundaries")
-                                    .small()
-                                    .ghost()
-                                    .icon(IconName::Bug)
-                                    .accessibility_label("Debug mode")
-                                    .tooltip_with_action("Debug mode: tile boundaries, tile IDs, and FPS", &ToggleTileBoundaries, Some("RasterWorkspace"))
-                                    .selected(self.tile_boundaries)
-                                    .toggled(self.tile_boundaries)
-                                    .on_click(cx.listener(|view, _, _, cx| view.toggle_tile_boundaries(cx))),
-                            )
-                            .child(
-                                Button::new("open-settings")
-                                    .small()
-                                    .ghost()
-                                    .icon(IconName::Settings)
-                                    .accessibility_label("Settings")
-                                    .tooltip_with_action("Settings…", &crate::settings::OpenSettings, Some("RasterWorkspace"))
-                                    .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::settings::OpenSettings), cx)),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .child(surface)
-                    .child(div().absolute().bottom_3().left_3().max_w_full().child(self.pixel_info.clone()))
-                    .children(self.vector.is_some().then(|| {
-                        div()
-                            .absolute()
-                            .top_3()
-                            .left_3()
-                            // Leave the right-hand controls and their gap unobstructed.
-                            .right(rems(21.5))
-                            .bottom_12()
-                            .flex()
-                            .flex_col()
-                            .max_w(rems(24.0))
-                            .child(self.feature_info.clone())
-                    }))
-                    .children((self.raster.is_some() || self.vector.is_some()).then(|| {
-                        div()
-                            .absolute()
-                            .top_3()
-                            .right_3()
-                            .bottom_3()
-                            .flex()
-                            .flex_col()
-                            .w_80()
-                            .max_w_full()
-                            .child(self.raster_panel.clone())
-                    }))
-                    .children(self.tile_boundaries.then(|| gpui_fps::fps_monitor(window, cx).anchor(Anchor::TopLeft)))
-                    .children(self.raster_panel.read(cx).render_load_progress()),
-            )
+            .child(self.render_title_bar(window, cx))
+            .child(self.render_map_content(surface, window, cx))
             .child(alerts)
     }
 }
@@ -831,6 +893,9 @@ mod tests {
     use gpui_kit::{AppContext, InputEvent as _, TestAppContext, point, px, size};
 
     use super::*;
+    use crate::appearance::{Appearance, AppearanceMode};
+    use gpui_kit::ElementId;
+    use gpui_kit::component::{ThemeMode, ThemeRegistry};
 
     #[gpui_kit::test]
     fn appearance_shortcut_cycles_persists_and_replaces_the_mode_indicator(cx: &mut TestAppContext) {
@@ -850,12 +915,7 @@ mod tests {
             crate::follow_system_appearance(window, cx);
             appearance::select_theme(ThemeMode::Light, "Gruvbox Light", window, cx).unwrap();
             appearance::select_theme(ThemeMode::Dark, "Tokyo Night", window, cx).unwrap();
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
+            let map = cx.new(|cx| new_test_map(window, cx));
             view = Some(map.clone());
             gpui_kit::base::Root::new(map, window, cx)
         });
@@ -930,12 +990,7 @@ mod tests {
         let mut view = None;
         let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
             appearance::select_mode(AppearanceMode::Dark, window, cx).unwrap();
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
+            let map = cx.new(|cx| new_test_map(window, cx));
             view = Some(map.clone());
             gpui_kit::base::Root::new(map, window, cx)
         });
@@ -966,43 +1021,7 @@ mod tests {
                         }
                     }
                 };
-                view.update(cx, |map, cx| {
-                    assert_eq!(map.requested.as_ref().unwrap().basemap, expected);
-                    assert_eq!(map.camera, camera);
-                    let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
-                    map.apply_frame(
-                        MapFrame {
-                            viewport: map.viewport.unwrap(),
-                            basemap: expected,
-                            tile_boundaries: false,
-                            raster_layer_id: None,
-                            vector_layer_id: None,
-                            settled: false,
-                            image: Ok(image.clone()),
-                        },
-                        window,
-                        cx,
-                    );
-                    map.apply_frame(
-                        MapFrame {
-                            viewport: map.viewport.unwrap(),
-                            basemap: if expected == BasemapStyle::Light {
-                                BasemapStyle::Dark
-                            } else {
-                                BasemapStyle::Light
-                            },
-                            raster_layer_id: None,
-                            vector_layer_id: None,
-                            settled: false,
-                            image: Err(anyhow::anyhow!("Obsolete basemap failed")),
-                            tile_boundaries: false,
-                        },
-                        window,
-                        cx,
-                    );
-                    assert!(Arc::ptr_eq(map.image.as_ref().unwrap(), &image));
-                    assert!(map.error.is_none(), "Obsolete basemap errors must not replace the current map");
-                });
+                view.update(cx, |map, cx| check_basemap_frame_identity(map, expected, camera, window, cx));
             })
             .unwrap();
         }
@@ -1012,34 +1031,8 @@ mod tests {
     fn selecting_offscreen_bands_fits_the_dataset_but_visible_bands_and_styles_keep_the_camera(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let directory = tempfile::tempdir().unwrap();
-        let mut paths = Vec::new();
-        for (name, west) in [("near", -10.0), ("far", 100.0)] {
-            let path = directory.path().join(format!("{name}.tif"));
-            crate::raster_source::test_support::write_raster(&path, 4326, 2).unwrap();
-            let mut dataset = gdal::Dataset::open_ex(
-                &path,
-                gdal::DatasetOptions {
-                    open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            dataset.set_geo_transform(&[west, 20.0 / 64.0, 0.0, 10.0, 0.0, -20.0 / 64.0]).unwrap();
-            dataset.close().unwrap();
-            paths.push(path);
-        }
-        let mut view = None;
-        let handle = cx.open_window(size(px(900.), px(760.)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
+        let paths = write_separated_rasters(directory.path());
+        let (view, handle) = open_test_map(size(px(900.), px(760.)), cx);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             view.update(cx, |map, cx| map.open_paths(paths, cx));
@@ -1123,18 +1116,7 @@ mod tests {
         ]}"#,
         )
         .unwrap();
-        let mut view = None;
-        let handle = cx.open_window(size(px(900.), px(900.)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
+        let (view, handle) = open_test_map(size(px(900.), px(900.)), cx);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             view.update(cx, |map, cx| map.open_paths(vec![path.clone()], cx));
@@ -1199,18 +1181,7 @@ mod tests {
             r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"LineString","coordinates":[[4,50],[6,52]]}}]}"#,
         )
         .unwrap();
-        let mut view = None;
-        let handle = cx.open_window(size(px(900.), px(760.)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
+        let (view, handle) = open_test_map(size(px(900.), px(760.)), cx);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             view.update(cx, |map, cx| map.open_paths(vec![path.clone()], cx));
@@ -1247,40 +1218,7 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             view.update(cx, |map, cx| {
-                let current_id = map.vector.as_ref().unwrap().id();
-                assert_ne!(current_id, old_id);
-                assert!(map.raster.is_none());
-                assert_eq!(map.requested.as_ref().unwrap().vector_id, Some(current_id));
-                let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
-                map.apply_frame(
-                    MapFrame {
-                        viewport: map.viewport.unwrap(),
-                        basemap: basemap_style(cx),
-                        raster_layer_id: None,
-                        vector_layer_id: Some(old_id),
-                        settled: false,
-                        tile_boundaries: map.tile_boundaries,
-                        image: Ok(image.clone()),
-                    },
-                    window,
-                    cx,
-                );
-                assert!(map.image.is_none(), "A frame for the previous vector source must be rejected");
-                map.apply_frame(
-                    MapFrame {
-                        viewport: map.viewport.unwrap(),
-                        basemap: basemap_style(cx),
-                        raster_layer_id: None,
-                        vector_layer_id: Some(current_id),
-                        settled: false,
-                        tile_boundaries: map.tile_boundaries,
-                        image: Ok(image.clone()),
-                    },
-                    window,
-                    cx,
-                );
-                assert!(Arc::ptr_eq(map.image.as_ref().unwrap(), &image), "The current vector frame must be accepted");
-                assert!(map.error.is_none());
+                check_vector_frame_identity(map, old_id, window, cx);
             });
             view.read(cx).raster_panel.clone().update(cx, |panel, cx| panel.clear(window, cx));
         })
@@ -1307,9 +1245,7 @@ mod tests {
         let mut view = None;
         let handle = cx.open_window(size(px(640.0), px(400.0)), |window, cx| {
             let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
+                let map = new_test_map(window, cx);
                 map.open_paths(vec![directory.path().join("missing.tif")], cx);
                 map
             });
@@ -1340,18 +1276,7 @@ mod tests {
             init(cx).unwrap();
             cx.set_reduce_motion(true);
         });
-        let mut view = None;
-        let handle = cx.open_window(size(px(800.0), px(600.0)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
+        let (view, handle) = open_test_map(size(px(800.0), px(600.0)), cx);
         let (load, map_bounds) = cx
             .update_window(handle.into(), |_, window, cx| {
                 window.render_frame(cx);
@@ -1366,22 +1291,7 @@ mod tests {
         load.report_conversion(0.45);
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            let progress = window.find("vector-load-progress");
-            assert!(progress.visible());
-            assert_eq!(progress.role(), Some(gpui_kit::Role::ProgressIndicator));
-            assert_eq!(progress.label(), Some("Converting vectors · 45%"));
-            assert_eq!(window.find("vector-load-status").label(), Some("Converting vectors · 45%"));
-            assert_eq!(progress.bounds().top(), window.find("title-bar").bounds().bottom());
-            assert_eq!(progress.bounds().left(), map_bounds.left());
-            assert_eq!(progress.bounds().right(), map_bounds.right());
-            assert_eq!(progress.bounds().size.height, px(4.0), "Use the component's xsmall strip, not a card");
-            assert_eq!(window.find("map-surface").bounds(), map_bounds);
-            assert_eq!(window.find("map-surface").focused(), Some(true));
-            assert!(
-                window.try_find("raster-controls").is_none(),
-                "The strip cannot depend on an already loaded layer"
-            );
+            assert_vector_progress_layout(map_bounds, window, cx);
 
             let camera = view.read(cx).camera;
             window.scroll("vector-load-progress", ScrollDelta::Lines(point(0.0, 1.0)), cx);
@@ -1410,18 +1320,7 @@ mod tests {
     #[gpui_kit::test]
     fn file_picker_loading_keeps_the_generic_spinner_without_vector_progress(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        let mut view = None;
-        let handle = cx.open_window(size(px(640.0), px(400.0)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
+        let (view, handle) = open_test_map(size(px(640.0), px(400.0)), cx);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.click("open-raster", cx);
@@ -1448,9 +1347,7 @@ mod tests {
         let mut view = None;
         let handle = cx.open_window(size(px(640.0), px(400.0)), |window, cx| {
             let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
+                let map = new_test_map(window, cx);
                 map.open_paths(vec![directory.path().join("missing.tif")], cx);
                 map
             });
@@ -1542,12 +1439,7 @@ mod tests {
             });
         });
         let handle = cx.open_window(size(px(640.), px(400.)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
+            let map = cx.new(|cx| new_test_map(window, cx));
             gpui_kit::base::Root::new(map, window, cx)
         });
         cx.update_window(handle.into(), |_, window, cx| {
@@ -1579,18 +1471,7 @@ mod tests {
             init(cx).unwrap();
             cx.set_reduce_motion(true);
         });
-        let mut view = None;
-        let handle = cx.open_window(size(px(640.0), px(400.0)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
+        let (view, handle) = open_test_map(size(px(640.0), px(400.0)), cx);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("keyboard-shortcuts").is_none());
@@ -1643,25 +1524,6 @@ mod tests {
 
     #[gpui_kit::test]
     fn settings_dialog_is_centered_and_dismissal_restores_map_focus(cx: &mut TestAppContext) {
-        use gpui_kit::ElementId;
-
-        fn assert_preview_layout(card: Bounds<Pixels>, preview: Bounds<Pixels>, label: Bounds<Pixels>, context: &str) {
-            for (part, bounds) in [("preview", preview), ("label", label)] {
-                assert!(
-                    bounds.size.width > px(0.) && bounds.size.height > px(0.),
-                    "{context}: {part} must have nonzero geometry, got {bounds:?}"
-                );
-                assert!(
-                    bounds.left() >= card.left() && bounds.right() <= card.right() && bounds.top() >= card.top() && bounds.bottom() <= card.bottom(),
-                    "{context}: {part} {bounds:?} must be contained in card {card:?}"
-                );
-            }
-            assert!(
-                preview.bottom() <= label.top(),
-                "{context}: preview {preview:?} must stack above label {label:?} without overlap"
-            );
-        }
-
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::appearance::setup_test(None, cx);
@@ -1678,12 +1540,7 @@ mod tests {
                 if let Some(font_size) = font_size {
                     Theme::update(cx, |theme| theme.font_size = font_size);
                 }
-                let map = cx.new(|cx| {
-                    let mut map = MapView::new(window, cx);
-                    map.renderer = None;
-                    map._frames_task = None;
-                    map
-                });
+                let map = cx.new(|cx| new_test_map(window, cx));
                 view = Some(map.clone());
                 gpui_kit::base::Root::new(map, window, cx)
             });
@@ -1695,117 +1552,10 @@ mod tests {
             .unwrap();
             cx.run_until_parked();
             cx.update_window(handle.into(), |_, window, cx| {
-                window.render_frame(cx);
-                let bounds = window.within("dialog").find("surface").bounds();
-                assert!((bounds.center().x - viewport.width / 2.).abs() <= px(1.));
-                assert!((bounds.center().y - viewport.height / 2.).abs() <= px(1.));
-                assert!(bounds.left() >= px(0.) && bounds.right() <= viewport.width);
-                assert!(bounds.top() >= px(0.) && bounds.bottom() <= viewport.height);
-                assert!(window.find("appearance-settings").visible());
-                let done = window.find("settings-done");
-                assert!(done.visible());
-                assert!(done.bounds().left() >= bounds.left() && done.bounds().right() <= bounds.right());
-                assert!(done.bounds().top() >= bounds.top() && done.bounds().bottom() <= bounds.bottom());
-                if let Some(font_size) = font_size {
-                    assert_eq!(cx.theme().font_size, font_size);
-                    assert_eq!(window.rem_size(), font_size, "The zoom case must exercise Root's rem scaling");
-                }
-                let layout = format!("viewport {viewport:?}, font {:?}", window.rem_size());
-                let mut mode_bounds = Vec::<Bounds<Pixels>>::new();
-                for id in ["mode-light", "mode-dark", "mode-system"] {
-                    let mode = window.find(id).bounds();
-                    assert!(
-                        mode.size.width > px(0.) && mode.size.height > px(0.),
-                        "Mode card {id} must have nonzero geometry"
-                    );
-                    assert!(mode.left() >= bounds.left() && mode.right() <= bounds.right());
-                    let scope = window.within(id);
-                    assert_preview_layout(
-                        mode,
-                        scope.find("mode-preview").bounds(),
-                        scope.find("mode-label").bounds(),
-                        &format!("Mode {id}, {layout}"),
-                    );
-                    for previous in &mode_bounds {
-                        assert!(
-                            mode.left() >= previous.right()
-                                || mode.right() <= previous.left()
-                                || mode.top() >= previous.bottom()
-                                || mode.bottom() <= previous.top(),
-                            "Mode cards must wrap without overlapping at {viewport:?}, font {font_size:?}"
-                        );
-                    }
-                    mode_bounds.push(mode);
-                }
-                let themes = gpui_kit::component::ThemeRegistry::global(cx).sorted_themes();
-                let light_themes = themes.iter().filter(|theme| !theme.mode.is_dark()).collect::<Vec<_>>();
-                let first = window.find((ElementId::from("theme"), light_themes[0].name.clone())).bounds();
-                let second = window.find((ElementId::from("theme"), light_themes[1].name.clone())).bounds();
-                let last_light = light_themes
-                    .iter()
-                    .map(|theme| window.find((ElementId::from("theme"), theme.name.clone())).bounds().bottom())
-                    .fold(first.bottom(), |bottom, next| bottom.max(next));
-                let first_dark = themes.iter().find(|theme| theme.mode.is_dark()).unwrap();
-                let first_dark = window.find((ElementId::from("theme"), first_dark.name.clone())).bounds();
-                assert!(first_dark.top() > last_light, "Dark themes must have their own section below all light themes");
-                for mode in &mode_bounds {
-                    assert!(first.top() >= mode.bottom(), "The theme grid must remain below the mode choices after wrapping");
-                }
-                if font_size.is_some() {
-                    assert!(second.top() >= first.bottom(), "At high zoom the narrow grid must reflow to a single column");
-                    assert!((first.left() - second.left()).abs() <= px(1.));
-                    assert!((first.right() - second.right()).abs() <= px(1.));
-                } else {
-                    assert!(
-                        (first.top() - second.top()).abs() <= px(1.),
-                        "At normal zoom theme cards should share a grid row"
-                    );
-                    assert!(first.right() <= second.left(), "Adjacent theme cards must not overlap");
-                }
-                let mut card_bounds = Vec::<Bounds<Pixels>>::new();
-                for theme in themes {
-                    let card = window.find((ElementId::from("theme"), theme.name.clone()));
-                    let label = format!("{}, {} theme", theme.name, if theme.mode.is_dark() { "Dark" } else { "Light" });
-                    assert_eq!(card.label(), Some(label.as_str()));
-                    assert_eq!(card.selected(), Some(&theme.name == cx.theme().theme_name()));
-                    let (section, other_section) = if theme.mode.is_dark() {
-                        ("dark-themes", "light-themes")
-                    } else {
-                        ("light-themes", "dark-themes")
-                    };
-                    let id = (ElementId::from("theme"), theme.name.clone());
-                    assert!(
-                        window.within(section).try_find(id.clone()).is_some(),
-                        "Each section must contain only its matching themes"
-                    );
-                    assert!(window.within(other_section).try_find(id).is_none());
-                    let card = card.bounds();
-                    assert!(
-                        card.size.width > px(0.) && card.size.height > px(0.),
-                        "Theme {} must have nonzero geometry",
-                        theme.name
-                    );
-                    assert!(card.left() >= bounds.left() && card.right() <= bounds.right());
-                    assert!((card.size.width - first.size.width).abs() <= px(1.));
-                    assert!((card.size.height - first.size.height).abs() <= px(1.));
-                    let scope = window.within((ElementId::from("theme"), theme.name.clone()));
-                    assert_preview_layout(
-                        card,
-                        scope.find("theme-swatch").bounds(),
-                        scope.find("theme-label").bounds(),
-                        &format!("Theme {}, {layout}", theme.name),
-                    );
-                    for previous in &card_bounds {
-                        assert!(
-                            card.left() >= previous.right()
-                                || card.right() <= previous.left()
-                                || card.top() >= previous.bottom()
-                                || card.bottom() <= previous.top(),
-                            "Theme cards must not overlap at {viewport:?}, font {font_size:?}"
-                        );
-                    }
-                    card_bounds.push(card);
-                }
+                let bounds = assert_settings_dialog_bounds(viewport, font_size, window, cx);
+                let mode_bounds = assert_mode_cards_layout(bounds, viewport, font_size, window);
+                let first = assert_theme_grid_layout(&mode_bounds, font_size, window, cx);
+                assert_theme_cards_layout(bounds, first, viewport, font_size, window, cx);
                 if escape {
                     window.press("escape", cx);
                 } else {
@@ -1825,35 +1575,6 @@ mod tests {
 
     #[gpui_kit::test]
     fn settings_shortcut_changes_appearance_and_escape_restores_map_focus(cx: &mut TestAppContext) {
-        use crate::appearance::{Appearance, AppearanceMode};
-        use gpui_kit::ElementId;
-        use gpui_kit::component::{ThemeMode, ThemeRegistry};
-
-        fn reveal_theme(name: &SharedString, themes: &[SharedString], window: &mut Window, cx: &mut App) {
-            let id = (ElementId::from("theme"), name.clone());
-            for _ in 0..100 {
-                let card = window.find(id.clone());
-                let dialog = window.within("dialog").find("surface").bounds();
-                let top = dialog.top() + px(80.);
-                let bottom = window.find("settings-done").bounds().top() - px(8.);
-                if card.visible() && card.bounds().top() >= top && card.bounds().bottom() <= bottom {
-                    return;
-                }
-                // Wheel over a visible card so native hit testing reaches the
-                // scrolling body, even when the requested card is clipped.
-                let anchor = themes
-                    .iter()
-                    .find(|name| {
-                        let card = window.find((ElementId::from("theme"), (*name).clone()));
-                        card.visible() && card.bounds().center().y > top && card.bounds().center().y < bottom
-                    })
-                    .expect("The scrolling body must expose a theme card");
-                let delta = if card.bounds().center().y < dialog.center().y { 80. } else { -80. };
-                window.scroll((ElementId::from("theme"), anchor.clone()), ScrollDelta::Pixels(point(px(0.), px(delta))), cx);
-            }
-            panic!("Theme card {name} did not scroll into view");
-        }
-
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("appearance.json");
         cx.update(|cx| {
@@ -1864,12 +1585,7 @@ mod tests {
         let mut view = None;
         let handle = cx.open_window(size(px(1000.), px(800.)), |window, cx| {
             crate::appearance::apply(window, cx);
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
+            let map = cx.new(|cx| new_test_map(window, cx));
             view = Some(map.clone());
             gpui_kit::base::Root::new(map, window, cx)
         });
@@ -1885,38 +1601,9 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.find("appearance-settings").visible());
-            for (id, label, selected) in [
-                ("mode-light", "Light", false),
-                ("mode-dark", "Dark", false),
-                ("mode-system", "Follow system", true),
-            ] {
-                let mode = window.find(id);
-                assert_eq!(mode.label(), Some(label));
-                assert_eq!(mode.selected(), Some(selected));
-            }
-            window.click("mode-light", cx);
-            assert_eq!(Appearance::mode(cx), AppearanceMode::Light);
-            assert_eq!(cx.theme().mode, ThemeMode::Light);
-            assert_eq!(window.find("mode-light").selected(), Some(true));
-            window.press("tab", cx);
-            assert_eq!(window.find("mode-dark").focused(), Some(true));
-            assert_eq!(window.find("mode-dark").selected(), Some(false), "Focusing a mode must not select it");
-            window.press("space", cx);
-            assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
-            assert_eq!(cx.theme().mode, ThemeMode::Dark);
-            assert_eq!(window.find("mode-dark").selected(), Some(true));
-            assert_eq!(window.find("mode-light").selected(), Some(false));
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["mode"],
-                "dark"
-            );
-            window.press("tab", cx);
-            assert_eq!(window.find("mode-system").focused(), Some(true));
-            window.press("enter", cx);
-            assert_eq!(Appearance::mode(cx), AppearanceMode::System);
-            assert_eq!(cx.theme().mode, ThemeMode::from(window.appearance()));
-            assert_eq!(window.find("mode-system").selected(), Some(true));
-            window.click("mode-dark", cx);
+            assert_initial_appearance_modes(window);
+            exercise_light_and_dark_modes(&path, window, cx);
+            exercise_system_mode(window, cx);
         })
         .unwrap();
         cx.run_until_parked();
@@ -1927,44 +1614,7 @@ mod tests {
                 .map(|theme| theme.name.clone())
                 .collect::<Vec<_>>()
         });
-        let mut selected_cards = Vec::<SharedString>::new();
-        for (mode, appearance_mode, slot, saved_mode) in [
-            (ThemeMode::Light, AppearanceMode::Light, "light_theme", "light"),
-            (ThemeMode::Dark, AppearanceMode::Dark, "dark_theme", "dark"),
-        ] {
-            cx.update_window(handle.into(), |_, window, cx| {
-                window.render_frame(cx);
-                let name = ThemeRegistry::global(cx)
-                    .sorted_themes()
-                    .into_iter()
-                    .find(|theme| theme.mode == mode && theme.name.as_str() != Appearance::selected_theme(mode, cx))
-                    .unwrap()
-                    .name
-                    .clone();
-                reveal_theme(&name, &themes, window, cx);
-                let id = (ElementId::from("theme"), name.clone());
-                assert_eq!(window.find(id.clone()).selected(), Some(false));
-                window.click(id.clone(), cx);
-                assert_eq!(
-                    Appearance::mode(cx),
-                    appearance_mode,
-                    "An explicit appearance must follow the clicked card's mode"
-                );
-                assert_eq!(cx.theme().mode, mode);
-                assert_eq!(cx.theme().theme_name(), &name);
-                assert_eq!(Appearance::selected_theme(mode, cx), name.as_str());
-                assert_eq!(window.find(id).selected(), Some(true));
-                for previous in &selected_cards {
-                    assert_eq!(window.find((ElementId::from("theme"), previous.clone())).selected(), Some(false));
-                }
-                let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-                assert_eq!(saved["mode"], saved_mode);
-                assert_eq!(saved[slot], name.as_str());
-                selected_cards.push(name);
-            })
-            .unwrap();
-            cx.run_until_parked();
-        }
+        let selected_cards = select_and_check_theme_cards(&path, &themes, handle.into(), cx);
         cx.update_window(handle.into(), |_, window, cx| window.press("escape", cx)).unwrap();
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
@@ -1975,70 +1625,7 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            window.click("mode-system", cx);
-            let before = cx.theme().clone();
-            let inactive = if before.mode.is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
-            let name = ThemeRegistry::global(cx)
-                .sorted_themes()
-                .into_iter()
-                .find(|theme| theme.mode == inactive && theme.name.as_str() != Appearance::selected_theme(inactive, cx))
-                .unwrap()
-                .name
-                .clone();
-            reveal_theme(&name, &themes, window, cx);
-            let id = (ElementId::from("theme"), name.clone());
-            assert_eq!(window.find(id.clone()).selected(), Some(false));
-            // Reach the card without clicking it: Enter must activate the real Radio.
-            for _ in 0..themes.len() + 8 {
-                if window.find(id.clone()).focused() == Some(true) {
-                    break;
-                }
-                window.press("tab", cx);
-            }
-            assert_eq!(window.find(id.clone()).focused(), Some(true));
-            assert_eq!(
-                Appearance::selected_theme(inactive, cx),
-                if inactive.is_dark() {
-                    selected_cards[1].as_str()
-                } else {
-                    selected_cards[0].as_str()
-                }
-            );
-            window.press("enter", cx);
-            assert_eq!(Appearance::mode(cx), AppearanceMode::System);
-            assert_eq!(Appearance::selected_theme(inactive, cx), name.as_str());
-            assert_eq!(cx.theme().mode, before.mode);
-            assert_eq!(cx.theme().theme_name(), before.theme_name());
-            assert_eq!(cx.theme().colors, before.colors, "An inactive System-mode choice must not change the palette");
-            assert_eq!(cx.theme().tokens, before.tokens);
-            assert_eq!(
-                window.find(id).selected(),
-                Some(false),
-                "Only the active theme card is selected, not both saved slots"
-            );
-            let active = SharedString::from(cx.theme().theme_name().to_string());
-            assert_eq!(window.find((ElementId::from("theme"), active)).selected(), Some(true));
-            assert_eq!(window.find("mode-system").selected(), Some(true));
-            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            assert_eq!(saved["mode"], "system");
-            assert_eq!(saved[if inactive.is_dark() { "dark_theme" } else { "light_theme" }], name.as_str());
-            assert_eq!(
-                saved[if inactive.is_dark() { "light_theme" } else { "dark_theme" }],
-                Appearance::selected_theme(before.mode, cx)
-            );
-            reveal_theme(&name, &themes, window, cx);
-            window.click((ElementId::from("theme"), name), cx);
-            assert_eq!(Appearance::mode(cx), AppearanceMode::System);
-            assert_eq!(
-                cx.theme().colors,
-                before.colors,
-                "Clicking an inactive System-mode card must also preserve the palette"
-            );
-            window.press("escape", cx);
-        })
-        .unwrap();
+        check_inactive_system_theme(&path, &themes, &selected_cards, handle.into(), cx);
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
@@ -2065,35 +1652,8 @@ mod tests {
         for path in [&short, &long, &oversized] {
             crate::raster_source::test_support::write_raster(path, 4326, 1).unwrap();
         }
-        let mut view = None;
-        let handle = cx.open_window(size(px(1200.), px(760.)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
-        let placeholder_width = cx
-            .update_window(handle.into(), |_, window, cx| {
-                window.render_frame(cx);
-                let selector = window.find("raster-band");
-                assert!(selector.visible());
-                assert_eq!(selector.disabled(), Some(true));
-                let width = selector.bounds().size.width;
-                let text = "Open a geospatial dataset";
-                let text_width = window
-                    .text_system()
-                    .shape_line(text.into(), window.rem_size() * 0.875, &[window.text_style().to_run(text.len())], None)
-                    .width();
-                assert!(width > text_width, "The empty placeholder must fit with room for the caret");
-                window.click("open-raster", cx);
-                width
-            })
-            .unwrap();
+        let (view, handle) = open_test_map(size(px(1200.), px(760.)), cx);
+        let placeholder_width = cx.update_window(handle.into(), |_, window, cx| measure_empty_selector(window, cx)).unwrap();
         cx.simulate_path_prompt_response(|_| Some(vec![short]));
         cx.run_until_parked();
         let short_width = cx
@@ -2110,52 +1670,11 @@ mod tests {
         cx.run_until_parked();
         let long_width = cx
             .update_window(handle.into(), |_, window, cx| {
-                window.render_frame(cx);
-                assert_eq!(
-                    view.read(cx).raster.as_ref().unwrap().metadata().name,
-                    "Regional elevation observations for winter"
-                );
-                let width = window.find("raster-band").bounds().size.width;
-                assert!(width > placeholder_width && width > short_width, "Longer names must grow the selector");
-                let text = &view.read(cx).raster.as_ref().unwrap().metadata().name;
-                let text_width = window
-                    .text_system()
-                    .shape_line(text.clone().into(), window.rem_size() * 0.875, &[window.text_style().to_run(text.len())], None)
-                    .width();
-                assert!(width > text_width, "An uncapped layer title must fit with room for the caret");
-                window.click("raster-band", cx);
-                window.press("up", cx);
-                window.press("enter", cx);
-                width
+                measure_long_selector(&view, placeholder_width, short_width, window, cx)
             })
             .unwrap();
         cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().name, "dem");
-            assert_eq!(
-                window.find("raster-band").bounds().size.width,
-                long_width,
-                "Keyboard selection must not change width"
-            );
-            window.scroll("raster-band", ScrollDelta::Lines(point(0., -1.)), cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            assert_eq!(
-                view.read(cx).raster.as_ref().unwrap().metadata().name,
-                "Regional elevation observations for winter"
-            );
-            assert_eq!(
-                window.find("raster-band").bounds().size.width,
-                long_width,
-                "Wheel selection must not change width"
-            );
-            Theme::update(cx, |theme| theme.font_size = px(24.));
-        })
-        .unwrap();
+        check_selector_input_keeps_width(&view, long_width, handle.into(), cx);
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
@@ -2176,34 +1695,7 @@ mod tests {
                 width
             })
             .unwrap();
-        cx.simulate_window_resize(handle.into(), size(px(640.), px(400.)));
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            let title_bar = window.find("title-bar").bounds();
-            let band = window.find("raster-band").bounds();
-            let open = window.find("open-raster").bounds();
-            let debug = window.find("toggle-tile-boundaries").bounds();
-            let settings = window.find("open-settings").bounds();
-            assert!(band.size.width < wide_capped_width && band.size.width <= title_bar.size.width * 0.5);
-            assert!(open.right() <= band.left() && band.right() < debug.left());
-            assert!(debug.right() <= settings.left() && settings.right() <= title_bar.right());
-            let controls = window.find("window-controls").bounds();
-            if controls.size.width > px(0.) {
-                assert!(settings.right() <= controls.left() && controls.right() <= title_bar.right());
-            }
-            assert!(window.find("open-raster").visible() && window.find("open-settings").visible());
-            window.click("toggle-tile-boundaries", cx);
-            assert!(view.read(cx).tile_boundaries, "The trailing action must remain clickable after capping");
-            window.click("open-settings", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            assert!(window.find("appearance-settings").visible(), "Settings must remain clickable after capping");
-        })
-        .unwrap();
+        check_capped_selector_actions(&view, wide_capped_width, handle.into(), cx);
     }
 
     #[gpui_kit::test]
@@ -2215,18 +1707,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bands.tif");
         crate::raster_source::test_support::write_raster(&path, 4326, 2).unwrap();
-        let mut view = None;
-        let handle = cx.open_window(size(px(1200.0), px(760.0)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
+        let (view, handle) = open_test_map(size(px(1200.0), px(760.0)), cx);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.click("open-raster", cx);
@@ -2294,19 +1775,8 @@ mod tests {
         .unwrap();
         let raster_path = directory.path().join("raster.tif");
         crate::raster_source::test_support::write_raster(&raster_path, 4326, 2).unwrap();
-        let mut view = None;
-        let handle = cx.open_window(size(px(1200.), px(760.)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map._feature_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
+        let (view, handle) = open_test_map(size(px(1200.), px(760.)), cx);
+        view.update(cx, |map, _| map._feature_task = None);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("feature-info").is_none(), "No dataset must not show vector properties");
@@ -2317,206 +1787,17 @@ mod tests {
         let (original_layer, revision) = cx
             .update_window(handle.into(), |_, window, cx| {
                 window.render_frame(cx);
-                assert!(
-                    window.find("feature-info-heading").visible(),
-                    "Vector properties must be available before the first hit"
-                );
-                assert!(window.find("feature-info-empty").visible());
-                window.click("toggle-feature-info", cx);
-                assert_eq!(window.find("toggle-feature-info").label(), Some("Expand properties"));
-                assert!(window.try_find("feature-info-empty").is_none());
-                window.click("toggle-feature-info", cx);
-                assert!(window.find("feature-info-empty").visible());
-                assert!(view.read(cx).drag.is_none());
+                assert_empty_vector_inspector(&view, window, cx);
+                let (layer, revision) = query_center_feature(&view, &feature, window, cx);
                 let bounds = view.read(cx).bounds.unwrap();
-                assert!(bounds.origin.y > px(0.), "The map must start below the title bar");
-                let center = bounds.center();
-                window.dispatch_event(
-                    MouseMoveEvent {
-                        position: center,
-                        pressed_button: None,
-                        modifiers: Default::default(),
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-                let (layer, revision) = view.update(cx, |map, cx| {
-                    let hover = map.vector_hover.expect("A native map pointer move must create a vector query");
-                    assert_eq!(map.pointer, Some(center));
-                    assert_eq!(hover.layer_id, map.vector.as_ref().unwrap().id());
-                    assert!(hover.map.viewport == map.viewport.unwrap());
-                    assert_eq!(hover.map.camera, map.camera);
-                    let local = center - bounds.origin;
-                    assert_eq!(hover.point, (f64::from(f32::from(local.x)), f64::from(f32::from(local.y))));
-                    assert_eq!(hover.point.0, f64::from(hover.map.viewport.width.get()) / 2.0);
-                    assert_eq!(hover.point.1, f64::from(hover.map.viewport.height.get()) / 2.0);
-                    assert_ne!(hover.point.1, f64::from(f32::from(center.y)), "Title-bar height must not enter the query point");
-                    map.apply_feature_result(map.hover_revision, Ok(vec![feature.clone()]), cx);
-                    (hover.layer_id, map.hover_revision)
-                });
                 window.render_frame(cx);
-                assert!(window.find("feature-info-properties").visible());
-                assert!(window.find("feature-info").visible());
-                assert!(window.find("feature-info").bounds().size.height > px(60.));
-                let layers = window.find("raster-layers-card").bounds();
-                let properties = window.find("feature-info").bounds();
-                assert_eq!(window.find("feature-info-heading").label(), Some("Properties"));
-                assert_eq!(properties.top(), layers.top());
-                assert_eq!(properties.left() - bounds.left(), bounds.right() - layers.right());
-                assert!(properties.right() < layers.left());
-                assert!(properties.size.width > layers.size.width);
-                let coordinates = window.find("pixel-info");
-                assert_eq!(coordinates.bounds().left(), properties.left());
-                assert!(coordinates.bounds().top() > properties.bottom());
-                assert_eq!(
-                    coordinates.label().unwrap().split_whitespace().count(),
-                    4,
-                    "Vector hover must show coordinates without a raster value"
-                );
+                let properties = assert_vector_inspector_layout(bounds, window);
 
-                for keyboard in [false, true] {
-                    let camera = view.read(cx).camera;
-                    let revision = view.read(cx).hover_revision;
-                    if keyboard {
-                        let focus = view.read(cx).focus.clone();
-                        window.focus(&focus, cx);
-                        window.press("+", cx);
-                    } else {
-                        window.dispatch_event(
-                            ScrollEvent {
-                                position: center,
-                                delta: ScrollDelta::Lines(point(0.0, 1.0)),
-                                ..Default::default()
-                            }
-                            .to_platform_input(),
-                            cx,
-                        );
-                        window.render_frame(cx);
-                    }
-                    assert_ne!(view.read(cx).camera, camera);
-                    assert_eq!(view.read(cx).pointer, Some(center), "Zoom must retain the stationary pointer");
-                    let hover = view.read(cx).vector_hover.expect("Zoom must retain an active feature query");
-                    assert_eq!(hover.map.camera, view.read(cx).camera);
-                    assert!(view.read(cx).hover_revision > revision);
-                    assert!(
-                        window.find("feature-info-properties").visible(),
-                        "Pending zoom queries must not blank the properties"
-                    );
-                    assert_eq!(
-                        window.find("feature-info").bounds(),
-                        properties,
-                        "Zoom must not resize the pane while refreshing"
-                    );
-                    view.update(cx, |map, cx| map.apply_feature_result(revision, Ok(Vec::new()), cx));
-                    window.render_frame(cx);
-                    assert!(
-                        window.find("feature-info-properties").visible(),
-                        "An empty result from the previous camera must not clear retained properties"
-                    );
-                    view.update(cx, |map, cx| map.apply_feature_result(map.hover_revision, Ok(vec![feature.clone()]), cx));
-                    window.render_frame(cx);
-                    assert!(
-                        window.find("feature-info-properties").visible(),
-                        "Fresh properties must not require a mouse move"
-                    );
-                }
+                check_zoom_retains_properties(&view, &feature, properties, window, cx);
 
-                let camera = view.read(cx).camera;
-                window.hover("feature-info-heading", cx);
-                assert!(
-                    view.read(cx).vector_hover.is_some(),
-                    "The properties pane must not dismiss its own hover snapshot"
-                );
-                assert!(window.find("feature-info-properties").visible());
-                window.scroll("feature-info-heading", ScrollDelta::Lines(point(0.0, 1.0)), cx);
-                assert_eq!(view.read(cx).camera, camera, "Scrolling properties must not zoom the map");
-
-                // Pointer-only queries retain the inspector until the latest hit arrives.
-                let info_bounds = window.find("feature-info").bounds();
-                window.dispatch_event(
-                    MouseMoveEvent {
-                        position: center + point(px(80.), px(40.)),
-                        pressed_button: None,
-                        modifiers: Default::default(),
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-                window.render_frame(cx);
-                assert!(window.find("feature-info-properties").visible(), "Pending queries must retain property rows");
-                assert_eq!(window.find("feature-info").bounds(), info_bounds);
-                view.update(cx, |map, cx| map.apply_feature_result(revision, Ok(Vec::new()), cx));
-                window.render_frame(cx);
-                assert!(
-                    window.find("feature-info-properties").visible(),
-                    "A late empty result from the previous cursor must not clear the inspector"
-                );
-                view.update(cx, |map, cx| {
-                    assert!(map.hover_revision > revision);
-                    let hover = map.vector_hover.unwrap();
-                    assert_eq!(
-                        hover.point,
-                        (
-                            f64::from(f32::from(bounds.size.width)) / 2.0 + 80.0,
-                            f64::from(f32::from(bounds.size.height)) / 2.0 + 40.0
-                        )
-                    );
-                    map.apply_feature_result(map.hover_revision, Ok(vec![feature.clone()]), cx);
-                });
-                window.render_frame(cx);
-                assert_eq!(
-                    window.find("feature-info").bounds(),
-                    info_bounds,
-                    "The same feature must not resize the inspector"
-                );
-                // Reaching the collapse button can move off the feature and return no hits.
-                window.hover("toggle-feature-info", cx);
-                let heading = window.find("feature-info-heading").bounds();
-                let toggle = window.find("toggle-feature-info").bounds();
-                view.update(cx, |map, cx| map.apply_feature_result(map.hover_revision, Ok(Vec::new()), cx));
-                window.render_frame(cx);
-                assert!(
-                    window.try_find("feature-info-properties").is_none(),
-                    "A completed empty query must remove stale properties"
-                );
-                assert!(window.find("feature-info-empty").visible());
-                assert_eq!(window.find("feature-info-heading").bounds(), heading);
-                assert_eq!(window.find("toggle-feature-info").bounds(), toggle);
-                window.click("toggle-feature-info", cx);
-                assert_eq!(window.find("toggle-feature-info").label(), Some("Expand properties"));
-                assert!(window.try_find("feature-info-empty").is_none());
-                view.update(cx, |map, cx| map.apply_feature_result(map.hover_revision, Ok(vec![feature.clone()]), cx));
-                window.render_frame(cx);
-                assert!(
-                    window.try_find("feature-info-properties").is_none(),
-                    "New hits must not expand the collapsed pane"
-                );
-                window.click("toggle-feature-info", cx);
-                assert!(window.find("feature-info-properties").visible());
-                let revision = view.read(cx).hover_revision;
-                let focus = view.read(cx).focus.clone();
-                window.focus(&focus, cx);
-                window.press("right", cx);
-                assert!(
-                    view.read(cx).hover_revision > revision,
-                    "Camera changes must invalidate a stationary pointer's query"
-                );
-                assert_eq!(view.read(cx).vector_hover.unwrap().map.camera, view.read(cx).camera);
-                view.update(cx, |map, cx| map.apply_feature_result(revision, Ok(Vec::new()), cx));
-                window.render_frame(cx);
-                assert!(
-                    window.find("feature-info-properties").visible(),
-                    "Panning must retain properties and reject empty results from the previous camera"
-                );
-                view.update(cx, |map, cx| map.apply_feature_result(map.hover_revision, Ok(Vec::new()), cx));
-                window.render_frame(cx);
-                assert!(
-                    window.try_find("feature-info-properties").is_none(),
-                    "A current-camera miss must still clear properties"
-                );
-                view.update(cx, |map, cx| map.show_vector_features(vec![feature.clone()], cx));
-                window.render_frame(cx);
-                assert!(window.find("feature-info").bounds().size.height > px(60.));
+                check_pointer_queries_retain_properties(&view, &feature, revision, window, cx);
+                check_empty_and_collapsed_properties(&view, &feature, window, cx);
+                check_pan_query_invalidation(&view, &feature, window, cx);
                 let revision = view.read(cx).hover_revision;
                 view.update(cx, |map, cx| map.open_paths(vec![vector_path], cx));
                 (layer, revision)
@@ -2525,39 +1806,8 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert!(view.read(cx).hover_revision > revision, "Layer switches must invalidate the previous query");
-            view.update(cx, |map, cx| map.apply_feature_result(revision, Ok(vec![feature.clone()]), cx));
-            window.render_frame(cx);
-            assert!(
-                window.try_find("feature-info-properties").is_none(),
-                "A result from the previous layer must be rejected"
-            );
-            assert!(window.find("feature-info-heading").visible());
-            assert!(window.find("feature-info-empty").visible());
-            window.hover("map-surface", cx);
-            view.update(cx, |map, cx| {
-                let hover = map.vector_hover.unwrap();
-                assert_ne!(hover.layer_id, original_layer);
-                assert_eq!(hover.layer_id, map.vector.as_ref().unwrap().id());
-                assert!(map.hover_revision > revision, "Layer switches must invalidate the previous query");
-                map.show_vector_features(vec![feature.clone()], cx);
-            });
-            window.render_frame(cx);
-            assert!(window.find("feature-info").bounds().size.height > px(60.));
-            let revision = view.read(cx).hover_revision;
-            window.hover("open-raster", cx);
-            assert!(view.read(cx).pointer.is_none());
-            assert!(view.read(cx).vector_hover.is_none(), "Leaving the map must clear vector hover");
-            assert!(view.read(cx).hover_revision > revision);
-            assert!(window.try_find("feature-info-properties").is_none());
-            assert!(window.find("feature-info-heading").visible(), "Leaving the map must not hide the vector pane");
-            assert!(window.find("feature-info-empty").visible());
-            assert_eq!(window.find("toggle-feature-info").label(), Some("Collapse properties"));
-            view.update(cx, |map, cx| {
-                map.clear_vector_hover(cx);
-                assert_eq!(map.hover_revision, revision + 1, "Redundant clears must not issue another revision");
-                map.open_paths(vec![raster_path], cx);
-            });
+            check_layer_switch_rejects_features(&view, &feature, original_layer, revision, window, cx);
+            leave_vector_for_raster(&view, raster_path, window, cx);
         })
         .unwrap();
         cx.run_until_parked();
@@ -2643,82 +1893,7 @@ mod tests {
                 position
             })
             .unwrap();
-        let mut properties_bounds = None;
-        for phase in 0..5 {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut received_current_hit = false;
-            loop {
-                let populated = cx
-                    .update_window(handle.into(), |_, window, cx| {
-                        while let Ok(frame) = frames.try_recv() {
-                            view.update(cx, |map, cx| map.apply_frame(frame, window, cx));
-                        }
-                        while let Ok(result) = results.try_recv() {
-                            let revision = result.revision();
-                            let features = result.into_features();
-                            received_current_hit |= revision == view.read(cx).hover_revision && features.as_ref().is_ok_and(|features| !features.is_empty());
-                            view.update(cx, |map, cx| map.apply_feature_result(revision, features, cx));
-                            window.render_frame(cx);
-                            if phase > 0 {
-                                assert!(window.find("feature-info-properties").visible(), "Worker results must not cause zoom flicker");
-                                assert_eq!(Some(window.find("feature-info").bounds()), properties_bounds);
-                            }
-                        }
-                        window.render_frame(cx);
-                        assert_eq!(view.read(cx).pointer, Some(position), "Zoom must not need a mouse move (phase {phase})");
-                        assert!(view.read(cx).error.is_none(), "{:?}", view.read(cx).error);
-                        if phase > 0 {
-                            assert!(
-                                window.find("feature-info-properties").visible(),
-                                "Properties must remain visible throughout the refresh"
-                            );
-                            assert_eq!(Some(window.find("feature-info").bounds()), properties_bounds);
-                        }
-                        received_current_hit && window.try_find("feature-info-properties").is_some_and(|properties| properties.visible())
-                    })
-                    .unwrap();
-                if populated {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "Properties did not populate in phase {phase} with a stationary pointer"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            if phase == 4 {
-                break;
-            }
-            cx.update_window(handle.into(), |_, window, cx| {
-                properties_bounds = Some(window.find("feature-info").bounds());
-                let camera = view.read(cx).camera;
-                let revision = view.read(cx).hover_revision;
-                if phase < 2 {
-                    window.dispatch_event(
-                        ScrollEvent {
-                            position,
-                            delta: ScrollDelta::Lines(point(0.0, if phase == 0 { 1.0 } else { -1.0 })),
-                            modifiers: Default::default(),
-                            touch_phase: Default::default(),
-                            source: Default::default(),
-                        }
-                        .to_platform_input(),
-                        cx,
-                    );
-                    window.render_frame(cx);
-                } else {
-                    window.press(if phase == 2 { "+" } else { "-" }, cx);
-                }
-                assert_ne!(view.read(cx).camera, camera);
-                assert!(view.read(cx).hover_revision > revision);
-                assert_eq!(view.read(cx).pointer, Some(position));
-                assert!(
-                    window.find("feature-info-properties").visible(),
-                    "Zoom must retain properties while querying the new camera"
-                );
-            })
-            .unwrap();
-        }
+        exercise_stationary_zoom(&view, &frames, &results, position, handle.into(), cx);
         view.update(cx, |map, _| map.renderer = None);
     }
 
@@ -2742,19 +1917,8 @@ mod tests {
             serde_json::json!({"type": "FeatureCollection", "features": [feature.clone()]}).to_string(),
         )
         .unwrap();
-        let mut view = None;
-        let handle = cx.open_window(size(px(640.0), px(400.0)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map._feature_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
+        let (view, handle) = open_test_map(size(px(640.0), px(400.0)), cx);
+        view.update(cx, |map, _| map._feature_task = None);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             view.update(cx, |map, cx| map.open_paths(vec![path], cx));
@@ -2762,103 +1926,18 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            let bounds = window.find("map-surface").bounds();
-            window.dispatch_event(
-                MouseMoveEvent {
-                    position: point(bounds.left() + px(40.0), bounds.center().y),
-                    pressed_button: None,
-                    modifiers: Default::default(),
-                }
-                .to_platform_input(),
-                cx,
-            );
-            view.update(cx, |map, cx| map.apply_feature_result(map.hover_revision, Ok(vec![feature]), cx));
-            window.render_frame(cx);
-            assert!(window.find("feature-info-heading").visible());
-            assert!(window.within("feature-info-properties").find("field_00").visible());
-            assert!(!window.within("feature-info-properties").find("field_63").visible());
-            let properties = window.find("feature-info").bounds();
-            let layers = window.find("raster-layers-card").bounds();
-            assert_eq!(properties.top(), layers.top());
-            assert_eq!(properties.left() - bounds.left(), bounds.right() - layers.right());
-            assert!(properties.right() + window.rem_size() * 0.75 <= layers.left());
+            show_many_properties(&view, feature, window, cx);
             let camera = view.read(cx).camera;
             window.hover("feature-info-heading", cx);
             assert!(view.read(cx).vector_hover.is_some());
             assert!(window.find("feature-info-properties").visible());
-            let heading = window.find("feature-info-heading").bounds();
-            assert!(window.try_find("feature-info-layer-name").is_none());
-            let body = window.find("feature-info-properties").bounds();
-            let first = window.within("feature-info-properties").find("field_00").bounds();
-            let last = window.within("feature-info-properties").find("field_63").bounds();
-            assert_eq!(body.top(), heading.bottom(), "The properties must sit directly below the centered header");
-            assert_eq!(window.find("feature-info-title").bounds().center().y, heading.center().y);
-            assert_eq!(window.find("toggle-feature-info").bounds().center().y, heading.center().y);
-            assert!(body.bottom() <= properties.bottom());
-            assert!(properties.bottom() < window.find("pixel-info").bounds().top());
-            window.scroll("feature-info-properties", ScrollDelta::Lines(point(0.0, -3.0)), cx);
-            assert!(
-                window.within("feature-info-properties").find("field_00").bounds().top() < first.top(),
-                "Wheel input must move the property rows"
-            );
-            assert!(view.read(cx).vector_hover.is_some());
-            assert_eq!(view.read(cx).camera, camera, "Scrolling properties must not zoom the map");
+            let layout = assert_short_properties_layout(window);
+            let scroll_extent = check_property_wheel_scroll(&view, &layout, camera, window, cx);
 
-            // Wrapped values can make the list taller than a fixed line delta.
-            let scroll_extent = last.bottom() - body.bottom();
-            window.scroll("feature-info-properties", ScrollDelta::Pixels(point(px(0.0), -scroll_extent)), cx);
-            let last = window.within("feature-info-properties").find("field_63");
-            assert!(last.visible(), "Every property must remain reachable by scrolling");
-            assert!(last.bounds().top() >= body.top());
-            assert!(last.bounds().bottom() <= body.bottom());
-            assert!(!window.within("feature-info-properties").find("field_00").visible());
-            assert_eq!(
-                window.find("feature-info-heading").bounds(),
-                heading,
-                "The heading must stay fixed while rows scroll"
-            );
-            assert_eq!(window.find("feature-info").bounds(), properties);
+            check_property_scroll_limits(&view, &layout, camera, scroll_extent, window, cx);
 
-            // Wheel events at either limit must stay in the pane, not zoom the map.
-            window.scroll("feature-info-properties", ScrollDelta::Lines(point(0.0, -3.0)), cx);
-            assert!(window.within("feature-info-properties").find("field_63").visible());
-            assert_eq!(view.read(cx).camera, camera, "Scrolling past the last property must not zoom the map");
-            window.scroll(
-                "feature-info-properties",
-                ScrollDelta::Pixels(point(px(0.0), scroll_extent + body.size.height)),
-                cx,
-            );
-            window.scroll("feature-info-properties", ScrollDelta::Lines(point(0.0, 3.0)), cx);
-            assert_eq!(window.within("feature-info-properties").find("field_00").bounds(), first);
-            assert!(window.within("feature-info-properties").find("field_00").visible());
-            assert!(view.read(cx).vector_hover.is_some());
-            assert_eq!(view.read(cx).camera, camera, "Scrolling past the first property must not zoom the map");
-            assert!(view.read(cx).drag.is_none());
-
-            window.click("toggle-feature-info", cx);
-            assert!(window.try_find("feature-info-properties").is_none());
-            assert_eq!(window.find("toggle-feature-info").label(), Some("Expand properties"));
-            assert!(window.find("feature-info").bounds().size.height < properties.size.height);
-            assert!(view.read(cx).vector_hover.is_some(), "Collapsing must not dismiss the hover");
-            assert_eq!(view.read(cx).camera, camera);
-            assert!(view.read(cx).drag.is_none(), "The collapse button must not start a map drag");
-            window.scroll("feature-info-heading", ScrollDelta::Lines(point(0.0, -3.0)), cx);
-            assert_eq!(view.read(cx).camera, camera, "The collapsed header must not zoom the map");
-            window.press("tab", cx);
-            assert_eq!(window.find("toggle-feature-info").focused(), Some(true));
-            window.press("enter", cx);
-            assert!(window.find("feature-info-properties").visible());
-            window.press("space", cx);
-            assert!(window.try_find("feature-info-properties").is_none());
-
-            window.click("toggle-feature-info", cx);
-            assert!(window.find("feature-info-properties").visible());
-            assert_eq!(window.find("toggle-feature-info").label(), Some("Collapse properties"));
-            assert_eq!(window.find("feature-info").bounds(), properties);
-            assert!(view.read(cx).vector_hover.is_some());
-            assert_eq!(view.read(cx).camera, camera);
-            assert!(view.read(cx).drag.is_none());
+            check_property_collapse(&view, layout.properties, camera, window, cx);
+            check_property_keyboard_toggle(&view, layout.properties, camera, window, cx);
         })
         .unwrap();
     }
@@ -2872,18 +1951,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("raster.tif");
         crate::raster_source::test_support::write_raster(&path, 4326, 2).unwrap();
-        let mut view = None;
-        let handle = cx.open_window(size(px(1200.0), px(760.0)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
+        let (view, handle) = open_test_map(size(px(1200.0), px(760.0)), cx);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.hover("map-surface", cx);
@@ -2925,30 +1993,7 @@ mod tests {
             let info = window.find("pixel-info");
             let value: f64 = info.label().unwrap().split_whitespace().nth(4).unwrap().parse().unwrap();
             assert_eq!(value, first_value + 10.0, "Band changes must invalidate the cached numeric tile");
-            // Cached moves must render a value before any background work runs.
-            let center = window.find("map-surface").bounds().center();
-            window.dispatch_event(
-                MouseMoveEvent {
-                    position: center + point(px(5.0), px(0.0)),
-                    pressed_button: None,
-                    modifiers: Default::default(),
-                }
-                .to_platform_input(),
-                cx,
-            );
-            window.render_frame(cx);
-            assert!(
-                window
-                    .find("pixel-info")
-                    .label()
-                    .unwrap()
-                    .split_whitespace()
-                    .nth(4)
-                    .unwrap()
-                    .parse::<f64>()
-                    .is_ok()
-            );
-            window.hover("raster-layers-card", cx);
+            assert_cached_pointer_value(window, cx);
         })
         .unwrap();
         cx.run_until_parked();
@@ -2978,18 +2023,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("raster.tif");
         crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
-        let mut view = None;
-        let handle = cx.open_window(size(px(1200.0), px(760.0)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
+        let (view, handle) = open_test_map(size(px(1200.0), px(760.0)), cx);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.click("open-raster", cx);
@@ -3057,18 +2091,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("raster.tif");
         crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
-        let mut view = None;
-        let handle = cx.open_window(size(px(1200.0), px(760.0)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
+        let (view, handle) = open_test_map(size(px(1200.0), px(760.0)), cx);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.click("open-raster", cx);
@@ -3097,32 +2120,7 @@ mod tests {
 
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            let title_bar = window.find("title-bar").bounds();
-            let open = window.within("title-bar").find("open-raster").bounds();
-            let map = window.find("map-surface").bounds();
-            let layers = window.find("raster-layers-card").bounds();
-            let range = window.find("raster-range-card").bounds();
-            let band = window.within("title-bar").find("raster-band").bounds();
-            assert!(band.left() < title_bar.center().x);
-            assert!(band.top() >= title_bar.top() && band.bottom() <= title_bar.bottom());
-            assert!(open.left() >= title_bar.left() && open.right() < band.left());
-            assert!(open.top() >= title_bar.top() && open.bottom() <= title_bar.bottom());
-            assert_eq!(band.left() - open.right(), window.rem_size() * 0.5);
-            assert!(window.within("raster-layers-card").try_find("raster-band").is_none());
-            assert!(window.within("raster-layers-card").try_find("open-raster").is_none());
-            assert_eq!(title_bar.origin, point(px(0.0), px(0.0)));
-            assert_eq!(title_bar.size.width, px(1200.0));
-            assert!(title_bar.size.height > px(0.0));
-            assert_eq!(
-                map.origin,
-                point(px(0.0), title_bar.bottom()),
-                "Only window chrome may reserve space above the map"
-            );
-            assert_eq!(map.size, size(px(1200.0), px(760.0) - title_bar.size.height));
-            assert!(layers.left() > map.center().x && layers.right() < map.right());
-            assert_eq!(layers.left(), range.left());
-            assert_eq!(layers.right(), range.right());
-            assert!(range.top() > layers.bottom() && range.bottom() < map.bottom());
+            let layers = assert_floating_controls_layout(window);
 
             let before = view.read(cx).camera;
             window.click("title-bar", cx);
@@ -3145,141 +2143,11 @@ mod tests {
             "The opacity slider must update the raster"
         );
 
-        let original_range = cx.update(|cx| view.read(cx).raster.as_ref().unwrap().range());
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            let range = window.find("raster-range-slider").bounds();
-            window.dispatch_event(
-                MouseDownEvent {
-                    button: MouseButton::Left,
-                    position: range.origin + point(range.size.width * 0.25, range.size.height * 0.5),
-                    modifiers: Default::default(),
-                    click_count: 1,
-                    first_mouse: false,
-                }
-                .to_platform_input(),
-                cx,
-            );
-        })
-        .unwrap();
-        cx.run_until_parked();
-        let pressed_range = cx.update(|cx| view.read(cx).raster.as_ref().unwrap().range());
-        assert!(pressed_range.0 > original_range.0, "Range changes must apply before releasing the pointer");
+        exercise_range_slider(&view, handle.into(), cx);
 
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            let range = window.find("raster-range-slider").bounds();
-            window.dispatch_event(
-                MouseUpEvent {
-                    button: MouseButton::Left,
-                    position: range.origin + point(range.size.width * 0.25, range.size.height * 0.5),
-                    modifiers: Default::default(),
-                    click_count: 1,
-                }
-                .to_platform_input(),
-                cx,
-            );
-            window.render_frame(cx);
-            let thumb = window.within("raster-range-slider").find(("slider-thumb", 1_u32)).bounds();
-            window.dispatch_event(
-                MouseDownEvent {
-                    button: MouseButton::Left,
-                    position: thumb.center(),
-                    modifiers: Default::default(),
-                    click_count: 1,
-                    first_mouse: false,
-                }
-                .to_platform_input(),
-                cx,
-            );
-            window.render_frame(cx);
-            for fraction in [0.3, 0.4] {
-                window.dispatch_event(
-                    MouseMoveEvent {
-                        position: range.origin + point(range.size.width * fraction, range.size.height * 0.5),
-                        pressed_button: Some(MouseButton::Left),
-                        modifiers: Default::default(),
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-                window.render_frame(cx);
-            }
-        })
-        .unwrap();
-        cx.run_until_parked();
-        assert!(
-            cx.update(|cx| view.read(cx).raster.as_ref().unwrap().range().0) > pressed_range.0,
-            "Dragging must continuously apply range changes"
-        );
+        check_raster_controls_toggle(handle.into(), cx);
 
-        cx.update_window(handle.into(), |_, window, cx| {
-            let range = window.find("raster-range-slider").bounds();
-            window.dispatch_event(
-                MouseUpEvent {
-                    button: MouseButton::Left,
-                    position: range.origin + point(range.size.width * 0.4, range.size.height * 0.5),
-                    modifiers: Default::default(),
-                    click_count: 1,
-                }
-                .to_platform_input(),
-                cx,
-            );
-            window.click("reset-raster-range", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        assert_eq!(cx.update(|cx| view.read(cx).raster.as_ref().unwrap().range()), original_range);
-
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.click("toggle-raster-controls", cx);
-            assert!(window.try_find("raster-range-card").is_none());
-            assert!(window.within("title-bar").find("raster-band").visible());
-            assert!(window.within("title-bar").find("open-raster").visible());
-            let title_bar = window.find("title-bar").bounds();
-            assert_eq!(window.find("map-surface").bounds().size, size(px(1200.0), px(760.0) - title_bar.size.height));
-            window.press("secondary-l", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            assert!(window.find("raster-range-card").visible());
-        })
-        .unwrap();
-
-        cx.simulate_window_resize(handle.into(), size(px(640.0), px(400.0)));
-        cx.update(|cx| gpui_kit::component::Theme::update(cx, |theme| theme.font_size = px(18.0)));
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            let map = window.find("map-surface").bounds();
-            let layers = window.find("raster-layers-card").bounds();
-            let title_bar = window.find("title-bar").bounds();
-            let open = window.within("title-bar").find("open-raster");
-            assert!(open.visible());
-            let band = window.within("title-bar").find("raster-band");
-            assert!(band.visible());
-            assert!(band.bounds().left() < title_bar.center().x);
-            assert!(open.bounds().left() >= title_bar.left() && open.bounds().right() < band.bounds().left());
-            assert!(band.bounds().right() <= title_bar.right());
-            assert_eq!(map.size, size(px(640.0), px(400.0) - title_bar.size.height));
-            assert!(layers.right() < map.right() && layers.left() > map.left());
-            window.scroll("raster-layers-card", ScrollDelta::Lines(point(0.0, -30.0)), cx);
-            assert!(
-                window.find("raster-max").visible(),
-                "The floating controls must scroll in short windows at larger UI scales"
-            );
-            view.read(cx).raster_panel.clone().update(cx, |panel, cx| panel.clear(window, cx));
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            assert!(window.try_find("raster-controls").is_none());
-            assert!(window.within("title-bar").find("open-raster").visible());
-        })
-        .unwrap();
+        check_floating_controls_resize(&view, handle.into(), cx);
     }
 
     #[gpui_kit::test]
@@ -3291,9 +2159,7 @@ mod tests {
         let mut view = None;
         let handle = cx.open_window(size(px(900.0), px(760.0)), |window, cx| {
             let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
+                let map = new_test_map(window, cx);
                 map.open_paths(vec![path], cx);
                 map
             });
@@ -3302,144 +2168,18 @@ mod tests {
         });
         let view = view.unwrap();
         cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            let thumb = window.within("raster-range-slider").find(("slider-thumb", 1_u32)).bounds();
-            window.dispatch_event(
-                MouseDownEvent {
-                    button: MouseButton::Left,
-                    position: thumb.center(),
-                    modifiers: Default::default(),
-                    click_count: 1,
-                    first_mouse: false,
-                }
-                .to_platform_input(),
-                cx,
-            );
-            window.render_frame(cx);
-            let range = window.find("raster-range-slider").bounds();
-            // Cross the drag threshold before checking continuous updates.
-            window.dispatch_event(
-                MouseMoveEvent {
-                    position: range.origin + point(range.size.width * 0.1, range.size.height * 0.5),
-                    pressed_button: Some(MouseButton::Left),
-                    modifiers: Default::default(),
-                }
-                .to_platform_input(),
-                cx,
-            );
-            window.render_frame(cx);
-        })
-        .unwrap();
+        start_range_slider_drag(handle.into(), cx);
         cx.run_until_parked();
 
-        for fraction in [0.2, 0.3, 0.4] {
-            // Emulate a frame that started rendering before this pointer event
-            // and completes while the next range is already requested.
-            let source = cx.update(|cx| view.read(cx).raster.clone().unwrap());
-            cx.update_window(handle.into(), |_, window, cx| {
-                let range = window.find("raster-range-slider").bounds();
-                let position = range.origin + point(range.size.width * fraction, range.size.height * 0.5);
-                window.dispatch_event(
-                    MouseMoveEvent {
-                        position,
-                        pressed_button: Some(MouseButton::Left),
-                        modifiers: Default::default(),
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-                window.render_frame(cx);
-            })
-            .unwrap();
-            cx.run_until_parked();
-            assert_ne!(cx.update(|cx| view.read(cx).raster.as_ref().unwrap().id()), source.id());
-            let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
-            cx.update_window(handle.into(), |_, window, cx| {
-                view.update(cx, |view, cx| {
-                    view.apply_frame(
-                        MapFrame {
-                            viewport: view.viewport.unwrap(),
-                            basemap: basemap_style(cx),
-                            raster_layer_id: Some(source.metadata().id),
-                            vector_layer_id: None,
-                            settled: false,
-                            tile_boundaries: false,
-                            image: Ok(image.clone()),
-                        },
-                        window,
-                        cx,
-                    );
-                    assert!(
-                        view.image.as_ref().is_some_and(|shown| Arc::ptr_eq(shown, &image)),
-                        "A continuous range drag must display completed frames, not wait for an exact style match"
-                    );
-                });
-            })
-            .unwrap();
-        }
+        check_in_flight_range_frames(&view, handle.into(), cx);
 
-        let obsolete_source = cx.update(|cx| view.read(cx).raster.clone().unwrap());
-        cx.update_window(handle.into(), |_, window, cx| {
-            let range = window.find("raster-range-slider").bounds();
-            window.dispatch_event(
-                MouseUpEvent {
-                    button: MouseButton::Left,
-                    position: range.origin + point(range.size.width * 0.4, range.size.height * 0.5),
-                    modifiers: Default::default(),
-                    click_count: 1,
-                }
-                .to_platform_input(),
-                cx,
-            );
-            window.click("raster-band", cx);
-            window.press("down", cx);
-            window.press("enter", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            view.update(cx, |view, cx| {
-                assert_ne!(view.raster.as_ref().unwrap().metadata().id, obsolete_source.metadata().id);
-                let shown = view.image.clone().unwrap();
-                let obsolete = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
-                view.apply_frame(
-                    MapFrame {
-                        viewport: view.viewport.unwrap(),
-                        basemap: basemap_style(cx),
-                        raster_layer_id: Some(obsolete_source.metadata().id),
-                        vector_layer_id: None,
-                        settled: false,
-                        tile_boundaries: false,
-                        image: Ok(obsolete),
-                    },
-                    window,
-                    cx,
-                );
-                assert!(
-                    Arc::ptr_eq(view.image.as_ref().unwrap(), &shown),
-                    "An in-flight frame from another band must still be rejected"
-                );
-            });
-        })
-        .unwrap();
+        check_obsolete_band_frame(&view, handle.into(), cx);
     }
 
     #[gpui_kit::test]
     fn replacing_map_frames_evicts_obsolete_texture_cache_entries(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        let mut view = None;
-        let handle = cx.open_window(size(px(800.0), px(600.0)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
-            view = Some(map.clone());
-            gpui_kit::base::Root::new(map, window, cx)
-        });
-        let view = view.unwrap();
+        let (view, handle) = open_test_map(size(px(800.0), px(600.0)), cx);
         cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx)).unwrap();
         cx.run_until_parked();
 
@@ -3476,12 +2216,7 @@ mod tests {
             .unwrap();
 
         cx.update_window(handle.into(), |_, window, cx| {
-            window.replace_root(cx, |window, cx| {
-                let mut map = MapView::new(window, cx);
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
+            window.replace_root(cx, new_test_map);
             window.render_frame(cx);
         })
         .unwrap();
@@ -3613,34 +2348,1517 @@ mod tests {
             window.simulate_next_frame(cx);
             assert_ne!(view.read(cx).camera, at_release);
 
-            let after_pan = view.read(cx).camera;
-            // End a drag on the attribution footer, outside the map hitbox.
-            window.drag(from, point(from.x, bounds.bottom() + px(5.0)), cx);
-            assert_ne!(view.read(cx).camera, after_pan);
-            assert!(view.read(cx).drag.is_none());
-            assert!(view.read(cx).coast.is_some());
-
-            let after_release = view.read(cx).camera;
-            window.hover("map-surface", cx);
-            assert_eq!(view.read(cx).camera, after_release);
-            window.right_click("map-surface", cx);
-            assert_eq!(view.read(cx).camera, after_release);
-            window.press("-", cx);
-            assert_ne!(view.read(cx).camera, after_release);
-            assert!(view.read(cx).coast.is_none());
-
-            window.drag(from, to, cx);
-            assert!(view.read(cx).coast.is_some());
-            window.click("map-surface", cx);
-            assert!(view.read(cx).coast.is_none());
-            let after_interrupt = view.read(cx).camera;
-            window.simulate_next_frame(cx);
-            assert_eq!(view.read(cx).camera, after_interrupt);
-
-            cx.set_reduce_motion(true);
-            window.drag(from, to, cx);
-            assert!(view.read(cx).coast.is_none());
+            check_coast_interruptions(&view, from, to, bounds, window, cx);
         })
         .unwrap();
+    }
+    fn new_test_map(window: &mut Window, cx: &mut Context<MapView>) -> MapView {
+        let mut map = MapView::new(window, cx);
+        map.renderer = None;
+        map._frames_task = None;
+        map
+    }
+
+    fn open_test_map(viewport: gpui_kit::Size<Pixels>, cx: &mut TestAppContext) -> (Entity<MapView>, gpui_kit::WindowHandle<gpui_kit::base::Root>) {
+        let mut view = None;
+        let handle = cx.open_window(viewport, |window, cx| {
+            let map = cx.new(|cx| new_test_map(window, cx));
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        (view.unwrap(), handle)
+    }
+
+    fn assert_preview_layout(card: Bounds<Pixels>, preview: Bounds<Pixels>, label: Bounds<Pixels>, context: &str) {
+        for (part, bounds) in [("preview", preview), ("label", label)] {
+            assert!(
+                bounds.size.width > px(0.) && bounds.size.height > px(0.),
+                "{context}: {part} must have nonzero geometry, got {bounds:?}"
+            );
+            assert!(
+                bounds.left() >= card.left() && bounds.right() <= card.right() && bounds.top() >= card.top() && bounds.bottom() <= card.bottom(),
+                "{context}: {part} {bounds:?} must be contained in card {card:?}"
+            );
+        }
+        assert!(
+            preview.bottom() <= label.top(),
+            "{context}: preview {preview:?} must stack above label {label:?} without overlap"
+        );
+    }
+
+    fn assert_nonoverlapping(bounds: Bounds<Pixels>, previous: &[Bounds<Pixels>], context: &str) {
+        for previous in previous {
+            assert!(
+                bounds.left() >= previous.right()
+                    || bounds.right() <= previous.left()
+                    || bounds.top() >= previous.bottom()
+                    || bounds.bottom() <= previous.top(),
+                "{context}"
+            );
+        }
+    }
+
+    fn assert_settings_dialog_bounds(viewport: gpui_kit::Size<Pixels>, font_size: Option<Pixels>, window: &mut Window, cx: &mut App) -> Bounds<Pixels> {
+        window.render_frame(cx);
+        let bounds = window.within("dialog").find("surface").bounds();
+        assert!((bounds.center().x - viewport.width / 2.).abs() <= px(1.));
+        assert!((bounds.center().y - viewport.height / 2.).abs() <= px(1.));
+        assert!(bounds.left() >= px(0.) && bounds.right() <= viewport.width);
+        assert!(bounds.top() >= px(0.) && bounds.bottom() <= viewport.height);
+        assert!(window.find("appearance-settings").visible());
+        let done = window.find("settings-done");
+        assert!(done.visible());
+        assert!(done.bounds().left() >= bounds.left() && done.bounds().right() <= bounds.right());
+        assert!(done.bounds().top() >= bounds.top() && done.bounds().bottom() <= bounds.bottom());
+        if let Some(font_size) = font_size {
+            assert_eq!(cx.theme().font_size, font_size);
+            assert_eq!(window.rem_size(), font_size, "The zoom case must exercise Root's rem scaling");
+        }
+
+        bounds
+    }
+
+    fn assert_mode_cards_layout(
+        bounds: Bounds<Pixels>,
+        viewport: gpui_kit::Size<Pixels>,
+        font_size: Option<Pixels>,
+        window: &mut Window,
+    ) -> Vec<Bounds<Pixels>> {
+        let layout = format!("viewport {viewport:?}, font {:?}", window.rem_size());
+        let mut mode_bounds = Vec::<Bounds<Pixels>>::new();
+        for id in ["mode-light", "mode-dark", "mode-system"] {
+            let mode = window.find(id).bounds();
+            assert!(
+                mode.size.width > px(0.) && mode.size.height > px(0.),
+                "Mode card {id} must have nonzero geometry"
+            );
+            assert!(mode.left() >= bounds.left() && mode.right() <= bounds.right());
+            let scope = window.within(id);
+            assert_preview_layout(
+                mode,
+                scope.find("mode-preview").bounds(),
+                scope.find("mode-label").bounds(),
+                &format!("Mode {id}, {layout}"),
+            );
+            assert_nonoverlapping(
+                mode,
+                &mode_bounds,
+                &format!("Mode cards must wrap without overlapping at {viewport:?}, font {font_size:?}"),
+            );
+            mode_bounds.push(mode);
+        }
+
+        mode_bounds
+    }
+
+    fn assert_theme_grid_layout(mode_bounds: &[Bounds<Pixels>], font_size: Option<Pixels>, window: &mut Window, cx: &App) -> Bounds<Pixels> {
+        let themes = gpui_kit::component::ThemeRegistry::global(cx).sorted_themes();
+        let light_themes = themes.iter().filter(|theme| !theme.mode.is_dark()).collect::<Vec<_>>();
+        let first = window.find((ElementId::from("theme"), light_themes[0].name.clone())).bounds();
+        let second = window.find((ElementId::from("theme"), light_themes[1].name.clone())).bounds();
+        let last_light = light_themes
+            .iter()
+            .map(|theme| window.find((ElementId::from("theme"), theme.name.clone())).bounds().bottom())
+            .fold(first.bottom(), |bottom, next| bottom.max(next));
+        let first_dark = themes.iter().find(|theme| theme.mode.is_dark()).unwrap();
+        let first_dark = window.find((ElementId::from("theme"), first_dark.name.clone())).bounds();
+        assert!(first_dark.top() > last_light, "Dark themes must have their own section below all light themes");
+        for mode in mode_bounds {
+            assert!(first.top() >= mode.bottom(), "The theme grid must remain below the mode choices after wrapping");
+        }
+        if font_size.is_some() {
+            assert!(second.top() >= first.bottom(), "At high zoom the narrow grid must reflow to a single column");
+            assert!((first.left() - second.left()).abs() <= px(1.));
+            assert!((first.right() - second.right()).abs() <= px(1.));
+        } else {
+            assert!(
+                (first.top() - second.top()).abs() <= px(1.),
+                "At normal zoom theme cards should share a grid row"
+            );
+            assert!(first.right() <= second.left(), "Adjacent theme cards must not overlap");
+        }
+
+        first
+    }
+
+    fn assert_theme_cards_layout(
+        bounds: Bounds<Pixels>,
+        first: Bounds<Pixels>,
+        viewport: gpui_kit::Size<Pixels>,
+        font_size: Option<Pixels>,
+        window: &mut Window,
+        cx: &App,
+    ) {
+        let layout = format!("viewport {viewport:?}, font {:?}", window.rem_size());
+        let mut card_bounds = Vec::<Bounds<Pixels>>::new();
+        for theme in gpui_kit::component::ThemeRegistry::global(cx).sorted_themes() {
+            let card = window.find((ElementId::from("theme"), theme.name.clone()));
+            let label = format!("{}, {} theme", theme.name, if theme.mode.is_dark() { "Dark" } else { "Light" });
+            assert_eq!(card.label(), Some(label.as_str()));
+            assert_eq!(card.selected(), Some(&theme.name == cx.theme().theme_name()));
+            let (section, other_section) = if theme.mode.is_dark() {
+                ("dark-themes", "light-themes")
+            } else {
+                ("light-themes", "dark-themes")
+            };
+            let id = (ElementId::from("theme"), theme.name.clone());
+            assert!(
+                window.within(section).try_find(id.clone()).is_some(),
+                "Each section must contain only its matching themes"
+            );
+            assert!(window.within(other_section).try_find(id).is_none());
+            let card = card.bounds();
+            assert!(
+                card.size.width > px(0.) && card.size.height > px(0.),
+                "Theme {} must have nonzero geometry",
+                theme.name
+            );
+            assert!(card.left() >= bounds.left() && card.right() <= bounds.right());
+            assert!((card.size.width - first.size.width).abs() <= px(1.));
+            assert!((card.size.height - first.size.height).abs() <= px(1.));
+            let scope = window.within((ElementId::from("theme"), theme.name.clone()));
+            assert_preview_layout(
+                card,
+                scope.find("theme-swatch").bounds(),
+                scope.find("theme-label").bounds(),
+                &format!("Theme {}, {layout}", theme.name),
+            );
+            assert_nonoverlapping(card, &card_bounds, &format!("Theme cards must not overlap at {viewport:?}, font {font_size:?}"));
+            card_bounds.push(card);
+        }
+    }
+
+    fn assert_initial_appearance_modes(window: &mut Window) {
+        for (id, label, selected) in [
+            ("mode-light", "Light", false),
+            ("mode-dark", "Dark", false),
+            ("mode-system", "Follow system", true),
+        ] {
+            let mode = window.find(id);
+            assert_eq!(mode.label(), Some(label));
+            assert_eq!(mode.selected(), Some(selected));
+        }
+    }
+
+    fn exercise_light_and_dark_modes(path: &std::path::Path, window: &mut Window, cx: &mut App) {
+        window.click("mode-light", cx);
+        assert_eq!(Appearance::mode(cx), AppearanceMode::Light);
+        assert_eq!(cx.theme().mode, ThemeMode::Light);
+        assert_eq!(window.find("mode-light").selected(), Some(true));
+        window.press("tab", cx);
+        assert_eq!(window.find("mode-dark").focused(), Some(true));
+        assert_eq!(window.find("mode-dark").selected(), Some(false), "Focusing a mode must not select it");
+        window.press("space", cx);
+        assert_eq!(Appearance::mode(cx), AppearanceMode::Dark);
+        assert_eq!(cx.theme().mode, ThemeMode::Dark);
+        assert_eq!(window.find("mode-dark").selected(), Some(true));
+        assert_eq!(window.find("mode-light").selected(), Some(false));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap()["mode"],
+            "dark"
+        );
+    }
+
+    fn exercise_system_mode(window: &mut Window, cx: &mut App) {
+        window.press("tab", cx);
+        assert_eq!(window.find("mode-system").focused(), Some(true));
+        window.press("enter", cx);
+        assert_eq!(Appearance::mode(cx), AppearanceMode::System);
+        assert_eq!(cx.theme().mode, ThemeMode::from(window.appearance()));
+        assert_eq!(window.find("mode-system").selected(), Some(true));
+        window.click("mode-dark", cx);
+    }
+
+    fn reveal_theme(name: &SharedString, themes: &[SharedString], window: &mut Window, cx: &mut App) {
+        let id = (ElementId::from("theme"), name.clone());
+        for _ in 0..100 {
+            let card = window.find(id.clone());
+            let dialog = window.within("dialog").find("surface").bounds();
+            let top = dialog.top() + px(80.);
+            let bottom = window.find("settings-done").bounds().top() - px(8.);
+            if card.visible() && card.bounds().top() >= top && card.bounds().bottom() <= bottom {
+                return;
+            }
+            // Wheel over a visible card so native hit testing reaches the
+            // scrolling body, even when the requested card is clipped.
+            let anchor = themes
+                .iter()
+                .find(|name| {
+                    let card = window.find((ElementId::from("theme"), (*name).clone()));
+                    card.visible() && card.bounds().center().y > top && card.bounds().center().y < bottom
+                })
+                .expect("The scrolling body must expose a theme card");
+            let delta = if card.bounds().center().y < dialog.center().y { 80. } else { -80. };
+            window.scroll((ElementId::from("theme"), anchor.clone()), ScrollDelta::Pixels(point(px(0.), px(delta))), cx);
+        }
+        panic!("Theme card {name} did not scroll into view");
+    }
+
+    fn select_and_check_theme_cards(
+        path: &std::path::Path,
+        themes: &[SharedString],
+        handle: gpui_kit::AnyWindowHandle,
+        cx: &mut TestAppContext,
+    ) -> Vec<SharedString> {
+        let mut selected_cards = Vec::<SharedString>::new();
+        for (mode, appearance_mode, slot, saved_mode) in [
+            (ThemeMode::Light, AppearanceMode::Light, "light_theme", "light"),
+            (ThemeMode::Dark, AppearanceMode::Dark, "dark_theme", "dark"),
+        ] {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                let name = ThemeRegistry::global(cx)
+                    .sorted_themes()
+                    .into_iter()
+                    .find(|theme| theme.mode == mode && theme.name.as_str() != Appearance::selected_theme(mode, cx))
+                    .unwrap()
+                    .name
+                    .clone();
+                reveal_theme(&name, themes, window, cx);
+                let id = (ElementId::from("theme"), name.clone());
+                assert_eq!(window.find(id.clone()).selected(), Some(false));
+                window.click(id.clone(), cx);
+                assert_eq!(
+                    Appearance::mode(cx),
+                    appearance_mode,
+                    "An explicit appearance must follow the clicked card's mode"
+                );
+                assert_eq!(cx.theme().mode, mode);
+                assert_eq!(cx.theme().theme_name(), &name);
+                assert_eq!(Appearance::selected_theme(mode, cx), name.as_str());
+                assert_eq!(window.find(id).selected(), Some(true));
+                assert_other_themes_unselected(&selected_cards, window);
+                let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                assert_eq!(saved["mode"], saved_mode);
+                assert_eq!(saved[slot], name.as_str());
+                selected_cards.push(name);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+
+        selected_cards
+    }
+
+    fn assert_other_themes_unselected(names: &[SharedString], window: &mut Window) {
+        for name in names {
+            assert_eq!(window.find((ElementId::from("theme"), name.clone())).selected(), Some(false));
+        }
+    }
+
+    fn focus_inactive_system_theme(themes: &[SharedString], window: &mut Window, cx: &mut App) -> (Theme, ThemeMode, SharedString) {
+        window.render_frame(cx);
+        window.click("mode-system", cx);
+        let before = cx.theme().clone();
+        let inactive = if before.mode.is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
+        let name = ThemeRegistry::global(cx)
+            .sorted_themes()
+            .into_iter()
+            .find(|theme| theme.mode == inactive && theme.name.as_str() != Appearance::selected_theme(inactive, cx))
+            .unwrap()
+            .name
+            .clone();
+        reveal_theme(&name, themes, window, cx);
+        let id = (ElementId::from("theme"), name.clone());
+        assert_eq!(window.find(id.clone()).selected(), Some(false));
+        // Reach the card without clicking it: Enter must activate the real Radio.
+        for _ in 0..themes.len() + 8 {
+            if window.find(id.clone()).focused() == Some(true) {
+                break;
+            }
+            window.press("tab", cx);
+        }
+        assert_eq!(window.find(id.clone()).focused(), Some(true));
+
+        (before, inactive, name)
+    }
+
+    fn assert_saved_inactive_theme(inactive: ThemeMode, selected_cards: &[SharedString], cx: &App) {
+        assert_eq!(
+            Appearance::selected_theme(inactive, cx),
+            if inactive.is_dark() {
+                selected_cards[1].as_str()
+            } else {
+                selected_cards[0].as_str()
+            }
+        );
+    }
+
+    fn assert_inactive_theme_preserves_palette(before: &Theme, inactive: ThemeMode, name: &SharedString, window: &mut Window, cx: &App) {
+        assert_eq!(Appearance::mode(cx), AppearanceMode::System);
+        assert_eq!(Appearance::selected_theme(inactive, cx), name.as_str());
+        assert_eq!(cx.theme().mode, before.mode);
+        assert_eq!(cx.theme().theme_name(), before.theme_name());
+        assert_eq!(cx.theme().colors, before.colors, "An inactive System-mode choice must not change the palette");
+        assert_eq!(cx.theme().tokens, before.tokens);
+        assert_eq!(
+            window.find((ElementId::from("theme"), name.clone())).selected(),
+            Some(false),
+            "Only the active theme card is selected, not both saved slots"
+        );
+        let active = SharedString::from(cx.theme().theme_name().to_string());
+        assert_eq!(window.find((ElementId::from("theme"), active)).selected(), Some(true));
+        assert_eq!(window.find("mode-system").selected(), Some(true));
+    }
+
+    fn assert_system_theme_persisted(path: &std::path::Path, inactive: ThemeMode, name: &SharedString, before: &Theme, cx: &App) {
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["mode"], "system");
+        assert_eq!(saved[if inactive.is_dark() { "dark_theme" } else { "light_theme" }], name.as_str());
+        assert_eq!(
+            saved[if inactive.is_dark() { "light_theme" } else { "dark_theme" }],
+            Appearance::selected_theme(before.mode, cx)
+        );
+    }
+
+    fn check_inactive_system_theme(
+        path: &std::path::Path,
+        themes: &[SharedString],
+        selected_cards: &[SharedString],
+        handle: gpui_kit::AnyWindowHandle,
+        cx: &mut TestAppContext,
+    ) {
+        cx.update_window(handle, |_, window, cx| {
+            let (before, inactive, name) = focus_inactive_system_theme(themes, window, cx);
+            assert_saved_inactive_theme(inactive, selected_cards, cx);
+            window.press("enter", cx);
+            assert_inactive_theme_preserves_palette(&before, inactive, &name, window, cx);
+            assert_system_theme_persisted(path, inactive, &name, &before, cx);
+            reveal_theme(&name, themes, window, cx);
+            window.click((ElementId::from("theme"), name), cx);
+            assert_eq!(Appearance::mode(cx), AppearanceMode::System);
+            assert_eq!(
+                cx.theme().colors,
+                before.colors,
+                "Clicking an inactive System-mode card must also preserve the palette"
+            );
+            window.press("escape", cx);
+        })
+        .unwrap();
+    }
+
+    fn assert_empty_vector_inspector(view: &Entity<MapView>, window: &mut Window, cx: &mut App) {
+        assert!(
+            window.find("feature-info-heading").visible(),
+            "Vector properties must be available before the first hit"
+        );
+        assert!(window.find("feature-info-empty").visible());
+        window.click("toggle-feature-info", cx);
+        assert_eq!(window.find("toggle-feature-info").label(), Some("Expand properties"));
+        assert!(window.try_find("feature-info-empty").is_none());
+        window.click("toggle-feature-info", cx);
+        assert!(window.find("feature-info-empty").visible());
+        assert!(view.read(cx).drag.is_none());
+    }
+
+    fn query_center_feature(view: &Entity<MapView>, feature: &serde_json::Value, window: &mut Window, cx: &mut App) -> (u64, u64) {
+        let bounds = view.read(cx).bounds.unwrap();
+        assert!(bounds.origin.y > px(0.), "The map must start below the title bar");
+        let center = bounds.center();
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: center,
+                pressed_button: None,
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        let (layer, revision) = view.update(cx, |map, cx| {
+            let hover = map.vector_hover.expect("A native map pointer move must create a vector query");
+            assert_eq!(map.pointer, Some(center));
+            assert_eq!(hover.layer_id, map.vector.as_ref().unwrap().id());
+            assert!(hover.map.viewport == map.viewport.unwrap());
+            assert_eq!(hover.map.camera, map.camera);
+            let local = center - bounds.origin;
+            assert_eq!(hover.point, (f64::from(f32::from(local.x)), f64::from(f32::from(local.y))));
+            assert_eq!(hover.point.0, f64::from(hover.map.viewport.width.get()) / 2.0);
+            assert_eq!(hover.point.1, f64::from(hover.map.viewport.height.get()) / 2.0);
+            assert_ne!(hover.point.1, f64::from(f32::from(center.y)), "Title-bar height must not enter the query point");
+            map.apply_feature_result(map.hover_revision, Ok(vec![feature.clone()]), cx);
+            (hover.layer_id, map.hover_revision)
+        });
+
+        (layer, revision)
+    }
+
+    fn assert_vector_inspector_layout(bounds: Bounds<Pixels>, window: &mut Window) -> Bounds<Pixels> {
+        assert!(window.find("feature-info-properties").visible());
+        assert!(window.find("feature-info").visible());
+        assert!(window.find("feature-info").bounds().size.height > px(60.));
+        let layers = window.find("raster-layers-card").bounds();
+        let properties = window.find("feature-info").bounds();
+        assert_eq!(window.find("feature-info-heading").label(), Some("Properties"));
+        assert_eq!(properties.top(), layers.top());
+        assert_eq!(properties.left() - bounds.left(), bounds.right() - layers.right());
+        assert!(properties.right() < layers.left());
+        assert!(properties.size.width > layers.size.width);
+        let coordinates = window.find("pixel-info");
+        assert_eq!(coordinates.bounds().left(), properties.left());
+        assert!(coordinates.bounds().top() > properties.bottom());
+        assert_eq!(
+            coordinates.label().unwrap().split_whitespace().count(),
+            4,
+            "Vector hover must show coordinates without a raster value"
+        );
+
+        properties
+    }
+
+    fn check_zoom_retains_properties(view: &Entity<MapView>, feature: &serde_json::Value, properties: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        let center = view.read(cx).bounds.unwrap().center();
+        for keyboard in [false, true] {
+            let camera = view.read(cx).camera;
+            let revision = view.read(cx).hover_revision;
+            if keyboard {
+                let focus = view.read(cx).focus.clone();
+                window.focus(&focus, cx);
+                window.press("+", cx);
+            } else {
+                window.dispatch_event(
+                    ScrollEvent {
+                        position: center,
+                        delta: ScrollDelta::Lines(point(0.0, 1.0)),
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.render_frame(cx);
+            }
+            assert_ne!(view.read(cx).camera, camera);
+            assert_eq!(view.read(cx).pointer, Some(center), "Zoom must retain the stationary pointer");
+            let hover = view.read(cx).vector_hover.expect("Zoom must retain an active feature query");
+            assert_eq!(hover.map.camera, view.read(cx).camera);
+            assert!(view.read(cx).hover_revision > revision);
+            assert!(
+                window.find("feature-info-properties").visible(),
+                "Pending zoom queries must not blank the properties"
+            );
+            assert_eq!(
+                window.find("feature-info").bounds(),
+                properties,
+                "Zoom must not resize the pane while refreshing"
+            );
+            view.update(cx, |map, cx| map.apply_feature_result(revision, Ok(Vec::new()), cx));
+            window.render_frame(cx);
+            assert!(
+                window.find("feature-info-properties").visible(),
+                "An empty result from the previous camera must not clear retained properties"
+            );
+            view.update(cx, |map, cx| map.apply_feature_result(map.hover_revision, Ok(vec![feature.clone()]), cx));
+            window.render_frame(cx);
+            assert!(
+                window.find("feature-info-properties").visible(),
+                "Fresh properties must not require a mouse move"
+            );
+        }
+    }
+
+    fn check_pointer_queries_retain_properties(view: &Entity<MapView>, feature: &serde_json::Value, revision: u64, window: &mut Window, cx: &mut App) {
+        let bounds = view.read(cx).bounds.unwrap();
+        let center = bounds.center();
+        let camera = view.read(cx).camera;
+        window.hover("feature-info-heading", cx);
+        assert!(
+            view.read(cx).vector_hover.is_some(),
+            "The properties pane must not dismiss its own hover snapshot"
+        );
+        assert!(window.find("feature-info-properties").visible());
+        window.scroll("feature-info-heading", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+        assert_eq!(view.read(cx).camera, camera, "Scrolling properties must not zoom the map");
+
+        // Pointer-only queries retain the inspector until the latest hit arrives.
+        let info_bounds = window.find("feature-info").bounds();
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: center + point(px(80.), px(40.)),
+                pressed_button: None,
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(window.find("feature-info-properties").visible(), "Pending queries must retain property rows");
+        assert_eq!(window.find("feature-info").bounds(), info_bounds);
+        view.update(cx, |map, cx| map.apply_feature_result(revision, Ok(Vec::new()), cx));
+        window.render_frame(cx);
+        assert!(
+            window.find("feature-info-properties").visible(),
+            "A late empty result from the previous cursor must not clear the inspector"
+        );
+        view.update(cx, |map, cx| {
+            assert!(map.hover_revision > revision);
+            let hover = map.vector_hover.unwrap();
+            assert_eq!(
+                hover.point,
+                (
+                    f64::from(f32::from(bounds.size.width)) / 2.0 + 80.0,
+                    f64::from(f32::from(bounds.size.height)) / 2.0 + 40.0
+                )
+            );
+            map.apply_feature_result(map.hover_revision, Ok(vec![feature.clone()]), cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("feature-info").bounds(),
+            info_bounds,
+            "The same feature must not resize the inspector"
+        );
+    }
+
+    fn check_empty_and_collapsed_properties(view: &Entity<MapView>, feature: &serde_json::Value, window: &mut Window, cx: &mut App) {
+        // Reaching the collapse button can move off the feature and return no hits.
+        window.hover("toggle-feature-info", cx);
+        let heading = window.find("feature-info-heading").bounds();
+        let toggle = window.find("toggle-feature-info").bounds();
+        view.update(cx, |map, cx| map.apply_feature_result(map.hover_revision, Ok(Vec::new()), cx));
+        window.render_frame(cx);
+        assert!(
+            window.try_find("feature-info-properties").is_none(),
+            "A completed empty query must remove stale properties"
+        );
+        assert!(window.find("feature-info-empty").visible());
+        assert_eq!(window.find("feature-info-heading").bounds(), heading);
+        assert_eq!(window.find("toggle-feature-info").bounds(), toggle);
+        window.click("toggle-feature-info", cx);
+        assert_eq!(window.find("toggle-feature-info").label(), Some("Expand properties"));
+        assert!(window.try_find("feature-info-empty").is_none());
+        view.update(cx, |map, cx| map.apply_feature_result(map.hover_revision, Ok(vec![feature.clone()]), cx));
+        window.render_frame(cx);
+        assert!(
+            window.try_find("feature-info-properties").is_none(),
+            "New hits must not expand the collapsed pane"
+        );
+        window.click("toggle-feature-info", cx);
+        assert!(window.find("feature-info-properties").visible());
+    }
+
+    fn check_pan_query_invalidation(view: &Entity<MapView>, feature: &serde_json::Value, window: &mut Window, cx: &mut App) {
+        let revision = view.read(cx).hover_revision;
+        let focus = view.read(cx).focus.clone();
+        window.focus(&focus, cx);
+        window.press("right", cx);
+        assert!(
+            view.read(cx).hover_revision > revision,
+            "Camera changes must invalidate a stationary pointer's query"
+        );
+        assert_eq!(view.read(cx).vector_hover.unwrap().map.camera, view.read(cx).camera);
+        view.update(cx, |map, cx| map.apply_feature_result(revision, Ok(Vec::new()), cx));
+        window.render_frame(cx);
+        assert!(
+            window.find("feature-info-properties").visible(),
+            "Panning must retain properties and reject empty results from the previous camera"
+        );
+        view.update(cx, |map, cx| map.apply_feature_result(map.hover_revision, Ok(Vec::new()), cx));
+        window.render_frame(cx);
+        assert!(
+            window.try_find("feature-info-properties").is_none(),
+            "A current-camera miss must still clear properties"
+        );
+        view.update(cx, |map, cx| map.show_vector_features(vec![feature.clone()], cx));
+        window.render_frame(cx);
+        assert!(window.find("feature-info").bounds().size.height > px(60.));
+    }
+
+    fn check_layer_switch_rejects_features(
+        view: &Entity<MapView>,
+        feature: &serde_json::Value,
+        original_layer: u64,
+        revision: u64,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        assert!(view.read(cx).hover_revision > revision, "Layer switches must invalidate the previous query");
+        view.update(cx, |map, cx| map.apply_feature_result(revision, Ok(vec![feature.clone()]), cx));
+        window.render_frame(cx);
+        assert!(
+            window.try_find("feature-info-properties").is_none(),
+            "A result from the previous layer must be rejected"
+        );
+        assert!(window.find("feature-info-heading").visible());
+        assert!(window.find("feature-info-empty").visible());
+        window.hover("map-surface", cx);
+        view.update(cx, |map, cx| {
+            let hover = map.vector_hover.unwrap();
+            assert_ne!(hover.layer_id, original_layer);
+            assert_eq!(hover.layer_id, map.vector.as_ref().unwrap().id());
+            assert!(map.hover_revision > revision, "Layer switches must invalidate the previous query");
+            map.show_vector_features(vec![feature.clone()], cx);
+        });
+        window.render_frame(cx);
+        assert!(window.find("feature-info").bounds().size.height > px(60.));
+    }
+
+    fn leave_vector_for_raster(view: &Entity<MapView>, raster_path: PathBuf, window: &mut Window, cx: &mut App) {
+        let revision = view.read(cx).hover_revision;
+        window.hover("open-raster", cx);
+        assert!(view.read(cx).pointer.is_none());
+        assert!(view.read(cx).vector_hover.is_none(), "Leaving the map must clear vector hover");
+        assert!(view.read(cx).hover_revision > revision);
+        assert!(window.try_find("feature-info-properties").is_none());
+        assert!(window.find("feature-info-heading").visible(), "Leaving the map must not hide the vector pane");
+        assert!(window.find("feature-info-empty").visible());
+        assert_eq!(window.find("toggle-feature-info").label(), Some("Collapse properties"));
+        view.update(cx, |map, cx| {
+            map.clear_vector_hover(cx);
+            assert_eq!(map.hover_revision, revision + 1, "Redundant clears must not issue another revision");
+            map.open_paths(vec![raster_path], cx);
+        });
+    }
+
+    fn exercise_stationary_zoom(
+        view: &Entity<MapView>,
+        frames: &async_channel::Receiver<MapFrame>,
+        results: &async_channel::Receiver<crate::map_renderer::FeatureQueryResult>,
+        position: Point<Pixels>,
+        handle: gpui_kit::AnyWindowHandle,
+        cx: &mut TestAppContext,
+    ) {
+        let mut properties_bounds = None;
+        for phase in 0..5 {
+            wait_for_stationary_query(view, (frames, results), position, properties_bounds, phase, handle, cx);
+            if phase == 4 {
+                break;
+            }
+            cx.update_window(handle, |_, window, cx| {
+                properties_bounds = Some(zoom_stationary_pointer(view, phase, position, window, cx));
+            })
+            .unwrap();
+        }
+    }
+
+    struct PropertyLayout {
+        properties: Bounds<Pixels>,
+        heading: Bounds<Pixels>,
+        body: Bounds<Pixels>,
+        first: Bounds<Pixels>,
+        last: Bounds<Pixels>,
+    }
+
+    fn show_many_properties(view: &Entity<MapView>, feature: serde_json::Value, window: &mut Window, cx: &mut App) {
+        window.render_frame(cx);
+        let bounds = window.find("map-surface").bounds();
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: point(bounds.left() + px(40.0), bounds.center().y),
+                pressed_button: None,
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        view.update(cx, |map, cx| map.apply_feature_result(map.hover_revision, Ok(vec![feature]), cx));
+        window.render_frame(cx);
+        assert!(window.find("feature-info-heading").visible());
+        assert!(window.within("feature-info-properties").find("field_00").visible());
+        assert!(!window.within("feature-info-properties").find("field_63").visible());
+    }
+
+    fn assert_short_properties_layout(window: &mut Window) -> PropertyLayout {
+        let bounds = window.find("map-surface").bounds();
+        let properties = window.find("feature-info").bounds();
+        let layers = window.find("raster-layers-card").bounds();
+        assert_eq!(properties.top(), layers.top());
+        assert_eq!(properties.left() - bounds.left(), bounds.right() - layers.right());
+        assert!(properties.right() + window.rem_size() * 0.75 <= layers.left());
+        let heading = window.find("feature-info-heading").bounds();
+        assert!(window.try_find("feature-info-layer-name").is_none());
+        let body = window.find("feature-info-properties").bounds();
+        let first = window.within("feature-info-properties").find("field_00").bounds();
+        let last = window.within("feature-info-properties").find("field_63").bounds();
+        assert_eq!(body.top(), heading.bottom(), "The properties must sit directly below the centered header");
+        assert_eq!(window.find("feature-info-title").bounds().center().y, heading.center().y);
+        assert_eq!(window.find("toggle-feature-info").bounds().center().y, heading.center().y);
+        assert!(body.bottom() <= properties.bottom());
+        assert!(properties.bottom() < window.find("pixel-info").bounds().top());
+
+        PropertyLayout {
+            properties,
+            heading,
+            body,
+            first,
+            last,
+        }
+    }
+
+    fn check_property_wheel_scroll(view: &Entity<MapView>, layout: &PropertyLayout, camera: MapCamera, window: &mut Window, cx: &mut App) -> Pixels {
+        let PropertyLayout {
+            properties,
+            heading,
+            body,
+            first,
+            last,
+        } = *layout;
+        window.scroll("feature-info-properties", ScrollDelta::Lines(point(0.0, -3.0)), cx);
+        assert!(
+            window.within("feature-info-properties").find("field_00").bounds().top() < first.top(),
+            "Wheel input must move the property rows"
+        );
+        assert!(view.read(cx).vector_hover.is_some());
+        assert_eq!(view.read(cx).camera, camera, "Scrolling properties must not zoom the map");
+
+        // Wrapped values can make the list taller than a fixed line delta.
+        let scroll_extent = last.bottom() - body.bottom();
+        window.scroll("feature-info-properties", ScrollDelta::Pixels(point(px(0.0), -scroll_extent)), cx);
+        let last = window.within("feature-info-properties").find("field_63");
+        assert!(last.visible(), "Every property must remain reachable by scrolling");
+        assert!(last.bounds().top() >= body.top());
+        assert!(last.bounds().bottom() <= body.bottom());
+        assert!(!window.within("feature-info-properties").find("field_00").visible());
+        assert_eq!(
+            window.find("feature-info-heading").bounds(),
+            heading,
+            "The heading must stay fixed while rows scroll"
+        );
+        assert_eq!(window.find("feature-info").bounds(), properties);
+
+        scroll_extent
+    }
+
+    fn check_property_scroll_limits(
+        view: &Entity<MapView>,
+        layout: &PropertyLayout,
+        camera: MapCamera,
+        scroll_extent: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let PropertyLayout { body, first, .. } = *layout;
+        // Wheel events at either limit must stay in the pane, not zoom the map.
+        window.scroll("feature-info-properties", ScrollDelta::Lines(point(0.0, -3.0)), cx);
+        assert!(window.within("feature-info-properties").find("field_63").visible());
+        assert_eq!(view.read(cx).camera, camera, "Scrolling past the last property must not zoom the map");
+        window.scroll(
+            "feature-info-properties",
+            ScrollDelta::Pixels(point(px(0.0), scroll_extent + body.size.height)),
+            cx,
+        );
+        window.scroll("feature-info-properties", ScrollDelta::Lines(point(0.0, 3.0)), cx);
+        assert_eq!(window.within("feature-info-properties").find("field_00").bounds(), first);
+        assert!(window.within("feature-info-properties").find("field_00").visible());
+        assert!(view.read(cx).vector_hover.is_some());
+        assert_eq!(view.read(cx).camera, camera, "Scrolling past the first property must not zoom the map");
+        assert!(view.read(cx).drag.is_none());
+    }
+
+    fn check_property_collapse(view: &Entity<MapView>, properties: Bounds<Pixels>, camera: MapCamera, window: &mut Window, cx: &mut App) {
+        window.click("toggle-feature-info", cx);
+        assert!(window.try_find("feature-info-properties").is_none());
+        assert_eq!(window.find("toggle-feature-info").label(), Some("Expand properties"));
+        assert!(window.find("feature-info").bounds().size.height < properties.size.height);
+        assert!(view.read(cx).vector_hover.is_some(), "Collapsing must not dismiss the hover");
+        assert_eq!(view.read(cx).camera, camera);
+        assert!(view.read(cx).drag.is_none(), "The collapse button must not start a map drag");
+        window.scroll("feature-info-heading", ScrollDelta::Lines(point(0.0, -3.0)), cx);
+        assert_eq!(view.read(cx).camera, camera, "The collapsed header must not zoom the map");
+    }
+
+    fn check_property_keyboard_toggle(view: &Entity<MapView>, properties: Bounds<Pixels>, camera: MapCamera, window: &mut Window, cx: &mut App) {
+        window.press("tab", cx);
+        assert_eq!(window.find("toggle-feature-info").focused(), Some(true));
+        window.press("enter", cx);
+        assert!(window.find("feature-info-properties").visible());
+        window.press("space", cx);
+        assert!(window.try_find("feature-info-properties").is_none());
+
+        window.click("toggle-feature-info", cx);
+        assert!(window.find("feature-info-properties").visible());
+        assert_eq!(window.find("toggle-feature-info").label(), Some("Collapse properties"));
+        assert_eq!(window.find("feature-info").bounds(), properties);
+        assert!(view.read(cx).vector_hover.is_some());
+        assert_eq!(view.read(cx).camera, camera);
+        assert!(view.read(cx).drag.is_none());
+    }
+
+    fn assert_vector_progress_layout(map_bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        window.render_frame(cx);
+        let progress = window.find("vector-load-progress");
+        assert!(progress.visible());
+        assert_eq!(progress.role(), Some(gpui_kit::Role::ProgressIndicator));
+        assert_eq!(progress.label(), Some("Converting vectors · 45%"));
+        assert_eq!(window.find("vector-load-status").label(), Some("Converting vectors · 45%"));
+        assert_eq!(progress.bounds().top(), window.find("title-bar").bounds().bottom());
+        assert_eq!(progress.bounds().left(), map_bounds.left());
+        assert_eq!(progress.bounds().right(), map_bounds.right());
+        assert_eq!(progress.bounds().size.height, px(4.0), "Use the component's xsmall strip, not a card");
+        assert_eq!(window.find("map-surface").bounds(), map_bounds);
+        assert_eq!(window.find("map-surface").focused(), Some(true));
+        assert!(
+            window.try_find("raster-controls").is_none(),
+            "The strip cannot depend on an already loaded layer"
+        );
+    }
+
+    fn assert_cached_pointer_value(window: &mut Window, cx: &mut App) {
+        // Cached moves must render a value before any background work runs.
+        let center = window.find("map-surface").bounds().center();
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: center + point(px(5.0), px(0.0)),
+                pressed_button: None,
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(
+            window
+                .find("pixel-info")
+                .label()
+                .unwrap()
+                .split_whitespace()
+                .nth(4)
+                .unwrap()
+                .parse::<f64>()
+                .is_ok()
+        );
+        window.hover("raster-layers-card", cx);
+    }
+
+    fn assert_title_controls_layout(title_bar: Bounds<Pixels>, open: Bounds<Pixels>, band: Bounds<Pixels>, window: &mut Window) {
+        assert!(band.left() < title_bar.center().x);
+        assert!(band.top() >= title_bar.top() && band.bottom() <= title_bar.bottom());
+        assert!(open.left() >= title_bar.left() && open.right() < band.left());
+        assert!(open.top() >= title_bar.top() && open.bottom() <= title_bar.bottom());
+        assert_eq!(band.left() - open.right(), window.rem_size() * 0.5);
+        assert!(window.within("raster-layers-card").try_find("raster-band").is_none());
+        assert!(window.within("raster-layers-card").try_find("open-raster").is_none());
+    }
+
+    fn assert_floating_controls_layout(window: &mut Window) -> Bounds<Pixels> {
+        let title_bar = window.find("title-bar").bounds();
+        let open = window.within("title-bar").find("open-raster").bounds();
+        let map = window.find("map-surface").bounds();
+        let layers = window.find("raster-layers-card").bounds();
+        let range = window.find("raster-range-card").bounds();
+        let band = window.within("title-bar").find("raster-band").bounds();
+        assert_title_controls_layout(title_bar, open, band, window);
+        assert_eq!(title_bar.origin, point(px(0.0), px(0.0)));
+        assert_eq!(title_bar.size.width, px(1200.0));
+        assert!(title_bar.size.height > px(0.0));
+        assert_eq!(
+            map.origin,
+            point(px(0.0), title_bar.bottom()),
+            "Only window chrome may reserve space above the map"
+        );
+        assert_eq!(map.size, size(px(1200.0), px(760.0) - title_bar.size.height));
+        assert!(layers.left() > map.center().x && layers.right() < map.right());
+        assert_eq!(layers.left(), range.left());
+        assert_eq!(layers.right(), range.right());
+        assert!(range.top() > layers.bottom() && range.bottom() < map.bottom());
+        layers
+    }
+
+    fn continue_range_slider_drag(handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let range = window.find("raster-range-slider").bounds();
+            window.dispatch_event(
+                MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: range.origin + point(range.size.width * 0.25, range.size.height * 0.5),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            let thumb = window.within("raster-range-slider").find(("slider-thumb", 1_u32)).bounds();
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: thumb.center(),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            for fraction in [0.3, 0.4] {
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: range.origin + point(range.size.width * fraction, range.size.height * 0.5),
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.render_frame(cx);
+            }
+        })
+        .unwrap();
+    }
+
+    fn exercise_range_slider(view: &Entity<MapView>, handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
+        let original_range = cx.update(|cx| view.read(cx).raster.as_ref().unwrap().range());
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let range = window.find("raster-range-slider").bounds();
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: range.origin + point(range.size.width * 0.25, range.size.height * 0.5),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let pressed_range = cx.update(|cx| view.read(cx).raster.as_ref().unwrap().range());
+        assert!(pressed_range.0 > original_range.0, "Range changes must apply before releasing the pointer");
+
+        continue_range_slider_drag(handle, cx);
+        cx.run_until_parked();
+        assert!(
+            cx.update(|cx| view.read(cx).raster.as_ref().unwrap().range().0) > pressed_range.0,
+            "Dragging must continuously apply range changes"
+        );
+
+        cx.update_window(handle, |_, window, cx| {
+            let range = window.find("raster-range-slider").bounds();
+            window.dispatch_event(
+                MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: range.origin + point(range.size.width * 0.4, range.size.height * 0.5),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.click("reset-raster-range", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| view.read(cx).raster.as_ref().unwrap().range()), original_range);
+    }
+
+    fn check_raster_controls_toggle(handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.update_window(handle, |_, window, cx| {
+            window.click("toggle-raster-controls", cx);
+            assert!(window.try_find("raster-range-card").is_none());
+            assert!(window.within("title-bar").find("raster-band").visible());
+            assert!(window.within("title-bar").find("open-raster").visible());
+            let title_bar = window.find("title-bar").bounds();
+            assert_eq!(window.find("map-surface").bounds().size, size(px(1200.0), px(760.0) - title_bar.size.height));
+            window.press("secondary-l", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("raster-range-card").visible());
+        })
+        .unwrap();
+    }
+
+    fn check_floating_controls_resize(view: &Entity<MapView>, handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.simulate_window_resize(handle, size(px(640.0), px(400.0)));
+        cx.update(|cx| gpui_kit::component::Theme::update(cx, |theme| theme.font_size = px(18.0)));
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let map = window.find("map-surface").bounds();
+            let layers = window.find("raster-layers-card").bounds();
+            let title_bar = window.find("title-bar").bounds();
+            let open = window.within("title-bar").find("open-raster");
+            assert!(open.visible());
+            let band = window.within("title-bar").find("raster-band");
+            assert!(band.visible());
+            assert!(band.bounds().left() < title_bar.center().x);
+            assert!(open.bounds().left() >= title_bar.left() && open.bounds().right() < band.bounds().left());
+            assert!(band.bounds().right() <= title_bar.right());
+            assert_eq!(map.size, size(px(640.0), px(400.0) - title_bar.size.height));
+            assert!(layers.right() < map.right() && layers.left() > map.left());
+            window.scroll("raster-layers-card", ScrollDelta::Lines(point(0.0, -30.0)), cx);
+            assert!(
+                window.find("raster-max").visible(),
+                "The floating controls must scroll in short windows at larger UI scales"
+            );
+            view.read(cx).raster_panel.clone().update(cx, |panel, cx| panel.clear(window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("raster-controls").is_none());
+            assert!(window.within("title-bar").find("open-raster").visible());
+        })
+        .unwrap();
+    }
+
+    fn start_range_slider_drag(handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let thumb = window.within("raster-range-slider").find(("slider-thumb", 1_u32)).bounds();
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: thumb.center(),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            let range = window.find("raster-range-slider").bounds();
+            // Cross the drag threshold before checking continuous updates.
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: range.origin + point(range.size.width * 0.1, range.size.height * 0.5),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+
+    fn check_in_flight_range_frames(view: &Entity<MapView>, handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
+        for fraction in [0.2, 0.3, 0.4] {
+            // Emulate a frame that started rendering before this pointer event
+            // and completes while the next range is already requested.
+            let source = cx.update(|cx| view.read(cx).raster.clone().unwrap());
+            cx.update_window(handle, |_, window, cx| {
+                let range = window.find("raster-range-slider").bounds();
+                let position = range.origin + point(range.size.width * fraction, range.size.height * 0.5);
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position,
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert_ne!(cx.update(|cx| view.read(cx).raster.as_ref().unwrap().id()), source.id());
+            let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| apply_completed_range_frame(view, &source, &image, window, cx));
+            })
+            .unwrap();
+        }
+    }
+
+    fn check_obsolete_band_frame(view: &Entity<MapView>, handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
+        let obsolete_source = cx.update(|cx| view.read(cx).raster.clone().unwrap());
+        cx.update_window(handle, |_, window, cx| {
+            let range = window.find("raster-range-slider").bounds();
+            window.dispatch_event(
+                MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: range.origin + point(range.size.width * 0.4, range.size.height * 0.5),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.click("raster-band", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert_ne!(view.raster.as_ref().unwrap().metadata().id, obsolete_source.metadata().id);
+                let shown = view.image.clone().unwrap();
+                let obsolete = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
+                view.apply_frame(
+                    MapFrame {
+                        viewport: view.viewport.unwrap(),
+                        basemap: basemap_style(cx),
+                        raster_layer_id: Some(obsolete_source.metadata().id),
+                        vector_layer_id: None,
+                        settled: false,
+                        tile_boundaries: false,
+                        image: Ok(obsolete),
+                    },
+                    window,
+                    cx,
+                );
+                assert!(
+                    Arc::ptr_eq(view.image.as_ref().unwrap(), &shown),
+                    "An in-flight frame from another band must still be rejected"
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    fn check_coast_interruptions(view: &Entity<MapView>, from: Point<Pixels>, to: Point<Pixels>, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        let after_pan = view.read(cx).camera;
+        // End a drag on the attribution footer, outside the map hitbox.
+        window.drag(from, point(from.x, bounds.bottom() + px(5.0)), cx);
+        assert_ne!(view.read(cx).camera, after_pan);
+        assert!(view.read(cx).drag.is_none());
+        assert!(view.read(cx).coast.is_some());
+
+        let after_release = view.read(cx).camera;
+        window.hover("map-surface", cx);
+        assert_eq!(view.read(cx).camera, after_release);
+        window.right_click("map-surface", cx);
+        assert_eq!(view.read(cx).camera, after_release);
+        window.press("-", cx);
+        assert_ne!(view.read(cx).camera, after_release);
+        assert!(view.read(cx).coast.is_none());
+
+        window.drag(from, to, cx);
+        assert!(view.read(cx).coast.is_some());
+        window.click("map-surface", cx);
+        assert!(view.read(cx).coast.is_none());
+        let after_interrupt = view.read(cx).camera;
+        window.simulate_next_frame(cx);
+        assert_eq!(view.read(cx).camera, after_interrupt);
+
+        cx.set_reduce_motion(true);
+        window.drag(from, to, cx);
+        assert!(view.read(cx).coast.is_none());
+    }
+    fn check_basemap_frame_identity(map: &mut MapView, expected: BasemapStyle, camera: MapCamera, window: &mut Window, cx: &mut Context<MapView>) {
+        assert_eq!(map.requested.as_ref().unwrap().basemap, expected);
+        assert_eq!(map.camera, camera);
+        let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
+        map.apply_frame(
+            MapFrame {
+                viewport: map.viewport.unwrap(),
+                basemap: expected,
+                tile_boundaries: false,
+                raster_layer_id: None,
+                vector_layer_id: None,
+                settled: false,
+                image: Ok(image.clone()),
+            },
+            window,
+            cx,
+        );
+        map.apply_frame(
+            MapFrame {
+                viewport: map.viewport.unwrap(),
+                basemap: if expected == BasemapStyle::Light {
+                    BasemapStyle::Dark
+                } else {
+                    BasemapStyle::Light
+                },
+                raster_layer_id: None,
+                vector_layer_id: None,
+                settled: false,
+                image: Err(anyhow::anyhow!("Obsolete basemap failed")),
+                tile_boundaries: false,
+            },
+            window,
+            cx,
+        );
+        assert!(Arc::ptr_eq(map.image.as_ref().unwrap(), &image));
+        assert!(map.error.is_none(), "Obsolete basemap errors must not replace the current map");
+    }
+
+    fn write_separated_rasters(directory: &std::path::Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for (name, west) in [("near", -10.0), ("far", 100.0)] {
+            let path = directory.join(format!("{name}.tif"));
+            crate::raster_source::test_support::write_raster(&path, 4326, 2).unwrap();
+            let mut dataset = gdal::Dataset::open_ex(
+                &path,
+                gdal::DatasetOptions {
+                    open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            dataset.set_geo_transform(&[west, 20.0 / 64.0, 0.0, 10.0, 0.0, -20.0 / 64.0]).unwrap();
+            dataset.close().unwrap();
+            paths.push(path);
+        }
+
+        paths
+    }
+
+    fn check_vector_frame_identity(map: &mut MapView, old_id: u64, window: &mut Window, cx: &mut Context<MapView>) {
+        let current_id = map.vector.as_ref().unwrap().id();
+        assert_ne!(current_id, old_id);
+        assert!(map.raster.is_none());
+        assert_eq!(map.requested.as_ref().unwrap().vector_id, Some(current_id));
+        let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
+        map.apply_frame(
+            MapFrame {
+                viewport: map.viewport.unwrap(),
+                basemap: basemap_style(cx),
+                raster_layer_id: None,
+                vector_layer_id: Some(old_id),
+                settled: false,
+                tile_boundaries: map.tile_boundaries,
+                image: Ok(image.clone()),
+            },
+            window,
+            cx,
+        );
+        assert!(map.image.is_none(), "A frame for the previous vector source must be rejected");
+        map.apply_frame(
+            MapFrame {
+                viewport: map.viewport.unwrap(),
+                basemap: basemap_style(cx),
+                raster_layer_id: None,
+                vector_layer_id: Some(current_id),
+                settled: false,
+                tile_boundaries: map.tile_boundaries,
+                image: Ok(image.clone()),
+            },
+            window,
+            cx,
+        );
+        assert!(Arc::ptr_eq(map.image.as_ref().unwrap(), &image), "The current vector frame must be accepted");
+        assert!(map.error.is_none());
+    }
+
+    fn measure_empty_selector(window: &mut Window, cx: &mut App) -> Pixels {
+        window.render_frame(cx);
+        let selector = window.find("raster-band");
+        assert!(selector.visible());
+        assert_eq!(selector.disabled(), Some(true));
+        let width = selector.bounds().size.width;
+        let text = "Open a geospatial dataset";
+        let text_width = window
+            .text_system()
+            .shape_line(text.into(), window.rem_size() * 0.875, &[window.text_style().to_run(text.len())], None)
+            .width();
+        assert!(width > text_width, "The empty placeholder must fit with room for the caret");
+        window.click("open-raster", cx);
+        width
+    }
+
+    fn measure_long_selector(view: &Entity<MapView>, placeholder_width: Pixels, short_width: Pixels, window: &mut Window, cx: &mut App) -> Pixels {
+        window.render_frame(cx);
+        assert_eq!(
+            view.read(cx).raster.as_ref().unwrap().metadata().name,
+            "Regional elevation observations for winter"
+        );
+        let width = window.find("raster-band").bounds().size.width;
+        assert!(width > placeholder_width && width > short_width, "Longer names must grow the selector");
+        let text = &view.read(cx).raster.as_ref().unwrap().metadata().name;
+        let text_width = window
+            .text_system()
+            .shape_line(text.clone().into(), window.rem_size() * 0.875, &[window.text_style().to_run(text.len())], None)
+            .width();
+        assert!(width > text_width, "An uncapped layer title must fit with room for the caret");
+        window.click("raster-band", cx);
+        window.press("up", cx);
+        window.press("enter", cx);
+        width
+    }
+
+    fn check_selector_input_keeps_width(view: &Entity<MapView>, long_width: Pixels, handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().name, "dem");
+            assert_eq!(
+                window.find("raster-band").bounds().size.width,
+                long_width,
+                "Keyboard selection must not change width"
+            );
+            window.scroll("raster-band", ScrollDelta::Lines(point(0., -1.)), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx).raster.as_ref().unwrap().metadata().name,
+                "Regional elevation observations for winter"
+            );
+            assert_eq!(
+                window.find("raster-band").bounds().size.width,
+                long_width,
+                "Wheel selection must not change width"
+            );
+            Theme::update(cx, |theme| theme.font_size = px(24.));
+        })
+        .unwrap();
+    }
+
+    fn check_capped_selector_actions(view: &Entity<MapView>, wide_capped_width: Pixels, handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.simulate_window_resize(handle, size(px(640.), px(400.)));
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let title_bar = window.find("title-bar").bounds();
+            let band = window.find("raster-band").bounds();
+            let open = window.find("open-raster").bounds();
+            let debug = window.find("toggle-tile-boundaries").bounds();
+            let settings = window.find("open-settings").bounds();
+            assert!(band.size.width < wide_capped_width && band.size.width <= title_bar.size.width * 0.5);
+            assert!(open.right() <= band.left() && band.right() < debug.left());
+            assert!(debug.right() <= settings.left() && settings.right() <= title_bar.right());
+            let controls = window.find("window-controls").bounds();
+            if controls.size.width > px(0.) {
+                assert!(settings.right() <= controls.left() && controls.right() <= title_bar.right());
+            }
+            assert!(window.find("open-raster").visible() && window.find("open-settings").visible());
+            window.click("toggle-tile-boundaries", cx);
+            assert!(view.read(cx).tile_boundaries, "The trailing action must remain clickable after capping");
+            window.click("open-settings", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("appearance-settings").visible(), "Settings must remain clickable after capping");
+        })
+        .unwrap();
+    }
+
+    fn drain_map_frames(view: &Entity<MapView>, frames: &async_channel::Receiver<MapFrame>, window: &mut Window, cx: &mut App) {
+        while let Ok(frame) = frames.try_recv() {
+            view.update(cx, |map, cx| map.apply_frame(frame, window, cx));
+        }
+    }
+
+    fn drain_stationary_query_results(
+        view: &Entity<MapView>,
+        results: &async_channel::Receiver<crate::map_renderer::FeatureQueryResult>,
+        phase: usize,
+        properties_bounds: Option<Bounds<Pixels>>,
+        received_current_hit: &mut bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        while let Ok(result) = results.try_recv() {
+            let revision = result.revision();
+            let features = result.into_features();
+            *received_current_hit |= revision == view.read(cx).hover_revision && features.as_ref().is_ok_and(|features| !features.is_empty());
+            view.update(cx, |map, cx| map.apply_feature_result(revision, features, cx));
+            window.render_frame(cx);
+            if phase > 0 {
+                assert!(window.find("feature-info-properties").visible(), "Worker results must not cause zoom flicker");
+                assert_eq!(Some(window.find("feature-info").bounds()), properties_bounds);
+            }
+        }
+    }
+
+    fn zoom_stationary_pointer(view: &Entity<MapView>, phase: usize, position: Point<Pixels>, window: &mut Window, cx: &mut App) -> Bounds<Pixels> {
+        let properties_bounds = window.find("feature-info").bounds();
+        let camera = view.read(cx).camera;
+        let revision = view.read(cx).hover_revision;
+        if phase < 2 {
+            window.dispatch_event(
+                ScrollEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, if phase == 0 { 1.0 } else { -1.0 })),
+                    modifiers: Default::default(),
+                    touch_phase: Default::default(),
+                    source: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        } else {
+            window.press(if phase == 2 { "+" } else { "-" }, cx);
+        }
+        assert_ne!(view.read(cx).camera, camera);
+        assert!(view.read(cx).hover_revision > revision);
+        assert_eq!(view.read(cx).pointer, Some(position));
+        assert!(
+            window.find("feature-info-properties").visible(),
+            "Zoom must retain properties while querying the new camera"
+        );
+
+        properties_bounds
+    }
+
+    fn assert_stationary_refresh(
+        view: &Entity<MapView>,
+        position: Point<Pixels>,
+        phase: usize,
+        properties_bounds: Option<Bounds<Pixels>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).pointer, Some(position), "Zoom must not need a mouse move (phase {phase})");
+        assert!(view.read(cx).error.is_none(), "{:?}", view.read(cx).error);
+        if phase > 0 {
+            assert!(
+                window.find("feature-info-properties").visible(),
+                "Properties must remain visible throughout the refresh"
+            );
+            assert_eq!(Some(window.find("feature-info").bounds()), properties_bounds);
+        }
+    }
+
+    fn wait_for_stationary_query(
+        view: &Entity<MapView>,
+        channels: (
+            &async_channel::Receiver<MapFrame>,
+            &async_channel::Receiver<crate::map_renderer::FeatureQueryResult>,
+        ),
+        position: Point<Pixels>,
+        properties_bounds: Option<Bounds<Pixels>>,
+        phase: usize,
+        handle: gpui_kit::AnyWindowHandle,
+        cx: &mut TestAppContext,
+    ) {
+        let (frames, results) = channels;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut received_current_hit = false;
+        loop {
+            let populated = cx
+                .update_window(handle, |_, window, cx| {
+                    drain_map_frames(view, frames, window, cx);
+                    drain_stationary_query_results(view, results, phase, properties_bounds, &mut received_current_hit, window, cx);
+                    assert_stationary_refresh(view, position, phase, properties_bounds, window, cx);
+                    received_current_hit && window.try_find("feature-info-properties").is_some_and(|properties| properties.visible())
+                })
+                .unwrap();
+            if populated {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Properties did not populate in phase {phase} with a stationary pointer"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn apply_completed_range_frame(view: &mut MapView, source: &RasterSource, image: &Arc<RenderImage>, window: &mut Window, cx: &mut Context<MapView>) {
+        view.apply_frame(
+            MapFrame {
+                viewport: view.viewport.unwrap(),
+                basemap: basemap_style(cx),
+                raster_layer_id: Some(source.metadata().id),
+                vector_layer_id: None,
+                settled: false,
+                tile_boundaries: false,
+                image: Ok(image.clone()),
+            },
+            window,
+            cx,
+        );
+        assert!(
+            view.image.as_ref().is_some_and(|shown| Arc::ptr_eq(shown, image)),
+            "A continuous range drag must display completed frames, not wait for an exact style match"
+        );
     }
 }

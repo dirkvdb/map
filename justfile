@@ -57,3 +57,16 @@ sync-skills:
 # Refresh both themes and agent skills from a single locked source download.
 sync-gpui:
     python3 scripts/sync_gpui.py all
+
+# Application policy checks; dependencies/submodules are not lint targets.
+check: fmt complexity lint
+
+fmt:
+    cargo fmt --all -- --check
+
+lint:
+    cargo clippy --locked --workspace --all-targets --all-features --no-deps -- -D warnings -D clippy::cognitive_complexity -D clippy::too_many_lines -D clippy::type_complexity
+
+# Use the version and thresholds configured in devenv.nix, without overrides.
+complexity:
+    devenv tasks run code:complexity

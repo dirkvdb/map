@@ -55,14 +55,18 @@ impl ConfigPaths {
         };
         current.extend(updates.clone());
         let data = serde_json::to_vec_pretty(current)?;
+        self.write(&data)
+    }
+
+    fn write(&self, data: &[u8]) -> anyhow::Result<()> {
         if exists(&self.state)? {
             if !is_writable(&self.state) {
                 bail!("Settings are not writable: {}", self.state.display());
             }
-            return write_json(&self.state, &data);
+            return write_json(&self.state, data);
         }
         if is_writable(&self.config) {
-            match write_json(&self.config, &data) {
+            match write_json(&self.config, data) {
                 Ok(()) => return Ok(()),
                 Err(error) if self.config != self.state && is_writable(&self.state) => {
                     log::warn!("Could not save configuration; using {}: {error:#}", self.state.display());
@@ -73,7 +77,7 @@ impl ConfigPaths {
         if !is_writable(&self.state) {
             bail!("Settings are not writable: {} or {}", self.config.display(), self.state.display());
         }
-        write_json(&self.state, &data)
+        write_json(&self.state, data)
     }
 }
 
@@ -85,22 +89,23 @@ fn exists(path: &Path) -> anyhow::Result<bool> {
     }
 }
 
-fn is_writable(path: &Path) -> bool {
+fn parent_is_writable(path: &Path) -> bool {
     let Some(mut parent) = path.parent() else { return false };
     loop {
         match fs::metadata(parent) {
-            Ok(metadata) => {
-                if !metadata.is_dir() || !permissions_allow_write(&metadata, true) {
-                    return false;
-                }
-                break;
-            }
+            Ok(metadata) => return metadata.is_dir() && permissions_allow_write(&metadata, true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let Some(ancestor) = parent.parent() else { return false };
                 parent = ancestor;
             }
             Err(_) => return false,
         }
+    }
+}
+
+fn is_writable(path: &Path) -> bool {
+    if !parent_is_writable(path) {
+        return false;
     }
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => fs::metadata(path).is_ok_and(|target| target.is_file() && permissions_allow_write(&target, false)),

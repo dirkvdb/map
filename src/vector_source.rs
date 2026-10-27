@@ -39,6 +39,21 @@ struct ConversionProgress<'a> {
     per_feature: bool,
 }
 
+impl ConversionProgress<'_> {
+    fn report_translation(&mut self, fraction: f64, preparing: &mut bool) {
+        if self.per_feature && *preparing {
+            return;
+        }
+        (self.callback)(VectorLoadProgress::Converting(fraction));
+        if self.per_feature && fraction >= 1.0 {
+            *preparing = true;
+            // Emit inside GDAL's final callback, before the translator
+            // returns and any output finalization or extent scans run.
+            (self.callback)(VectorLoadProgress::Preparing);
+        }
+    }
+}
+
 /// A top-level numeric attribute and its usable default coloring range.
 #[derive(Debug)]
 pub struct NumericProperty {
@@ -152,192 +167,18 @@ impl VectorSource {
         }
         let driver = dataset.driver().short_name();
         let is_csv = driver == "CSV";
-        let dataset = if is_csv {
-            // Let GDAL parse quoting, delimiters and coordinate columns. Do not
-            // infer attribute types: identifiers such as "00123" must survive.
-            gdalio::dataset::open_read_only_with_options(
-                path,
-                Some(&[
-                    "X_POSSIBLE_NAMES=lon,long,longitude",
-                    "Y_POSSIBLE_NAMES=lat,latitude",
-                    "KEEP_GEOM_COLUMNS=YES",
-                    "AUTODETECT_TYPE=NO",
-                ]),
-            )
-            .with_context(|| format!("Could not open CSV coordinates in {}", path.display()))?
-        } else {
-            dataset
-        };
+        let dataset = if is_csv { open_csv_dataset(path)? } else { dataset };
         if matches!(driver.as_str(), "PMTiles" | "MBTiles") {
-            let absolute = path.canonicalize().with_context(|| format!("Could not resolve {}", path.display()))?;
-            let file_url = url::Url::from_file_path(&absolute).map_err(|_| anyhow::anyhow!("Could not create a file URL for {}", absolute.display()))?;
-            let url = match driver.as_str() {
-                "PMTiles" => format!("pmtiles://{file_url}"),
-                // Native MBTiles takes an encoded absolute path, not a file URL.
-                _ => format!("mbtiles://{}", file_url.path()),
-            };
-            // Reading names uses GDAL's layer metadata, never feature iteration
-            // or extent/statistics calculation, which could scan the archive.
-            let sources = (0..dataset.layer_count())
-                .map(|index| {
-                    let layer = dataset.layer(index)?;
-                    Ok(Arc::new(Self::new(
-                        layer.name(),
-                        bounds_array(gdalio::layer_bounds(&layer)?.unwrap_or_else(geo::LatLonBounds::world)),
-                        VectorData::Tiled { url: url.clone() },
-                        schema_numeric_properties(layer.defn()),
-                        schema_points_only(layer.defn()),
-                    )))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            return Ok(Some(sources));
+            return Self::tiled_sources(&dataset, path, &driver).map(Some);
         }
 
-        let per_feature = progress.as_ref().is_some_and(|progress| progress.per_feature);
-        if per_feature && let Some(progress) = progress.as_mut() {
+        if let Some(progress) = progress.as_mut().filter(|progress| progress.per_feature) {
             (progress.callback)(VectorLoadProgress::Converting(0.0));
         }
-        let layer_count = dataset.layer_count();
         let mut sources = Vec::new();
-        for index in 0..layer_count {
-            let mut layer = dataset.layer(index)?;
-            let name = layer.name();
-            ensure!(
-                layer.defn().geom_fields().count() <= 1,
-                "Layer {name:?} has multiple geometry fields; GeoJSON can only preserve one"
-            );
-            let csv_fields = if is_csv {
-                let fields: Vec<String> = layer.defn().fields().map(|field| field.name()).collect();
-                ensure!(
-                    ["lat", "latitude"]
-                        .iter()
-                        .any(|alias| fields.iter().any(|name| name.eq_ignore_ascii_case(alias)))
-                        && ["lon", "long", "longitude"]
-                            .iter()
-                            .any(|alias| fields.iter().any(|name| name.eq_ignore_ascii_case(alias)))
-                        && layer.defn().geom_fields().count() == 1,
-                    "CSV layer {name:?} requires latitude (lat or latitude) and longitude (lon, long or longitude) columns"
-                );
-                let projection = if path.is_dir() {
-                    path.join(&name).with_extension("prj")
-                } else {
-                    path.with_extension("prj")
-                };
-                ensure!(
-                    layer.spatial_ref().is_some() || !projection.try_exists()?,
-                    "CSV layer {name:?} has an invalid coordinate reference system in {}",
-                    projection.display()
-                );
-                validate_csv_records(&mut layer, &fields)?;
-                fields
-            } else {
-                Vec::new()
-            };
-            let assign_wgs84 = is_csv && layer.spatial_ref().is_none();
-            ensure!(
-                layer.defn().geom_fields().count() == 0 || layer.spatial_ref().is_some() || assign_wgs84,
-                "Layer {name:?} has no coordinate reference system"
-            );
-            let expected_count = layer.try_feature_count();
-            if per_feature
-                && index > 0
-                && let Some(progress) = progress.as_mut()
-            {
-                (progress.callback)(VectorLoadProgress::Converting(index as f64 / layer_count as f64));
-            }
-            let report_progress = progress.is_some();
-            let mut layer_progress = |event| {
-                let event = match event {
-                    VectorLoadProgress::Converting(fraction) if fraction.is_finite() => {
-                        VectorLoadProgress::Converting((index as f64 + fraction.clamp(0.0, 1.0)) / layer_count as f64)
-                    }
-                    VectorLoadProgress::Converting(_) => return,
-                    VectorLoadProgress::Preparing => VectorLoadProgress::Preparing,
-                };
-                if let Some(progress) = progress.as_mut() {
-                    (progress.callback)(event);
-                }
-            };
-            let (mut geojson, bounds) = translate_layer(
-                &dataset,
-                &name,
-                &conversion_path(),
-                assign_wgs84,
-                is_csv,
-                report_progress.then_some(ConversionProgress {
-                    callback: &mut layer_progress,
-                    per_feature,
-                }),
-            )
-            .with_context(|| format!("Could not convert layer {name:?} in {} to WGS84 GeoJSON", path.display()))?;
-            let parsed = Instant::now();
-            let mut data: Value = serde_json::from_str(&geojson).with_context(|| format!("Could not read converted layer {name:?}"))?;
-            log::info!(target: "map::vector_load", "layer={name:?} stage=rust-json-parse elapsed={:?} bytes={}", parsed.elapsed(), geojson.len());
-            let validated = Instant::now();
-            ensure!(data["type"] == "FeatureCollection", "GDAL did not produce a FeatureCollection for {name:?}");
-            let features = data["features"].as_array_mut().context("GeoJSON features must be an array")?;
-            if let Some(expected) = expected_count {
-                ensure!(
-                    features.len() as u64 == expected,
-                    "Layer {name:?}: expected {expected} features, converted {}",
-                    features.len()
-                );
-            }
-            let mut properties_changed = false;
-            if is_csv {
-                for (record_ix, feature) in features.iter_mut().enumerate() {
-                    ensure!(
-                        feature["geometry"]["type"] == "Point"
-                            && feature["geometry"]["coordinates"].as_array().is_some_and(|coordinates| {
-                                coordinates.len() >= 2
-                                    && coordinates[0]
-                                        .as_f64()
-                                        .zip(coordinates[1].as_f64())
-                                        .is_some_and(|(lon, lat)| geo::Coordinate::latlon(lat, lon).is_valid() && (-180.0..=180.0).contains(&lon))
-                            }),
-                        "CSV layer {name:?}, record {} has missing or invalid longitude/latitude coordinates",
-                        record_ix + 1
-                    );
-                    // GDAL leaves empty typed CSV cells unset; retain their
-                    // columns explicitly rather than dropping the properties.
-                    let properties = feature["properties"].as_object_mut().context("CSV feature properties must be an object")?;
-                    for field in &csv_fields {
-                        if let serde_json::map::Entry::Vacant(entry) = properties.entry(field) {
-                            entry.insert(Value::Null);
-                            properties_changed = true;
-                        }
-                    }
-                }
-            }
-            let fallback = if features.is_empty() {
-                geo::LatLonBounds::from([0.0; 4])
-            } else {
-                geo::LatLonBounds::world()
-            };
-            let feature_count = features.len();
-            log::info!(target: "map::vector_load", "layer={name:?} stage=validate-features elapsed={:?} features={feature_count}", validated.elapsed());
-            let metadata_started = Instant::now();
-            let numeric_properties = geojson_numeric_properties(features);
-            let points_only = geojson_points_only(features);
-            log::info!(target: "map::vector_load", "layer={name:?} stage=numeric-and-geometry-metadata elapsed={:?} numeric_properties={}", metadata_started.elapsed(), numeric_properties.len());
-            // Retain GDAL's original text unless CSV null restoration changed it.
-            // The temporary JSON tree is only needed for validation and metadata.
-            if properties_changed {
-                let serialized = Instant::now();
-                geojson = serde_json::to_string(&data)?;
-                log::info!(target: "map::vector_load", "layer={name:?} stage=csv-json-reserialize elapsed={:?}", serialized.elapsed());
-            }
-            let released = Instant::now();
-            drop(data);
-            log::info!(target: "map::vector_load", "layer={name:?} stage=release-rust-json-tree elapsed={:?}", released.elapsed());
-            let bounds = bounds_array(bounds.unwrap_or(fallback));
-            sources.push(Arc::new(Self::new(
-                name,
-                bounds,
-                VectorData::GeoJson(Arc::new(geojson)),
-                numeric_properties,
-                points_only,
-            )));
+        for index in 0..dataset.layer_count() {
+            let (source, feature_count) = Self::materialize_layer(&dataset, index, path, is_csv, &mut progress)?;
+            sources.push(Arc::new(source));
             let source = &sources[sources.len() - 1];
             log::info!(target: "map::vector_load", "path={path:?} source={} layer={:?} stage=layer-prepared since_open={:?} features={feature_count}", source.id(), source.name(), load_started.elapsed());
         }
@@ -345,6 +186,101 @@ impl VectorSource {
         dataset.close()?;
         log::info!(target: "map::vector_load", "path={path:?} stage=close-input elapsed={:?} total_open={:?}", closed.elapsed(), load_started.elapsed());
         Ok(Some(sources))
+    }
+
+    fn tiled_sources(dataset: &Dataset, path: &Path, driver: &str) -> Result<Vec<Arc<Self>>> {
+        let absolute = path.canonicalize().with_context(|| format!("Could not resolve {}", path.display()))?;
+        let file_url = url::Url::from_file_path(&absolute).map_err(|_| anyhow::anyhow!("Could not create a file URL for {}", absolute.display()))?;
+        let url = match driver {
+            "PMTiles" => format!("pmtiles://{file_url}"),
+            // Native MBTiles takes an encoded absolute path, not a file URL.
+            _ => format!("mbtiles://{}", file_url.path()),
+        };
+        // Reading names uses GDAL's layer metadata, never feature iteration
+        // or extent/statistics calculation, which could scan the archive.
+        (0..dataset.layer_count())
+            .map(|index| {
+                let layer = dataset.layer(index)?;
+                Ok(Arc::new(Self::new(
+                    layer.name(),
+                    bounds_array(gdalio::layer_bounds(&layer)?.unwrap_or_else(geo::LatLonBounds::world)),
+                    VectorData::Tiled { url: url.clone() },
+                    schema_numeric_properties(layer.defn()),
+                    schema_points_only(layer.defn()),
+                )))
+            })
+            .collect()
+    }
+
+    fn materialize_layer(dataset: &Dataset, index: usize, path: &Path, is_csv: bool, progress: &mut Option<ConversionProgress<'_>>) -> Result<(Self, usize)> {
+        let mut layer = dataset.layer(index)?;
+        let name = layer.name();
+        ensure!(
+            layer.defn().geom_fields().count() <= 1,
+            "Layer {name:?} has multiple geometry fields; GeoJSON can only preserve one"
+        );
+        let csv_fields = if is_csv { Some(prepare_csv_layer(&mut layer, path)?) } else { None };
+        let assign_wgs84 = is_csv && layer.spatial_ref().is_none();
+        ensure!(
+            layer.defn().geom_fields().count() == 0 || layer.spatial_ref().is_some() || assign_wgs84,
+            "Layer {name:?} has no coordinate reference system"
+        );
+        let expected_count = layer.try_feature_count();
+        let (geojson, bounds) = translate_dataset_layer(dataset, &name, index, assign_wgs84, is_csv, progress)
+            .with_context(|| format!("Could not convert layer {name:?} in {} to WGS84 GeoJSON", path.display()))?;
+        Self::from_converted_geojson(name, geojson, bounds, expected_count, csv_fields.as_deref())
+    }
+
+    fn from_converted_geojson(
+        name: String,
+        mut geojson: String,
+        bounds: Option<geo::LatLonBounds>,
+        expected_count: Option<u64>,
+        csv_fields: Option<&[String]>,
+    ) -> Result<(Self, usize)> {
+        let parsed = Instant::now();
+        let mut data: Value = serde_json::from_str(&geojson).with_context(|| format!("Could not read converted layer {name:?}"))?;
+        log::info!(target: "map::vector_load", "layer={name:?} stage=rust-json-parse elapsed={:?} bytes={}", parsed.elapsed(), geojson.len());
+        let validated = Instant::now();
+        ensure!(data["type"] == "FeatureCollection", "GDAL did not produce a FeatureCollection for {name:?}");
+        let features = data["features"].as_array_mut().context("GeoJSON features must be an array")?;
+        if let Some(expected) = expected_count {
+            ensure!(
+                features.len() as u64 == expected,
+                "Layer {name:?}: expected {expected} features, converted {}",
+                features.len()
+            );
+        }
+        let properties_changed = match csv_fields {
+            Some(fields) => restore_csv_properties(features, fields, &name)?,
+            None => false,
+        };
+        let fallback = if features.is_empty() {
+            geo::LatLonBounds::from([0.0; 4])
+        } else {
+            geo::LatLonBounds::world()
+        };
+        let feature_count = features.len();
+        log::info!(target: "map::vector_load", "layer={name:?} stage=validate-features elapsed={:?} features={feature_count}", validated.elapsed());
+        let metadata_started = Instant::now();
+        let numeric_properties = geojson_numeric_properties(features);
+        let points_only = geojson_points_only(features);
+        log::info!(target: "map::vector_load", "layer={name:?} stage=numeric-and-geometry-metadata elapsed={:?} numeric_properties={}", metadata_started.elapsed(), numeric_properties.len());
+        // Retain GDAL's original text unless CSV null restoration changed it.
+        // The temporary JSON tree is only needed for validation and metadata.
+        if properties_changed {
+            let serialized = Instant::now();
+            geojson = serde_json::to_string(&data)?;
+            log::info!(target: "map::vector_load", "layer={name:?} stage=csv-json-reserialize elapsed={:?}", serialized.elapsed());
+        }
+        let released = Instant::now();
+        drop(data);
+        log::info!(target: "map::vector_load", "layer={name:?} stage=release-rust-json-tree elapsed={:?}", released.elapsed());
+        let bounds = bounds_array(bounds.unwrap_or(fallback));
+        Ok((
+            Self::new(name, bounds, VectorData::GeoJson(Arc::new(geojson)), numeric_properties, points_only),
+            feature_count,
+        ))
     }
 
     fn new(name: String, bounds: [f64; 4], data: VectorData, numeric_properties: Vec<NumericProperty>, points_only: bool) -> Self {
@@ -637,6 +573,75 @@ fn bounds_array(bounds: geo::LatLonBounds) -> [f64; 4] {
     [bounds.west(), bounds.south(), bounds.east(), bounds.north()]
 }
 
+fn open_csv_dataset(path: &Path) -> Result<Dataset> {
+    // Let GDAL parse quoting, delimiters and coordinate columns. Do not
+    // infer attribute types: identifiers such as "00123" must survive.
+    gdalio::dataset::open_read_only_with_options(
+        path,
+        Some(&[
+            "X_POSSIBLE_NAMES=lon,long,longitude",
+            "Y_POSSIBLE_NAMES=lat,latitude",
+            "KEEP_GEOM_COLUMNS=YES",
+            "AUTODETECT_TYPE=NO",
+        ]),
+    )
+    .with_context(|| format!("Could not open CSV coordinates in {}", path.display()))
+}
+
+fn prepare_csv_layer(layer: &mut impl gdal::vector::LayerAccess, path: &Path) -> Result<Vec<String>> {
+    let name = layer.name();
+    let fields: Vec<String> = layer.defn().fields().map(|field| field.name()).collect();
+    let has_alias = |aliases: &[&str]| aliases.iter().any(|alias| fields.iter().any(|name| name.eq_ignore_ascii_case(alias)));
+    ensure!(
+        has_alias(&["lat", "latitude"]) && has_alias(&["lon", "long", "longitude"]) && layer.defn().geom_fields().count() == 1,
+        "CSV layer {name:?} requires latitude (lat or latitude) and longitude (lon, long or longitude) columns"
+    );
+    let projection = if path.is_dir() {
+        path.join(&name).with_extension("prj")
+    } else {
+        path.with_extension("prj")
+    };
+    ensure!(
+        layer.spatial_ref().is_some() || !projection.try_exists()?,
+        "CSV layer {name:?} has an invalid coordinate reference system in {}",
+        projection.display()
+    );
+    validate_csv_records(layer, &fields)?;
+    Ok(fields)
+}
+
+fn valid_csv_point(geometry: &Value) -> bool {
+    geometry["type"] == "Point"
+        && geometry["coordinates"].as_array().is_some_and(|coordinates| {
+            coordinates.len() >= 2
+                && coordinates[0]
+                    .as_f64()
+                    .zip(coordinates[1].as_f64())
+                    .is_some_and(|(lon, lat)| geo::Coordinate::latlon(lat, lon).is_valid() && (-180.0..=180.0).contains(&lon))
+        })
+}
+
+fn restore_csv_properties(features: &mut [Value], fields: &[String], name: &str) -> Result<bool> {
+    let mut changed = false;
+    for (record_ix, feature) in features.iter_mut().enumerate() {
+        ensure!(
+            valid_csv_point(&feature["geometry"]),
+            "CSV layer {name:?}, record {} has missing or invalid longitude/latitude coordinates",
+            record_ix + 1
+        );
+        // GDAL leaves empty typed CSV cells unset; retain their
+        // columns explicitly rather than dropping the properties.
+        let properties = feature["properties"].as_object_mut().context("CSV feature properties must be an object")?;
+        for field in fields {
+            if let serde_json::map::Entry::Vacant(entry) = properties.entry(field) {
+                entry.insert(Value::Null);
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}
+
 fn validate_csv_records(layer: &mut impl gdal::vector::LayerAccess, fields: &[String]) -> Result<()> {
     let coordinate_field = |aliases: &[&str]| -> Result<usize> {
         let matches: Vec<usize> = fields
@@ -752,17 +757,77 @@ fn conversion_path() -> std::path::PathBuf {
     format!("/vsimem/map-vector-{}-{id}.geojson", std::process::id()).into()
 }
 
+fn translate_dataset_layer(
+    dataset: &Dataset,
+    name: &str,
+    index: usize,
+    assign_wgs84: bool,
+    is_csv: bool,
+    progress: &mut Option<ConversionProgress<'_>>,
+) -> Result<(String, Option<geo::LatLonBounds>)> {
+    let layer_count = dataset.layer_count();
+    let per_feature = progress.as_ref().is_some_and(|progress| progress.per_feature);
+    if per_feature
+        && index > 0
+        && let Some(progress) = progress.as_mut()
+    {
+        (progress.callback)(VectorLoadProgress::Converting(index as f64 / layer_count as f64));
+    }
+    let report_progress = progress.is_some();
+    let mut layer_progress = |event| {
+        let event = match event {
+            VectorLoadProgress::Converting(fraction) if fraction.is_finite() => {
+                VectorLoadProgress::Converting((index as f64 + fraction.clamp(0.0, 1.0)) / layer_count as f64)
+            }
+            VectorLoadProgress::Converting(_) => return,
+            VectorLoadProgress::Preparing => VectorLoadProgress::Preparing,
+        };
+        if let Some(progress) = progress.as_mut() {
+            (progress.callback)(event);
+        }
+    };
+    translate_layer(
+        dataset,
+        name,
+        &conversion_path(),
+        assign_wgs84,
+        is_csv,
+        report_progress.then_some(ConversionProgress {
+            callback: &mut layer_progress,
+            per_feature,
+        }),
+    )
+}
+
 fn translate_layer(
     dataset: &Dataset,
     layer: &str,
     output: &Path,
     assign_wgs84: bool,
     is_csv: bool,
-    mut progress: Option<ConversionProgress<'_>>,
+    progress: Option<ConversionProgress<'_>>,
 ) -> Result<(String, Option<geo::LatLonBounds>)> {
     // The GeoJSON driver requires a nonexistent destination. Let translation
     // create it, and unlink only after all dataset handles close, even on error.
     let _cleanup = gdal::vsi::MemFileRef::new(output);
+    let mut output_dataset = translate_geojson_dataset(dataset, layer, output, assign_wgs84, progress)?;
+    // CSV warnings include lossy field conversions, which must not silently
+    // discard properties. CE_Warning = 2, CE_Failure = 3, CE_Fatal = 4.
+    // SAFETY: Reads only this thread's GDAL error state.
+    ensure!(
+        unsafe { CPLGetLastErrorType() } < if is_csv { 2 } else { 3 },
+        "GDAL vector conversion failed: {}",
+        geo::gdalinterop::last_error_message()
+    );
+    let closed = Instant::now();
+    output_dataset.flush_cache()?;
+    // Closing completes the GeoJSON FeatureCollection before it is read.
+    output_dataset.close()?;
+    log::info!(target: "map::vector_load", "layer={layer:?} stage=finish-geojson elapsed={:?}", closed.elapsed());
+    read_converted_geojson(output, layer)
+}
+
+fn geojson_translation_arguments(layer: &str, assign_wgs84: bool) -> Vec<String> {
     let mut arguments = vec![
         "-f",
         "GeoJSON",
@@ -780,7 +845,17 @@ fn translate_layer(
         // CSV lat/lon headers establish WGS84 even without a CRS sidecar.
         arguments.extend(["-s_srs", "OGC:CRS84"]);
     }
-    let arguments: Vec<String> = arguments.into_iter().map(str::to_owned).collect();
+    arguments.into_iter().map(str::to_owned).collect()
+}
+
+fn translate_geojson_dataset(
+    dataset: &Dataset,
+    layer: &str,
+    output: &Path,
+    assign_wgs84: bool,
+    mut progress: Option<ConversionProgress<'_>>,
+) -> Result<Dataset> {
+    let arguments = geojson_translation_arguments(layer, assign_wgs84);
     // SAFETY: Resets only this thread's GDAL error state. A read failure must not
     // masquerade as end-of-layer even if GDAL returns a non-null output handle.
     unsafe { CPLErrorReset() };
@@ -789,22 +864,13 @@ fn translate_layer(
     let per_feature = progress.as_ref().is_some_and(|progress| progress.per_feature);
     let report_progress = progress.is_some();
     let mut preparing = false;
-    let mut output_dataset = {
+    let output_dataset = {
         // Arrow can report only a terminal batch for small datasets. Preserve
         // the default/opt-in Arrow path for legacy conversion diagnostics.
         let _arrow_api = per_feature.then(|| ScopedArrowApi::set(Some(c"NO")));
         let mut callback = |fraction| {
-            if per_feature && preparing {
-                return;
-            }
             if let Some(progress) = progress.as_mut() {
-                (progress.callback)(VectorLoadProgress::Converting(fraction));
-                if per_feature && fraction >= 1.0 {
-                    preparing = true;
-                    // Emit inside GDAL's final callback, before the translator
-                    // returns and any output finalization or extent scans run.
-                    (progress.callback)(VectorLoadProgress::Preparing);
-                }
+                progress.report_translation(fraction, &mut preparing);
             }
         };
         algo::translate_ds_to_disk_with_progress(dataset, output, &arguments, report_progress.then_some(&mut callback as &mut dyn FnMut(f64)))?
@@ -817,19 +883,10 @@ fn translate_layer(
         (progress.callback)(VectorLoadProgress::Preparing);
     }
     log::info!(target: "map::vector_load", "layer={layer:?} stage=gdal-convert-reproject elapsed={:?}", translated.elapsed());
-    // CSV warnings include lossy field conversions, which must not silently
-    // discard properties. CE_Warning = 2, CE_Failure = 3, CE_Fatal = 4.
-    // SAFETY: Reads only this thread's GDAL error state.
-    ensure!(
-        unsafe { CPLGetLastErrorType() } < if is_csv { 2 } else { 3 },
-        "GDAL vector conversion failed: {}",
-        geo::gdalinterop::last_error_message()
-    );
-    let closed = Instant::now();
-    output_dataset.flush_cache()?;
-    // Closing completes the GeoJSON FeatureCollection before it is read.
-    output_dataset.close()?;
-    log::info!(target: "map::vector_load", "layer={layer:?} stage=finish-geojson elapsed={:?}", closed.elapsed());
+    Ok(output_dataset)
+}
+
+fn read_converted_geojson(output: &Path, layer: &str) -> Result<(String, Option<geo::LatLonBounds>)> {
     let reopened = Instant::now();
     let converted = gdalio::dataset::open_read_only(output)?;
     log::info!(target: "map::vector_load", "layer={layer:?} stage=gdal-reopen-geojson elapsed={:?}", reopened.elapsed());
@@ -865,14 +922,7 @@ mod tests {
         let connection = sqlite::Connection::new(path, sqlite::AccessMode::Create)?;
         connection.execute("CREATE TABLE metadata (name TEXT, value TEXT)")?;
         connection.execute("CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")?;
-        let mut tile = Vec::new();
-        for name in ["points", "polygons"] {
-            let mut layer = vec![0x0a, name.len() as u8];
-            layer.extend_from_slice(name.as_bytes());
-            layer.extend_from_slice(&[0x28, 0x80, 0x20, 0x78, 0x02]);
-            tile.extend_from_slice(&[0x1a, layer.len() as u8]);
-            tile.extend(layer);
-        }
+        let tile = mbtiles_fixture_tile();
         let mut insert = connection.prepare_statement("INSERT INTO tiles VALUES (0,0,0,?1) RETURNING zoom_level")?;
         insert.bind_blob(1, &tile)?;
         ensure!(insert.next().is_some(), "Could not insert fixture tile");
@@ -893,6 +943,18 @@ mod tests {
         Ok(())
     }
 
+    fn mbtiles_fixture_tile() -> Vec<u8> {
+        let mut tile = Vec::new();
+        for name in ["points", "polygons"] {
+            let mut layer = vec![0x0a, name.len() as u8];
+            layer.extend_from_slice(name.as_bytes());
+            layer.extend_from_slice(&[0x28, 0x80, 0x20, 0x78, 0x02]);
+            tile.extend_from_slice(&[0x1a, layer.len() as u8]);
+            tile.extend(layer);
+        }
+        tile
+    }
+
     #[test]
     fn mbtiles_uses_native_urls_and_metadata_without_materializing_features() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -903,25 +965,30 @@ mod tests {
         assert_ne!(sources[0].id(), sources[1].id());
         assert_eq!(sources[0].source_json(), sources[1].source_json());
         for source in sources {
-            assert!(matches!(source.data, VectorData::Tiled { .. }));
-            for (actual, expected) in source.bounds().into_iter().zip([-4.0, 49.0, 6.0, 53.0]) {
-                assert!((actual - expected).abs() < 1e-8);
-            }
-            let json = source.source_json();
-            assert_eq!(json["type"], "vector");
-            assert!(json.get("data").is_none(), "MBTiles must never become GeoJSON");
-            let native_url = json["url"].as_str().unwrap();
-            let encoded_path = native_url.strip_prefix("mbtiles://").unwrap();
-            assert!(encoded_path.starts_with('/'));
-            assert!(!encoded_path.starts_with("file:"));
-            assert_eq!(
-                url::Url::parse(&format!("file://{encoded_path}"))?.to_file_path().unwrap(),
-                path.canonicalize()?
-            );
-            assert!(native_url.contains("%20%23%20caf%C3%A9"));
-            for layer in source.layers_json(0.5, "red") {
-                assert_eq!(layer["source-layer"], source.name());
-            }
+            assert_native_mbtiles_source(&source, &path)?;
+        }
+        Ok(())
+    }
+
+    fn assert_native_mbtiles_source(source: &VectorSource, path: &Path) -> Result<()> {
+        assert!(matches!(source.data, VectorData::Tiled { .. }));
+        for (actual, expected) in source.bounds().into_iter().zip([-4.0, 49.0, 6.0, 53.0]) {
+            assert!((actual - expected).abs() < 1e-8);
+        }
+        let json = source.source_json();
+        assert_eq!(json["type"], "vector");
+        assert!(json.get("data").is_none(), "MBTiles must never become GeoJSON");
+        let native_url = json["url"].as_str().unwrap();
+        let encoded_path = native_url.strip_prefix("mbtiles://").unwrap();
+        assert!(encoded_path.starts_with('/'));
+        assert!(!encoded_path.starts_with("file:"));
+        assert_eq!(
+            url::Url::parse(&format!("file://{encoded_path}"))?.to_file_path().unwrap(),
+            path.canonicalize()?
+        );
+        assert!(native_url.contains("%20%23%20caf%C3%A9"));
+        for layer in source.layers_json(0.5, "red") {
+            assert_eq!(layer["source-layer"], source.name());
         }
         Ok(())
     }
@@ -1133,14 +1200,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn open_loads_every_layer_with_distinct_identities() -> Result<()> {
+    fn write_point_layers(path: &Path) -> Result<()> {
         use gdal::spatial_ref::SpatialRef;
         use gdal::vector::{Geometry, LayerOptions};
 
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("layers.gpkg");
-        let mut dataset = gdal::DriverManager::get_driver_by_name("GPKG")?.create_vector_only(&path)?;
+        let mut dataset = gdal::DriverManager::get_driver_by_name("GPKG")?.create_vector_only(path)?;
         let srs = SpatialRef::from_epsg(u32::from(geo::crs::epsg::WGS84.code()))?;
         for name in ["first", "second"] {
             let mut layer = dataset.create_layer(LayerOptions {
@@ -1151,6 +1215,14 @@ mod tests {
             layer.create_feature(Geometry::from_wkt("POINT (4 51)")?)?;
         }
         drop(dataset);
+        Ok(())
+    }
+
+    #[test]
+    fn open_loads_every_layer_with_distinct_identities() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("layers.gpkg");
+        write_point_layers(&path)?;
         let sources = VectorSource::open(&path)?.context("Expected vector layers")?;
         assert_eq!(sources.iter().map(|source| source.name()).collect::<Vec<_>>(), ["first", "second"]);
         assert_ne!(sources[0].id(), sources[1].id());

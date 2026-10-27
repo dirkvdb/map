@@ -46,6 +46,21 @@ fn write_projected_points(dataset: &mut Dataset, name: &str, epsg: u32, options:
         ty: OGRwkbGeometryType::wkbPoint,
         options: Some(options),
     })?;
+    add_projected_point_fields(&layer)?;
+    let defn = layer.defn();
+    let fields = [
+        defn.field_index("name")?,
+        defn.field_index("count")?,
+        defn.field_index("ratio")?,
+        defn.field_index("missing")?,
+    ];
+    for point in points {
+        write_projected_point(&layer, fields, point)?;
+    }
+    Ok(())
+}
+
+fn add_projected_point_fields(layer: &gdal::vector::Layer<'_>) -> Result<()> {
     for (name, field_type, width, precision) in [
         ("name", OGRFieldType::OFTString, 80, 0),
         // DBF widths above 18 can be reopened as real rather than integer64.
@@ -56,19 +71,20 @@ fn write_projected_points(dataset: &mut Dataset, name: &str, epsg: u32, options:
         let field = FieldDefn::new(name, field_type)?;
         field.set_width(width);
         field.set_precision(precision);
-        field.add_to_layer(&layer)?;
+        field.add_to_layer(layer)?;
     }
-    let defn = layer.defn();
-    for point in points {
-        let mut feature = Feature::new(defn)?;
-        let [x, y] = point.projected;
-        feature.set_geometry(Geometry::from_wkt(&format!("POINT ({x} {y})"))?)?;
-        feature.set_field_string(defn.field_index("name")?, point.name)?;
-        feature.set_field_integer64(defn.field_index("count")?, point.count)?;
-        feature.set_field_double(defn.field_index("ratio")?, point.ratio)?;
-        feature.set_field_null(defn.field_index("missing")?)?;
-        feature.create(&layer)?;
-    }
+    Ok(())
+}
+
+fn write_projected_point(layer: &gdal::vector::Layer<'_>, fields: [usize; 4], point: &ProjectedPoint) -> Result<()> {
+    let mut feature = Feature::new(layer.defn())?;
+    let [x, y] = point.projected;
+    feature.set_geometry(Geometry::from_wkt(&format!("POINT ({x} {y})"))?)?;
+    feature.set_field_string(fields[0], point.name)?;
+    feature.set_field_integer64(fields[1], point.count)?;
+    feature.set_field_double(fields[2], point.ratio)?;
+    feature.set_field_null(fields[3])?;
+    feature.create(layer)?;
     Ok(())
 }
 

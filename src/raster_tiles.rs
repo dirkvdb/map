@@ -46,27 +46,7 @@ impl TileWorkers {
             let generation = generation.clone();
             std::thread::Builder::new()
                 .name(format!("numeric-tiles-{ix}"))
-                .spawn(move || {
-                    while let Ok(job) = receiver.recv_blocking() {
-                        if job.generation != generation.load(Ordering::Relaxed) {
-                            continue;
-                        }
-                        let data = job.source.numeric_tile(job.tile, job.dpi);
-                        if job.generation != generation.load(Ordering::Relaxed) {
-                            continue;
-                        }
-                        if results
-                            .send_blocking(TileResult {
-                                generation: job.generation,
-                                tile: job.tile,
-                                data,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                })
+                .spawn(move || run_tile_worker(receiver, results, generation))
                 .context("Could not start numeric tile workers")?;
         }
         Ok(Self {
@@ -86,6 +66,28 @@ impl TileWorkers {
 
     pub fn completed(&self) -> impl Iterator<Item = TileResult> + '_ {
         std::iter::from_fn(|| self.results.try_recv().ok())
+    }
+}
+
+fn run_tile_worker(receiver: async_channel::Receiver<TileJob>, results: async_channel::Sender<TileResult>, generation: Arc<AtomicU64>) {
+    while let Ok(job) = receiver.recv_blocking() {
+        if job.generation != generation.load(Ordering::Relaxed) {
+            continue;
+        }
+        let data = job.source.numeric_tile(job.tile, job.dpi);
+        if job.generation != generation.load(Ordering::Relaxed) {
+            continue;
+        }
+        if results
+            .send_blocking(TileResult {
+                generation: job.generation,
+                tile: job.tile,
+                data,
+            })
+            .is_err()
+        {
+            break;
+        }
     }
 }
 
@@ -344,17 +346,7 @@ mod tests {
             let fine_z = visible_tiles(&parameters, &fine)[0].z;
             assert!(coarse_z < fine_z);
             let z = coarse_z.max(fine_z);
-            let n = 1_i32 << z;
-            let mut expected = HashSet::new();
-            for y in 0..n {
-                for x in 0..n {
-                    let tile = VisibleTile { z, x: i64::from(x), y };
-                    let bounds = tile.canonical().bounds();
-                    if bounds.intersects(&coarse_bounds) || bounds.intersects(&fine_bounds) {
-                        expected.insert(tile);
-                    }
-                }
-            }
+            let expected = expected_union_coverage(z, coarse_bounds, fine_bounds);
             let tiles = transition_tiles(&parameters, &coarse, &fine);
             let actual: HashSet<_> = tiles.iter().copied().collect();
             assert_eq!(actual, expected, "Coverage must be clipped geographically at the common zoom");
@@ -365,6 +357,17 @@ mod tests {
             assert_eq!(tiles, transition_tiles(&parameters, &fine, &coarse));
         }
         Ok(())
+    }
+
+    fn expected_union_coverage(z: i32, coarse_bounds: LatLonBounds, fine_bounds: LatLonBounds) -> HashSet<VisibleTile> {
+        let n = 1_i32 << z;
+        (0..n)
+            .flat_map(|y| (0..n).map(move |x| VisibleTile { z, x: i64::from(x), y }))
+            .filter(|tile| {
+                let bounds = tile.canonical().bounds();
+                bounds.intersects(&coarse_bounds) || bounds.intersects(&fine_bounds)
+            })
+            .collect()
     }
 
     #[test]

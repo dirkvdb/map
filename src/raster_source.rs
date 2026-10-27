@@ -39,7 +39,10 @@ impl RasterSource {
             calculate_stats: false,
             zoom_level_strategy: geo::ZoomLevelStrategy::PreferHigher,
         };
-        let (metadata, source_files) = raster_metadata(path, &options)?;
+        let RasterMetadata {
+            layers: metadata,
+            source_files,
+        } = raster_metadata(path, &options)?;
         ensure!(!metadata.is_empty(), "No raster bands found in {}", path.display());
         metadata
             .into_iter()
@@ -254,13 +257,21 @@ impl NumericTile {
     }
 }
 
-fn raster_metadata(path: &Path, options: &TileProviderOptions) -> Result<(Vec<LayerMetadata>, Option<Arc<tempfile::TempDir>>)> {
+struct RasterMetadata {
+    layers: Vec<LayerMetadata>,
+    source_files: Option<Arc<tempfile::TempDir>>,
+}
+
+fn raster_metadata(path: &Path, options: &TileProviderOptions) -> Result<RasterMetadata> {
     // Probing must not prevent formats handled by native readers (such as
     // raster MBTiles) from opening without their optional GDAL driver.
     let dataset = gdal::Dataset::open(path);
     if dataset.as_ref().is_ok_and(|dataset| dataset.driver().short_name() == "netCDF") {
         let (metadata, directory) = netcdf_metadata(path, options)?;
-        return Ok((metadata, Some(directory)));
+        return Ok(RasterMetadata {
+            layers: metadata,
+            source_files: Some(directory),
+        });
     }
     let mut metadata = provider_metadata(path, options)?;
     if metadata.iter().any(|meta| meta.source_format == LayerSourceType::CloudOptimizedGeoTiff) && dataset?.raster_count() > 1 {
@@ -269,7 +280,10 @@ fn raster_metadata(path: &Path, options: &TileProviderOptions) -> Result<(Vec<La
             meta.source_format = LayerSourceType::GeoTiff;
         }
     }
-    Ok((metadata, None))
+    Ok(RasterMetadata {
+        layers: metadata,
+        source_files: None,
+    })
 }
 
 fn provider_metadata(path: &Path, options: &TileProviderOptions) -> Result<Vec<LayerMetadata>> {
@@ -556,6 +570,17 @@ fn netcdf_label_layers(dataset: &gdal::Dataset, file_name: &str, metadata: &mut 
 }
 
 fn netcdf_native_sources(dataset: &gdal::Dataset, vrt: &mut gdal::Dataset, source: &Path, output: &Path) -> Result<()> {
+    let (variable, sizes) = netcdf_native_dimensions(source, dataset)?;
+    netcdf_validate_native_dimensions(dataset, &sizes)?;
+    let native = netcdf_native_vrt(dataset, source, output, &variable, &sizes)?;
+    std::fs::write(&native.path, native.xml)?;
+    for (index, source_xml) in native.sources.iter().enumerate() {
+        vrt.rasterband(index + 1)?.set_metadata_item("source_0", source_xml, "vrt_sources")?;
+    }
+    Ok(())
+}
+
+fn netcdf_native_dimensions(source: &Path, dataset: &gdal::Dataset) -> Result<(String, Vec<usize>)> {
     let multidimensional = gdal::Dataset::open_ex(
         source,
         gdal::DatasetOptions {
@@ -572,14 +597,8 @@ fn netcdf_native_sources(dataset: &gdal::Dataset, vrt: &mut gdal::Dataset, sourc
     }
     let array = group.open_md_array(name, Default::default())?;
     let dimensions = array.dimensions()?;
-    let sizes = dimensions.iter().map(|dimension| dimension.size()).collect::<Vec<_>>();
-    netcdf_validate_native_dimensions(dataset, &sizes)?;
-    let native = netcdf_native_vrt(dataset, source, output, &variable, &sizes)?;
-    std::fs::write(&native.path, native.xml)?;
-    for (index, source_xml) in native.sources.iter().enumerate() {
-        vrt.rasterband(index + 1)?.set_metadata_item("source_0", source_xml, "vrt_sources")?;
-    }
-    Ok(())
+    let sizes = dimensions.iter().map(|dimension| dimension.size()).collect();
+    Ok((variable, sizes))
 }
 
 fn netcdf_validate_native_dimensions(dataset: &gdal::Dataset, sizes: &[usize]) -> Result<()> {
@@ -770,15 +789,9 @@ impl RasterTiles {
         for worker in 0..2 {
             let receiver = receiver.clone();
             let sources = sources.clone();
-            std::thread::Builder::new().name(format!("raster-tiles-{worker}")).spawn(move || {
-                while let Ok(job) = receiver.recv_blocking() {
-                    if job.cancelled.load(Ordering::Relaxed) {
-                        continue;
-                    }
-                    let response = tile_response(&sources, &job.url);
-                    job.responder.complete(response);
-                }
-            })?;
+            std::thread::Builder::new()
+                .name(format!("raster-tiles-{worker}"))
+                .spawn(move || run_tile_worker(receiver, sources))?;
         }
         register_file_source(FileSourceType::Asset, RasterFileSource { jobs });
         Ok(Self { sources })
@@ -789,6 +802,16 @@ impl RasterTiles {
         sources.retain(|_, source| source.strong_count() > 0);
         sources.insert(source.metadata.id, Arc::downgrade(source));
         Ok(())
+    }
+}
+
+fn run_tile_worker(receiver: async_channel::Receiver<TileJob>, sources: Sources) {
+    while let Ok(job) = receiver.recv_blocking() {
+        if job.cancelled.load(Ordering::Relaxed) {
+            continue;
+        }
+        let response = tile_response(&sources, &job.url);
+        job.responder.complete(response);
     }
 }
 
@@ -877,23 +900,7 @@ mod tests {
     fn netcdf_local_file_opens_all_layers_and_reads_tiles() -> Result<()> {
         let path = std::path::PathBuf::from(std::env::var("MAP_TEST_NETCDF")?);
         assert!(crate::vector_source::VectorSource::open(&path)?.is_none());
-        let multidimensional = gdal::Dataset::open_ex(
-            &path,
-            gdal::DatasetOptions {
-                open_flags: gdal::GdalOpenFlags::GDAL_OF_MULTIDIM_RASTER,
-                ..Default::default()
-            },
-        )?;
-        let group = multidimensional.root_group()?;
-        for name in group.array_names(Default::default()) {
-            let array = group.open_md_array(&name, Default::default())?;
-            let dimensions = array.dimensions()?;
-            if dimensions.len() == 1 && dimensions[0].size() > 1 && array.datatype().class().is_numeric() {
-                let first = array.read_as::<f64>(vec![0], vec![1])?[0];
-                let last = array.read_as::<f64>(vec![dimensions[0].size() as u64 - 1], vec![1])?[0];
-                eprintln!("Coordinate {name}: first={first}, last={last}");
-            }
-        }
+        print_netcdf_coordinates(&path)?;
         let sources = RasterSource::open(&path)?;
         eprintln!("Opened {} NetCDF raster layers", sources.len());
         for source in sources {
@@ -905,6 +912,32 @@ mod tests {
             assert_eq!(data.values.len(), data.width as usize * data.height as usize);
             eprintln!("{}: bounds={:?}, range={:?}", metadata.name, metadata.bounds, source.range());
         }
+        Ok(())
+    }
+
+    fn print_netcdf_coordinates(path: &Path) -> Result<()> {
+        let multidimensional = gdal::Dataset::open_ex(
+            path,
+            gdal::DatasetOptions {
+                open_flags: gdal::GdalOpenFlags::GDAL_OF_MULTIDIM_RASTER,
+                ..Default::default()
+            },
+        )?;
+        let group = multidimensional.root_group()?;
+        for name in group.array_names(Default::default()) {
+            let array = group.open_md_array(&name, Default::default())?;
+            let dimensions = array.dimensions()?;
+            if dimensions.len() == 1 && dimensions[0].size() > 1 && array.datatype().class().is_numeric() {
+                print_netcdf_coordinate_endpoints(&name, &array, dimensions[0].size())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn print_netcdf_coordinate_endpoints(name: &str, array: &gdal::raster::MDArray<'_>, size: usize) -> Result<()> {
+        let first = array.read_as::<f64>(vec![0], vec![1])?[0];
+        let last = array.read_as::<f64>(vec![size as u64 - 1], vec![1])?[0];
+        eprintln!("Coordinate {name}: first={first}, last={last}");
         Ok(())
     }
 
@@ -990,15 +1023,13 @@ mod tests {
         assert!(original.geo_transform().is_err());
         let source = RasterSource::open(&path)?.remove(0);
         assert_eq!(source.metadata().epsg, Some(geo::crs::epsg::WGS84_WEB_MERCATOR));
-        let vrt = gdal::Dataset::open(&source.metadata().path)?;
-        let band = vrt.rasterband(1)?;
         assert_eq!(
-            band.read_as::<f32>((0, 0), (1, 1), (1, 1), None)?.data(),
+            read_raster_values(&source.metadata().path, 1, (0, 0), (1, 1))?.data(),
             &[10.0],
             "Northern rows must remain north"
         );
         assert_eq!(
-            band.read_as::<f32>((0, 63), (1, 1), (1, 1), None)?.data(),
+            read_raster_values(&source.metadata().path, 1, (0, 63), (1, 1))?.data(),
             &[11.0],
             "Southern rows must remain south"
         );
@@ -1020,19 +1051,27 @@ mod tests {
         assert_eq!(netcdf_variable_name(&dataset)?, "/forecast/day/WBGT");
         let sources = RasterSource::open(&path)?;
         assert_eq!(sources.len(), 2);
-        for (index, source) in sources.iter().enumerate() {
-            let vrt = gdal::Dataset::open(&source.metadata().path)?;
-            let values = vrt.rasterband(index + 1)?.read_as::<f32>((0, 0), (4, 2), (4, 2), None)?;
-            let value = (index + 1) as f32 * 10.0;
-            assert_eq!(values.data(), &[value, -1.0, 1000.0, -9999.0, value + 1.0, 0.0, 100.0, value + 2.0]);
-        }
+        assert_grouped_netcdf_values(&sources)?;
         let selected = gdal::Dataset::open(format!("NETCDF:\"{}\":/forecast/day/WBGT", path.display()))?;
         let output = dir.path().join("selected.vrt");
         let metadata = netcdf_grid_metadata(&selected, &path, &output, "grouped", &TileProviderOptions::default())?;
         assert_eq!(metadata.len(), 2);
         assert!(metadata[0].name.starts_with("grouped - /forecast/day/WBGT"));
-        let vrt = gdal::Dataset::open(&output)?;
-        assert_eq!(vrt.rasterband(2)?.read_as::<f32>((0, 0), (1, 2), (1, 2), None)?.data(), &[20.0, 21.0]);
+        assert_eq!(read_raster_values(&output, 2, (0, 0), (1, 2))?.data(), &[20.0, 21.0]);
+        Ok(())
+    }
+
+    fn read_raster_values(path: &Path, band: usize, origin: (isize, isize), size: (usize, usize)) -> Result<gdal::raster::Buffer<f32>> {
+        let dataset = gdal::Dataset::open(path)?;
+        Ok(dataset.rasterband(band)?.read_as::<f32>(origin, size, size, None)?)
+    }
+
+    fn assert_grouped_netcdf_values(sources: &[Arc<RasterSource>]) -> Result<()> {
+        for (index, source) in sources.iter().enumerate() {
+            let values = read_raster_values(&source.metadata().path, index + 1, (0, 0), (4, 2))?;
+            let value = (index + 1) as f32 * 10.0;
+            assert_eq!(values.data(), &[value, -1.0, 1000.0, -9999.0, value + 1.0, 0.0, 100.0, value + 2.0]);
+        }
         Ok(())
     }
 
@@ -1166,11 +1205,15 @@ mod tests {
             before.values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
             after.values.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
         );
+        assert_unscaled_snapshots_without_reads(&source, &raw)
+    }
+
+    fn assert_unscaled_snapshots_without_reads(source: &RasterSource, raw: &RasterSource) -> Result<()> {
         // No subsequent snapshot operation may reopen the backing dataset.
         std::fs::remove_file(&source.metadata().path)?;
         let toggled = source.with_unscaling(false)?;
         let restyled = toggled.restyled(ColorMapPreset::Gray, (25.0, 30.0))?;
-        for snapshot in [&raw, &toggled, &restyled] {
+        for snapshot in [raw, &*toggled, &*restyled] {
             assert_ne!(source.id(), snapshot.id());
             assert!(Arc::ptr_eq(&source.metadata, &snapshot.metadata));
             assert_eq!(source.metadata().id, snapshot.metadata().id);
@@ -1192,8 +1235,17 @@ mod tests {
         super::test_support::write_raster(&path, 4326, 3)?;
         let original = RasterSource::open(&path)?;
         let coefficients = [(0.01, -4.0), (-0.5, 7.0), (0.0, 12.0)];
+        set_band_scales(&path, &coefficients)?;
+        let scaled = RasterSource::open(&path)?;
+        for (index, (scale, offset)) in coefficients.iter().copied().enumerate() {
+            assert_scaled_source(&original[index], &scaled[index], RasterScale { scale, offset })?;
+        }
+        Ok(())
+    }
+
+    fn set_band_scales(path: &Path, coefficients: &[(f64, f64)]) -> Result<()> {
         let dataset = gdal::Dataset::open_ex(
-            &path,
+            path,
             gdal::DatasetOptions {
                 open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
                 ..Default::default()
@@ -1205,32 +1257,28 @@ mod tests {
             band.set_offset(offset)?;
         }
         dataset.close()?;
-        let scaled = RasterSource::open(&path)?;
-        for (index, (scale, offset)) in coefficients.iter().copied().enumerate() {
-            let source = &scaled[index];
-            assert_eq!(source.metadata().scale, Some(RasterScale { scale, offset }));
-            assert_eq!(
-                source.metadata().min_value,
-                original[index].metadata().min_value,
-                "Statistics stay in raw units"
-            );
-            assert_eq!(source.metadata().max_value, original[index].metadata().max_value);
-            let first = (f64::from(source.metadata().min_value) * scale + offset) as f32;
-            let last = (f64::from(source.metadata().max_value) * scale + offset) as f32;
-            let expected = if scale == 0.0 { (11.0, 13.0) } else { (first.min(last), first.max(last)) };
-            assert_eq!(source.data_range(), expected);
-            assert_eq!(source.range(), expected);
-            let tile = Tile { z: 3, x: 3, y: 3 };
-            let raw = original[index].numeric_tile(tile, 1)?.context("Missing original tile")?;
-            let values = source.numeric_tile(tile, 1)?.context("Missing scaled tile")?;
-            assert!(
-                raw.values.iter().zip(&values.values).all(|(a, b)| a == b || (a.is_nan() && b.is_nan())),
-                "Scale/offset must not change cached pixel values or nodata"
-            );
-            let restyled = source.restyled(ColorMapPreset::Gray, expected)?;
-            assert_eq!(restyled.metadata().scale, Some(RasterScale { scale, offset }));
-            assert_eq!(restyled.metadata().id, source.metadata().id);
-        }
+        Ok(())
+    }
+
+    fn assert_scaled_source(original: &RasterSource, source: &RasterSource, RasterScale { scale, offset }: RasterScale) -> Result<()> {
+        assert_eq!(source.metadata().scale, Some(RasterScale { scale, offset }));
+        assert_eq!(source.metadata().min_value, original.metadata().min_value, "Statistics stay in raw units");
+        assert_eq!(source.metadata().max_value, original.metadata().max_value);
+        let first = (f64::from(source.metadata().min_value) * scale + offset) as f32;
+        let last = (f64::from(source.metadata().max_value) * scale + offset) as f32;
+        let expected = if scale == 0.0 { (11.0, 13.0) } else { (first.min(last), first.max(last)) };
+        assert_eq!(source.data_range(), expected);
+        assert_eq!(source.range(), expected);
+        let tile = Tile { z: 3, x: 3, y: 3 };
+        let raw = original.numeric_tile(tile, 1)?.context("Missing original tile")?;
+        let values = source.numeric_tile(tile, 1)?.context("Missing scaled tile")?;
+        assert!(
+            raw.values.iter().zip(&values.values).all(|(a, b)| a == b || (a.is_nan() && b.is_nan())),
+            "Scale/offset must not change cached pixel values or nodata"
+        );
+        let restyled = source.restyled(ColorMapPreset::Gray, expected)?;
+        assert_eq!(restyled.metadata().scale, Some(RasterScale { scale, offset }));
+        assert_eq!(restyled.metadata().id, source.metadata().id);
         Ok(())
     }
 
@@ -1276,16 +1324,21 @@ mod tests {
             );
             let sources = RasterSource::open(&path)?;
             assert_eq!(sources.len(), 2);
-            for (index, source) in sources.iter().enumerate() {
-                let vrt = gdal::Dataset::open(&source.metadata().path)?;
-                assert_eq!(vrt.geo_transform()?, [-1_000_000.0, 500_000.0, 0.0, 1_000_000.0, 0.0, -1_000_000.0]);
-                let values = vrt.rasterband(index + 1)?.read_as::<f32>((0, 0), (1, 2), (1, 2), None)?;
-                assert_eq!(
-                    values.data(),
-                    &expected.map(|value| value + index as f32 * 10.0),
-                    "Coordinates must determine north/south ordering"
-                );
-            }
+            assert_netcdf_orientation(&sources, expected)?;
+        }
+        Ok(())
+    }
+
+    fn assert_netcdf_orientation(sources: &[Arc<RasterSource>], expected: [f32; 2]) -> Result<()> {
+        for (index, source) in sources.iter().enumerate() {
+            let vrt = gdal::Dataset::open(&source.metadata().path)?;
+            assert_eq!(vrt.geo_transform()?, [-1_000_000.0, 500_000.0, 0.0, 1_000_000.0, 0.0, -1_000_000.0]);
+            let values = vrt.rasterband(index + 1)?.read_as::<f32>((0, 0), (1, 2), (1, 2), None)?;
+            assert_eq!(
+                values.data(),
+                &expected.map(|value| value + index as f32 * 10.0),
+                "Coordinates must determine north/south ordering"
+            );
         }
         Ok(())
     }
@@ -1379,12 +1432,7 @@ mod tests {
     fn mercator_tiles_without_declared_nodata_keep_padding_invalid_and_zero_valid() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("no-nodata.tif");
-        let mut dataset = gdal::DriverManager::get_driver_by_name("GTiff")?.create_with_band_type::<f32, _>(&path, 64, 64, 1)?;
-        dataset.set_geo_transform(&[-1_000_000.0, 31_250.0, 0.0, 1_000_000.0, 0.0, -31_250.0])?;
-        dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(3857)?)?;
-        dataset.rasterband(1)?.fill(0.0, None)?;
-        dataset.flush_cache()?;
-        drop(dataset);
+        write_zero_raster_without_nodata(&path)?;
 
         let source = RasterSource::open(&path)?.remove(0);
         for (z, x, y) in [(3, 3, 3), (2, 1, 1)] {
@@ -1402,6 +1450,15 @@ mod tests {
                 "Tiles outside the raster must not contain valid padding"
             );
         }
+        Ok(())
+    }
+
+    fn write_zero_raster_without_nodata(path: &Path) -> Result<()> {
+        let mut dataset = gdal::DriverManager::get_driver_by_name("GTiff")?.create_with_band_type::<f32, _>(path, 64, 64, 1)?;
+        dataset.set_geo_transform(&[-1_000_000.0, 31_250.0, 0.0, 1_000_000.0, 0.0, -31_250.0])?;
+        dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(3857)?)?;
+        dataset.rasterband(1)?.fill(0.0, None)?;
+        dataset.flush_cache()?;
         Ok(())
     }
 
@@ -1471,7 +1528,7 @@ mod tests {
         let tile = source.numeric_tile(Tile { z: 0, x: 0, y: 0 }, 1)?.context("Missing byte tile")?;
         assert_eq!((tile.width, tile.height), (256, 256));
         let palette = source.palette_rgba();
-        assert!(palette.chunks_exact(4).all(|color| color[3] == 255));
+        assert!(palette.as_chunks::<4>().0.iter().all(|color| color[3] == 255));
         for value in 0..255 {
             assert_eq!(tile.values[128 * 256 + value], value as f32, "Valid byte {value} must not become nodata");
         }
@@ -1483,21 +1540,7 @@ mod tests {
     fn image_mbtiles_pass_through_unchanged_across_style_snapshots() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("image.mbtiles");
-        // Build MBTiles directly: the static GDAL build need not enable its
-        // optional MBTiles driver for our native SQLite tile provider to work.
-        let db = sqlite::Connection::new(&path, sqlite::AccessMode::Create)?;
-        db.execute_sql_statements(
-            "CREATE TABLE metadata (name TEXT, value TEXT);
-            INSERT INTO metadata VALUES ('format','png'), ('bounds','-180,-85,180,85'), ('minzoom','0'), ('maxzoom','0');
-            CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);",
-        )?;
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::RgbaImage::from_pixel(256, 256, image::Rgba([255, 0, 0, 255])).write_to(&mut png, image::ImageFormat::Png)?;
-        let mut insert = db.prepare_statement("INSERT INTO tiles VALUES (0,0,0,?1) RETURNING zoom_level")?;
-        insert.bind_blob(1, png.get_ref())?;
-        ensure!(insert.next().is_some(), "Could not create fixture tile: {}", db.last_error());
-        drop(insert);
-        drop(db);
+        write_red_image_mbtiles(&path)?;
         let source = RasterSource::open(&path)?.remove(0);
         assert!(!source.is_numeric());
         let tiles = RasterTiles::init()?;
@@ -1518,27 +1561,32 @@ mod tests {
         Ok(())
     }
 
+    fn write_red_image_mbtiles(path: &Path) -> Result<()> {
+        // Build MBTiles directly: the static GDAL build need not enable its
+        // optional MBTiles driver for our native SQLite tile provider to work.
+        let db = sqlite::Connection::new(path, sqlite::AccessMode::Create)?;
+        db.execute_sql_statements(
+            "CREATE TABLE metadata (name TEXT, value TEXT);
+            INSERT INTO metadata VALUES ('format','png'), ('bounds','-180,-85,180,85'), ('minzoom','0'), ('maxzoom','0');
+            CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);",
+        )?;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(256, 256, image::Rgba([255, 0, 0, 255])).write_to(&mut png, image::ImageFormat::Png)?;
+        let mut insert = db.prepare_statement("INSERT INTO tiles VALUES (0,0,0,?1) RETURNING zoom_level")?;
+        insert.bind_blob(1, png.get_ref())?;
+        ensure!(insert.next().is_some(), "Could not create fixture tile: {}", db.last_error());
+        drop(insert);
+        drop(db);
+        Ok(())
+    }
+
     #[test]
     fn optimized_cogs_use_native_tiles_and_synthesize_missing_overviews() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("input.tif");
         super::test_support::write_raster(&path, 3857, 1)?;
         let cog_path = dir.path().join("aligned-cog.tif");
-        let input = gdal::Dataset::open(&path)?;
-        let options = gdal::raster::RasterCreationOptions::from_iter([
-            "TILING_SCHEME=GoogleMapsCompatible",
-            "ZOOM_LEVEL=3",
-            "BLOCKSIZE=256",
-            "OVERVIEWS=NONE",
-            "COMPRESS=DEFLATE",
-            "ADD_ALPHA=NO",
-        ]);
-        let cog = input.create_copy(&gdal::DriverManager::get_driver_by_name("COG")?, &cog_path, &options)?;
-        drop(cog);
-        // The tiler's COG probe reads a full 16-KiB header. Keep this tiny,
-        // highly compressible fixture large enough to exercise that path.
-        let file = std::fs::OpenOptions::new().write(true).open(&cog_path)?;
-        file.set_len(file.metadata()?.len().max(16 * 1024))?;
+        write_aligned_cog(&path, &cog_path)?;
         let source = RasterSource::open(&cog_path)?.remove(0);
         assert_eq!(source.metadata().source_format, LayerSourceType::CloudOptimizedGeoTiff);
         assert_eq!(source.source_json(2)["minzoom"], 0);
@@ -1553,6 +1601,25 @@ mod tests {
         }
         Ok(())
     }
+
+    fn write_aligned_cog(path: &Path, cog_path: &Path) -> Result<()> {
+        let input = gdal::Dataset::open(path)?;
+        let options = gdal::raster::RasterCreationOptions::from_iter([
+            "TILING_SCHEME=GoogleMapsCompatible",
+            "ZOOM_LEVEL=3",
+            "BLOCKSIZE=256",
+            "OVERVIEWS=NONE",
+            "COMPRESS=DEFLATE",
+            "ADD_ALPHA=NO",
+        ]);
+        let cog = input.create_copy(&gdal::DriverManager::get_driver_by_name("COG")?, cog_path, &options)?;
+        drop(cog);
+        // The tiler's COG probe reads a full 16-KiB header. Keep this tiny,
+        // highly compressible fixture large enough to exercise that path.
+        let file = std::fs::OpenOptions::new().write(true).open(cog_path)?;
+        file.set_len(file.metadata()?.len().max(16 * 1024))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1561,30 +1628,9 @@ pub(crate) mod test_support {
 
     pub fn write_netcdf(path: &Path, time_dimension: bool, metadata_only_transform: bool) -> Result<()> {
         let mut dataset = gdal::DriverManager::get_driver_by_name("MEM")?.create_with_band_type::<f32, _>("", 64, 64, 2)?;
-        if metadata_only_transform {
-            dataset.set_metadata_item("NC_GLOBAL#crs", "EPSG:3857", "")?;
-        } else {
-            dataset.set_geo_transform(&[-1_000_000.0, 31_250.0, 0.0, 1_000_000.0, 0.0, -31_250.0])?;
-            dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(3857)?)?;
-        }
-        if time_dimension {
-            dataset.set_metadata_item("NETCDF_DIM_EXTRA", "{time}", "")?;
-            dataset.set_metadata_item("NETCDF_DIM_time_DEF", "{2,6}", "")?;
-            dataset.set_metadata_item("NETCDF_DIM_time_VALUES", "{0,1}", "")?;
-            dataset.set_metadata_item("time#units", "hours since 2024-06-20 00:00:00", "")?;
-        }
+        configure_netcdf_fixture(&mut dataset, time_dimension, metadata_only_transform)?;
         for band_nr in 1..=2 {
-            let mut band = dataset.rasterband(band_nr)?;
-            band.set_no_data_value(Some(-9999.0))?;
-            if time_dimension {
-                band.set_metadata_item("NETCDF_VARNAME", "WBGT", "")?;
-                band.set_metadata_item("NETCDF_DIM_time", &(band_nr - 1).to_string(), "")?;
-            }
-            if metadata_only_transform {
-                band.set_metadata_item("GeoTransform", "-1000000 31250 0 1000000 0 -31250", "")?;
-            }
-            let values = (0..4096).map(|index| band_nr as f32 * 10.0 + if index / 64 < 32 { 0.0 } else { 1.0 }).collect();
-            band.write((0, 0), (64, 64), &mut gdal::raster::Buffer::new((64, 64), values))?;
+            write_netcdf_band(&dataset, band_nr, time_dimension, metadata_only_transform)?;
         }
         dataset
             .create_copy(
@@ -1593,6 +1639,41 @@ pub(crate) mod test_support {
                 &gdal::raster::RasterCreationOptions::from_iter(["FORMAT=NC", "WRITE_BOTTOMUP=NO", "WRITE_LONLAT=YES"]),
             )?
             .close()?;
+        Ok(())
+    }
+
+    fn configure_netcdf_fixture(dataset: &mut gdal::Dataset, time_dimension: bool, metadata_only_transform: bool) -> Result<()> {
+        if metadata_only_transform {
+            dataset.set_metadata_item("NC_GLOBAL#crs", "EPSG:3857", "")?;
+        } else {
+            dataset.set_geo_transform(&[-1_000_000.0, 31_250.0, 0.0, 1_000_000.0, 0.0, -31_250.0])?;
+            dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(3857)?)?;
+        }
+        if time_dimension {
+            for (name, value) in [
+                ("NETCDF_DIM_EXTRA", "{time}"),
+                ("NETCDF_DIM_time_DEF", "{2,6}"),
+                ("NETCDF_DIM_time_VALUES", "{0,1}"),
+                ("time#units", "hours since 2024-06-20 00:00:00"),
+            ] {
+                dataset.set_metadata_item(name, value, "")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_netcdf_band(dataset: &gdal::Dataset, band_nr: usize, time_dimension: bool, metadata_only_transform: bool) -> Result<()> {
+        let mut band = dataset.rasterband(band_nr)?;
+        band.set_no_data_value(Some(-9999.0))?;
+        if time_dimension {
+            band.set_metadata_item("NETCDF_VARNAME", "WBGT", "")?;
+            band.set_metadata_item("NETCDF_DIM_time", &(band_nr - 1).to_string(), "")?;
+        }
+        if metadata_only_transform {
+            band.set_metadata_item("GeoTransform", "-1000000 31250 0 1000000 0 -31250", "")?;
+        }
+        let values = (0..4096).map(|index| band_nr as f32 * 10.0 + if index / 64 < 32 { 0.0 } else { 1.0 }).collect();
+        band.write((0, 0), (64, 64), &mut gdal::raster::Buffer::new((64, 64), values))?;
         Ok(())
     }
 
@@ -1615,14 +1696,19 @@ pub(crate) mod test_support {
         dataset.set_geo_transform(&[-extent, extent / 32.0, 0.0, extent, 0.0, -extent / 32.0])?;
         dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(epsg)?)?;
         for band_nr in 1..=bands {
-            let mut band = dataset.rasterband(band_nr)?;
-            band.set_no_data_value(Some(-9999.0))?;
-            let values = (0..4096)
-                .map(|ix| if ix % 64 < 8 { -9999.0 } else { (ix % 64 + ix / 64 + band_nr * 10) as f32 })
-                .collect();
-            band.write((0, 0), (64, 64), &mut gdal::raster::Buffer::new((64, 64), values))?;
+            write_raster_band(&dataset, band_nr)?;
         }
         dataset.flush_cache()?;
+        Ok(())
+    }
+
+    fn write_raster_band(dataset: &gdal::Dataset, band_nr: usize) -> Result<()> {
+        let mut band = dataset.rasterband(band_nr)?;
+        band.set_no_data_value(Some(-9999.0))?;
+        let values = (0..4096)
+            .map(|ix| if ix % 64 < 8 { -9999.0 } else { (ix % 64 + ix / 64 + band_nr * 10) as f32 })
+            .collect();
+        band.write((0, 0), (64, 64), &mut gdal::raster::Buffer::new((64, 64), values))?;
         Ok(())
     }
 }

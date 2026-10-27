@@ -22,6 +22,24 @@ A GPUI desktop geospatial viewer with a MapLibre Native vector basemap.
 - Test a local NetCDF file: `MAP_TEST_NETCDF=/path/to/file.nc devenv shell -- cargo test --locked netcdf_local_file -- --ignored --nocapture`.
 - Package: `just exe` (Windows), `just appimage` (Linux), or `just dmg` (macOS).
 
+## Complexity checks
+
+Run `devenv shell -- just check` after Rust changes, followed by `cargo test --workspace --all-features` in the development shell. The devenv `ci:checks` task also runs this gate before building/testing. The individual checks are:
+
+| Command | Check |
+| --- | --- |
+| `just fmt` | `cargo fmt --all -- --check` |
+| `just lint` | Workspace Clippy, all targets/features, `--no-deps`, with the warning/complexity errors required by `AGENTS.md` |
+| `just complexity` | `devenv tasks run code:complexity`, using its configured Knots version and thresholds unchanged |
+
+`Cargo.toml` enables `clippy::cognitive_complexity`, `clippy::too_many_lines`, and `clippy::excessive_nesting` at **forbid** level. Their thresholds in `clippy.toml` are **15**, **80**, and **4**, respectively. These are Clippy's own metrics: function length excludes blank/comment-only lines, while nesting includes enclosing inline modules/impl blocks. `forbid` rejects source-level `allow`/`expect` overrides and is compatible with the required command-line `-D` flags. The lint command also denies all warnings and `clippy::type_complexity`, which uses the existing threshold of **200**.
+
+Clippy does not provide cyclomatic complexity. The existing `scripts.knots` command in `devenv.nix` pins **Knots 2.0.0** through `uvx`; `code:complexity` enforces per-function **cognitive ≤ 15**, **McCabe ≤ 10**, **nesting ≤ 4**, and **AIRD ≤ 85**. AIRD is **AI Reasoning Difficulty** (lower is better), not a minimum readiness score. No baseline is currently passed to this task: a clean gate requires zero over-threshold functions. Do not introduce suppressions, broad exclusions, a baseline, or threshold overrides to hide violations.
+
+Knots scans application source under `src/`, including test modules and platform-specific source, without building Rust/native dependencies. It does not traverse `vendor/`, the `infra-rs/` submodule, packaging/tooling scripts, or build output under `target/` and `.devenv/`. Generated `src/bundled_themes.rs` contains only declarations and contributes no functions; no handwritten functions are excluded. Clippy is scoped to this application's workspace, not its dependencies. Source analyzers and Clippy use different metrics, so neither substitutes for the other.
+
+The development shell supplies `uv`/`uvx`. Its first Knots invocation may download the pinned tool; analysis runs locally without uploading source and adds no Rust runtime dependency. For a machine-readable, report-only snapshot, run `devenv shell -- knots -r src/ --format json --completion-report .devenv/knots-completion.json > .devenv/knots-metrics.json`. This exports metrics and scan completeness; always run `just complexity` separately for the configured threshold gate.
+
 ## Vector loading diagnostics
 
 Enable `RUST_LOG=map::vector_load=info` when running the application to trace file drop/open, background queueing, GDAL conversion and progress milestones, reopening the converted GeoJSON for bounds, buffer copying, Rust JSON parsing/metadata/cleanup, UI handoff, native parsing/source copying, frame readback, and native idle. Logs include layer/source identities and elapsed times; they do not log feature-property values. A frame's requested source ID is not proof that its geometry is visible.

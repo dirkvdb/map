@@ -74,93 +74,108 @@ fn thread_local_gdal_option_guard_restores_absent_empty_and_existing_values_on_u
 #[test]
 #[ignore = "manual local GDAL progress comparison; requires MAP_TEST_VECTOR; no GPU or network"]
 fn local_vector_arrow_progress_comparison() -> Result<()> {
-    use gdal::vector::{LayerAccess as _, LayerCaps};
-
     const KEY: &str = "OGR2OGR_USE_ARROW_API";
     let _ = env_logger::builder().is_test(true).format_timestamp_millis().try_init();
     let path = std::path::PathBuf::from(std::env::var_os("MAP_TEST_VECTOR").context("Set MAP_TEST_VECTOR to the local vector file to measure")?);
     let original = thread_local_gdal_option(KEY)?;
     let original_debug = thread_local_gdal_option("CPL_DEBUG")?;
     let debug = ThreadLocalGdalOption::set("CPL_DEBUG", Some("OGR2OGR"))?;
-    log::info!(target: "map::vector_load", "Arrow progress experiment: GDAL={}, path={path:?}, file_bytes={}, original_tls={original:?}",
-        gdal::version::VersionInfo::release_name(), std::fs::metadata(&path)?.len());
-    {
-        let dataset = geo::vector::gdalio::dataset::open_read_only(&path)?;
-        for layer in dataset.layers() {
-            log::info!(target: "map::vector_load", "layer={:?} feature_count={:?} fast_arrow_stream={}",
-                layer.name(), layer.try_feature_count(), layer.has_capability(LayerCaps::OLCFastGetArrowStream));
-        }
-    }
-
-    let mut baseline: Option<Vec<Arc<VectorSource>>> = None;
-    // Reverse the order on the warm repeat to reduce a simple cache/order bias.
-    for (case, value) in [("normal-1", None), ("no-arrow-1", Some("NO")), ("no-arrow-2", Some("NO")), ("normal-2", None)] {
-        let override_option = ThreadLocalGdalOption::set(KEY, value)?;
-        log::info!(target: "map::vector_load", "case={case} effective_OGR2OGR_USE_ARROW_API={:?} (unset means GDAL auto-selection)",
-            gdal::config::get_config_option(KEY, "<unset>")?);
-        let started = Instant::now();
-        let mut callbacks = Vec::with_capacity(10_000);
-        // Record in memory, not a log per feature: otherwise logging itself
-        // would distort the feature-at-a-time path's elapsed time.
-        let sources =
-            VectorSource::open_with_progress(&path, &mut |fraction| callbacks.push((fraction, started.elapsed())))?.context("Expected a vector dataset")?;
-        let elapsed = started.elapsed();
-        drop(override_option);
-        assert_eq!(thread_local_gdal_option(KEY)?, original, "case={case}: TLS must be restored after every load");
-
-        let mut milestones = Vec::new();
-        let mut last_bucket = None;
-        let mut previous_time = Duration::ZERO;
-        let mut longest_callback_gap = Duration::ZERO;
-        for &(fraction, at) in &callbacks {
-            longest_callback_gap = longest_callback_gap.max(at - previous_time);
-            previous_time = at;
-            let bucket = (fraction * 10.0).floor() as u32;
-            if last_bucket != Some(bucket) {
-                milestones.push((fraction, at));
-                last_bucket = Some(bucket);
-            }
-        }
-        let zeros = callbacks.iter().filter(|(fraction, _)| *fraction == 0.0).count();
-        let intermediate = callbacks.iter().filter(|(fraction, _)| *fraction > 0.0 && *fraction < 1.0).count();
-        let complete = callbacks.iter().filter(|(fraction, _)| *fraction == 1.0).count();
-        log::info!(target: "map::vector_load",
-            "case={case} progress summary: source_load={elapsed:?}, callbacks={}, zero={zeros}, intermediate={intermediate}, complete={complete}, first={:?}, last={:?}, longest_gap_including_start={longest_callback_gap:?}, decile_milestones={milestones:?}, layers={}, geojson_bytes={}",
-            callbacks.len(), callbacks.first(), callbacks.last(), sources.len(), sources.iter().filter_map(|source| source.geojson()).map(str::len).sum::<usize>());
-        ensure!(
-            callbacks.last().is_some_and(|(fraction, _)| *fraction == 1.0),
-            "case={case}: expected completion callback"
-        );
-        ensure!(
-            callbacks.windows(2).all(|pair| pair[0].0 <= pair[1].0),
-            "case={case}: progress must be monotonic"
-        );
-        if let Some(baseline) = &baseline {
-            ensure!(sources.len() == baseline.len(), "case={case}: layer count changed");
-            for (source, expected) in sources.iter().zip(baseline) {
-                // Compare without re-parsing or serializing the 100 MB output.
-                // Exact equality also checks preservation of geometry/properties.
-                ensure!(
-                    source.name() == expected.name() && source.geojson() == expected.geojson(),
-                    "case={case}: converted GeoJSON changed"
-                );
-            }
-            log::info!(target: "map::vector_load", "case={case} output is byte-identical to normal-1");
-        } else {
-            baseline = Some(sources);
-        }
-    }
+    log_arrow_experiment_header(&path, &original)?;
+    compare_arrow_progress_cases(&path, &original)?;
     drop(debug);
     assert_eq!(thread_local_gdal_option("CPL_DEBUG")?, original_debug);
     assert_eq!(thread_local_gdal_option(KEY)?, original);
     Ok(())
 }
 
+#[derive(Default)]
+struct VectorReadbackTiming {
+    first_frame: Option<Duration>,
+    first_data_frame: Option<Duration>,
+    latest: Option<RgbaImage>,
+    frames: u64,
+    comparison_time: Duration,
+}
+
+struct VectorTimingContext<'a> {
+    case: &'a str,
+    source_id: u64,
+    installation_started: Instant,
+    load_started: Instant,
+}
+
+impl VectorReadbackTiming {
+    fn record_frame(
+        &mut self,
+        pixels: RgbaImage,
+        background: &RgbaImage,
+        context: &VectorTimingContext<'_>,
+        available: Duration,
+        rendering: Duration,
+        readback: Duration,
+    ) {
+        self.frames += 1;
+        self.first_frame.get_or_insert(available);
+        let comparison_started = Instant::now();
+        let differs = pixels.as_raw() != background.as_raw();
+        self.comparison_time += comparison_started.elapsed();
+        if differs && self.first_data_frame.is_none() {
+            self.first_data_frame = Some(available);
+            let VectorTimingContext {
+                case,
+                source_id,
+                installation_started,
+                load_started,
+            } = context;
+            log::info!(target: "map::vector_load",
+                "case={case} source={source_id} first actual data-bearing readback: after_install={available:?}, including_install={:?}, since_source_open={:?}, frame={}, native_render={rendering:?}, readback={readback:?} (pixels differ from same-camera local background)",
+                installation_started.elapsed(), load_started.elapsed(), self.frames);
+        }
+        self.latest = Some(pixels);
+    }
+
+    fn poll_until_settled(
+        map: &mut NativeMap,
+        background: &RgbaImage,
+        case: &str,
+        source_id: u64,
+        installation_started: Instant,
+        load_started: Instant,
+        installed: Instant,
+    ) -> Result<Self> {
+        // Keep this manual test bounded even if native work stops making progress.
+        let deadline = installed + Duration::from_secs(90);
+        map.deadline = deadline;
+        let mut timing = Self::default();
+        let context = VectorTimingContext {
+            case,
+            source_id,
+            installation_started,
+            load_started,
+        };
+        loop {
+            ensure!(Instant::now() < deadline, "case={case}: vector did not settle within 90 seconds");
+            let render_started = Instant::now();
+            if let Some(texture) = map.poll_frame()? {
+                let rendering = render_started.elapsed();
+                let readback_started = Instant::now();
+                let pixels = map.read_frame(&texture)?;
+                let readback = readback_started.elapsed();
+                let available = installed.elapsed();
+                timing.record_frame(pixels, background, &context, available, rendering, readback);
+            }
+            if map.is_settled() {
+                return Ok(timing);
+            }
+            // Match the worker's approximate cadence, rather than busy-polling.
+            std::thread::sleep(Duration::from_millis(16));
+        }
+    }
+}
+
 #[test]
 #[ignore = "manual local GPU timing; requires MAP_TEST_VECTOR and a wgpu-compatible graphics device"]
 fn local_vector_load_frame_timings() -> Result<()> {
-    use gdal::vector::LayerAccess as _;
-
     let _ = env_logger::builder().is_test(true).format_timestamp_millis().try_init();
     let path = std::path::PathBuf::from(std::env::var_os("MAP_TEST_VECTOR").context("Set MAP_TEST_VECTOR to the local vector file to measure")?);
     let viewport = Viewport {
@@ -181,88 +196,188 @@ fn local_vector_load_frame_timings() -> Result<()> {
     // Reopen on the second pass as well: this reports a genuinely warm load,
     // not merely attaching the already-converted GeoJSON again.
     for case in ["warm-renderer", "warm-repeat"] {
-        map.set_vector(None, 1.0, "#3b82f6")?;
-        let load_started = Instant::now();
-        let mut conversion_complete = None;
-        let sources = VectorSource::open_with_progress(&path, &mut |fraction| {
-            if fraction >= 1.0 && conversion_complete.is_none() {
-                conversion_complete = Some(load_started.elapsed());
-            }
-        })?
-        .context("Expected a vector dataset")?;
-        let source_load = load_started.elapsed();
-        let source = sources.first().context("Expected at least one vector layer")?.clone();
-        log::info!(target: "map::vector_load",
-            "case={case} source={} VectorSource::open_with_progress complete: elapsed={source_load:?}, first_progress_100pct={conversion_complete:?}, layers={}, selected_layer={:?}, geojson_bytes={:?}",
-            source.id(), sources.len(), source.name(), source.geojson().map(str::len));
-
-        let request = MapRequest {
-            viewport,
-            camera: MapCamera::fit_bounds(source.bounds(), 1200.0, 760.0),
-        };
-        // Same camera, viewport, and local style make pixel differences evidence
-        // of vector data, unlike MapFrame's requested source ID. This extra
-        // harness-only background render is outside the installation timer.
-        let background_started = Instant::now();
-        let background = map.render(request)?;
-        let background_preparation = background_started.elapsed();
-        let installation_started = Instant::now();
-        map.set_vector(Some(source.clone()), 1.0, "#3b82f6")?;
-        let installation = installation_started.elapsed();
-        map.apply_request(request);
-        let installed = Instant::now();
-        // Keep this manual test bounded even if native work stops making progress.
-        let deadline = installed + Duration::from_secs(90);
-        map.deadline = deadline;
-        let mut first_frame = None;
-        let mut first_data_frame = None;
-        let mut latest = None;
-        let mut frames = 0;
-        let mut comparison_time = Duration::ZERO;
-        loop {
-            ensure!(Instant::now() < deadline, "case={case}: vector did not settle within 90 seconds");
-            let render_started = Instant::now();
-            if let Some(texture) = map.poll_frame()? {
-                let rendering = render_started.elapsed();
-                let readback_started = Instant::now();
-                let pixels = map.read_frame(&texture)?;
-                let readback = readback_started.elapsed();
-                let available = installed.elapsed();
-                frames += 1;
-                first_frame.get_or_insert(available);
-                let comparison_started = Instant::now();
-                let differs = pixels.as_raw() != background.as_raw();
-                comparison_time += comparison_started.elapsed();
-                if differs && first_data_frame.is_none() {
-                    first_data_frame = Some(available);
-                    log::info!(target: "map::vector_load",
-                        "case={case} source={} first actual data-bearing readback: after_install={available:?}, including_install={:?}, since_source_open={:?}, frame={frames}, native_render={rendering:?}, readback={readback:?} (pixels differ from same-camera local background)",
-                        source.id(), installation_started.elapsed(), load_started.elapsed());
-                }
-                latest = Some(pixels);
-            }
-            if map.idle.get() && !map.needs_frame.get() && !map.numeric.borrow().is_loading() {
-                break;
-            }
-            // Match the worker's approximate cadence, rather than busy-polling.
-            std::thread::sleep(Duration::from_millis(16));
-        }
-        let settled = installed.elapsed();
-        let latest = latest.context("Native renderer produced no frames")?;
-        let changed_pixels = latest
-            .pixels()
-            .zip(background.pixels())
-            .filter(|(actual, background)| actual != background)
-            .count();
-        ensure!(
-            first_data_frame.is_some() && changed_pixels > 0,
-            "case={case}: native idle must not be mistaken for vector display; no vector pixels differed from the background"
-        );
-        let dataset = geo::vector::gdalio::dataset::open_read_only(&path)?;
-        let feature_count = dataset.layer_by_name(source.name())?.try_feature_count();
-        log::info!(target: "map::vector_load",
-            "case={case} source={} local timing summary: source_load={source_load:?}, progress_100pct={conversion_complete:?}, harness_background_preparation={background_preparation:?}, installation={installation:?}, first_readback_after_install={first_frame:?}, first_data_after_install={first_data_frame:?}, native_idle_after_install={settled:?}, install_through_idle={:?}, frames={frames}, settled_changed_pixels={changed_pixels}, feature_count={feature_count:?}, pixel_comparisons={comparison_time:?}",
-            source.id(), installation + settled);
+        measure_vector_display_case(&mut map, viewport, &path, case)?;
     }
     Ok(())
+}
+
+fn log_arrow_experiment_header(path: &std::path::Path, original: &Option<String>) -> Result<()> {
+    use gdal::vector::{LayerAccess as _, LayerCaps};
+
+    log::info!(target: "map::vector_load", "Arrow progress experiment: GDAL={}, path={path:?}, file_bytes={}, original_tls={original:?}",
+        gdal::version::VersionInfo::release_name(), std::fs::metadata(path)?.len());
+    {
+        let dataset = geo::vector::gdalio::dataset::open_read_only(path)?;
+        for layer in dataset.layers() {
+            log::info!(target: "map::vector_load", "layer={:?} feature_count={:?} fast_arrow_stream={}",
+                layer.name(), layer.try_feature_count(), layer.has_capability(LayerCaps::OLCFastGetArrowStream));
+        }
+    }
+    Ok(())
+}
+
+fn compare_arrow_progress_cases(path: &std::path::Path, original: &Option<String>) -> Result<()> {
+    let mut baseline: Option<Vec<Arc<VectorSource>>> = None;
+    // Reverse the order on the warm repeat to reduce a simple cache/order bias.
+    for (case, value) in [("normal-1", None), ("no-arrow-1", Some("NO")), ("no-arrow-2", Some("NO")), ("normal-2", None)] {
+        let sources = load_arrow_progress_case(path, case, value, original)?;
+        if let Some(baseline) = &baseline {
+            assert_arrow_sources_unchanged(&sources, baseline, case)?;
+        } else {
+            baseline = Some(sources);
+        }
+    }
+    Ok(())
+}
+
+fn load_arrow_progress_case(path: &std::path::Path, case: &str, value: Option<&str>, original: &Option<String>) -> Result<Vec<Arc<VectorSource>>> {
+    const KEY: &str = "OGR2OGR_USE_ARROW_API";
+    let override_option = ThreadLocalGdalOption::set(KEY, value)?;
+    log::info!(target: "map::vector_load", "case={case} effective_OGR2OGR_USE_ARROW_API={:?} (unset means GDAL auto-selection)",
+        gdal::config::get_config_option(KEY, "<unset>")?);
+    let started = Instant::now();
+    let mut callbacks = Vec::with_capacity(10_000);
+    // Record in memory, not a log per feature: otherwise logging itself
+    // would distort the feature-at-a-time path's elapsed time.
+    let sources =
+        VectorSource::open_with_progress(path, &mut |fraction| callbacks.push((fraction, started.elapsed())))?.context("Expected a vector dataset")?;
+    let elapsed = started.elapsed();
+    drop(override_option);
+    assert_eq!(thread_local_gdal_option(KEY)?, *original, "case={case}: TLS must be restored after every load");
+    log_arrow_progress_summary(case, elapsed, &callbacks, &sources)?;
+    Ok(sources)
+}
+
+fn log_arrow_progress_summary(case: &str, elapsed: Duration, callbacks: &[(f64, Duration)], sources: &[Arc<VectorSource>]) -> Result<()> {
+    let mut milestones = Vec::new();
+    let mut last_bucket = None;
+    let mut previous_time = Duration::ZERO;
+    let mut longest_callback_gap = Duration::ZERO;
+    for &(fraction, at) in callbacks {
+        longest_callback_gap = longest_callback_gap.max(at - previous_time);
+        previous_time = at;
+        let bucket = (fraction * 10.0).floor() as u32;
+        if last_bucket != Some(bucket) {
+            milestones.push((fraction, at));
+            last_bucket = Some(bucket);
+        }
+    }
+    let zeros = callbacks.iter().filter(|(fraction, _)| *fraction == 0.0).count();
+    let intermediate = callbacks.iter().filter(|(fraction, _)| *fraction > 0.0 && *fraction < 1.0).count();
+    let complete = callbacks.iter().filter(|(fraction, _)| *fraction == 1.0).count();
+    log::info!(target: "map::vector_load",
+        "case={case} progress summary: source_load={elapsed:?}, callbacks={}, zero={zeros}, intermediate={intermediate}, complete={complete}, first={:?}, last={:?}, longest_gap_including_start={longest_callback_gap:?}, decile_milestones={milestones:?}, layers={}, geojson_bytes={}",
+        callbacks.len(), callbacks.first(), callbacks.last(), sources.len(), sources.iter().filter_map(|source| source.geojson()).map(str::len).sum::<usize>());
+    ensure!(
+        callbacks.last().is_some_and(|(fraction, _)| *fraction == 1.0),
+        "case={case}: expected completion callback"
+    );
+    ensure!(
+        callbacks.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+        "case={case}: progress must be monotonic"
+    );
+    Ok(())
+}
+
+fn assert_arrow_sources_unchanged(sources: &[Arc<VectorSource>], baseline: &[Arc<VectorSource>], case: &str) -> Result<()> {
+    ensure!(sources.len() == baseline.len(), "case={case}: layer count changed");
+    for (source, expected) in sources.iter().zip(baseline) {
+        // Compare without re-parsing or serializing the 100 MB output.
+        // Exact equality also checks preservation of geometry/properties.
+        ensure!(
+            source.name() == expected.name() && source.geojson() == expected.geojson(),
+            "case={case}: converted GeoJSON changed"
+        );
+    }
+    log::info!(target: "map::vector_load", "case={case} output is byte-identical to normal-1");
+    Ok(())
+}
+
+struct TimedVectorSource {
+    sources: Vec<Arc<VectorSource>>,
+    source: Arc<VectorSource>,
+    load_started: Instant,
+    source_load: Duration,
+    conversion_complete: Option<Duration>,
+}
+
+fn load_timed_vector_source(path: &std::path::Path, case: &str) -> Result<TimedVectorSource> {
+    let load_started = Instant::now();
+    let mut conversion_complete = None;
+    let sources = VectorSource::open_with_progress(path, &mut |fraction| {
+        if fraction >= 1.0 && conversion_complete.is_none() {
+            conversion_complete = Some(load_started.elapsed());
+        }
+    })?
+    .context("Expected a vector dataset")?;
+    let source_load = load_started.elapsed();
+    let source = sources.first().context("Expected at least one vector layer")?.clone();
+    log::info!(target: "map::vector_load",
+        "case={case} source={} VectorSource::open_with_progress complete: elapsed={source_load:?}, first_progress_100pct={conversion_complete:?}, layers={}, selected_layer={:?}, geojson_bytes={:?}",
+        source.id(), sources.len(), source.name(), source.geojson().map(str::len));
+    Ok(TimedVectorSource {
+        sources,
+        source,
+        load_started,
+        source_load,
+        conversion_complete,
+    })
+}
+
+fn measure_vector_display_case(map: &mut NativeMap, viewport: Viewport, path: &std::path::Path, case: &str) -> Result<()> {
+    map.set_vector(None, 1.0, "#3b82f6")?;
+    // Retain every loaded layer through this case, as in the original harness.
+    let TimedVectorSource {
+        sources: _sources,
+        source,
+        load_started,
+        source_load,
+        conversion_complete,
+    } = load_timed_vector_source(path, case)?;
+    let request = MapRequest {
+        viewport,
+        camera: MapCamera::fit_bounds(source.bounds(), 1200.0, 760.0),
+    };
+    // Same camera, viewport, and local style make pixel differences evidence
+    // of vector data, unlike MapFrame's requested source ID. This extra
+    // harness-only background render is outside the installation timer.
+    let background_started = Instant::now();
+    let background = map.render(request)?;
+    let background_preparation = background_started.elapsed();
+    let installation_started = Instant::now();
+    map.set_vector(Some(source.clone()), 1.0, "#3b82f6")?;
+    let installation = installation_started.elapsed();
+    map.apply_request(request);
+    let installed = Instant::now();
+    let timing = VectorReadbackTiming::poll_until_settled(map, &background, case, source.id(), installation_started, load_started, installed)?;
+    let settled = installed.elapsed();
+    let VectorReadbackTiming {
+        first_frame,
+        first_data_frame,
+        latest,
+        frames,
+        comparison_time,
+    } = timing;
+    let latest = latest.context("Native renderer produced no frames")?;
+    let changed_pixels = latest
+        .pixels()
+        .zip(background.pixels())
+        .filter(|(actual, background)| actual != background)
+        .count();
+    ensure!(
+        first_data_frame.is_some() && changed_pixels > 0,
+        "case={case}: native idle must not be mistaken for vector display; no vector pixels differed from the background"
+    );
+    let feature_count = local_vector_feature_count(path, source.name())?;
+    log::info!(target: "map::vector_load",
+        "case={case} source={} local timing summary: source_load={source_load:?}, progress_100pct={conversion_complete:?}, harness_background_preparation={background_preparation:?}, installation={installation:?}, first_readback_after_install={first_frame:?}, first_data_after_install={first_data_frame:?}, native_idle_after_install={settled:?}, install_through_idle={:?}, frames={frames}, settled_changed_pixels={changed_pixels}, feature_count={feature_count:?}, pixel_comparisons={comparison_time:?}",
+        source.id(), installation + settled);
+    Ok(())
+}
+
+fn local_vector_feature_count(path: &std::path::Path, layer: &str) -> Result<Option<u64>> {
+    use gdal::vector::LayerAccess as _;
+
+    let dataset = geo::vector::gdalio::dataset::open_read_only(path)?;
+    Ok(dataset.layer_by_name(layer)?.try_feature_count())
 }
