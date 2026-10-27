@@ -185,9 +185,12 @@ pub struct MapView {
 impl MapView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let renderer = MapRenderer::new().expect("Failed to create the map renderer");
+        Self::with_renderer(Some(renderer), window, cx)
+    }
 
-        let task = Self::watch_frames(&renderer, cx);
-        let feature_task = Self::watch_feature_results(&renderer, cx);
+    fn with_renderer(renderer: Option<MapRenderer>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let task = renderer.as_ref().map(|renderer| Self::watch_frames(renderer, cx));
+        let feature_task = renderer.as_ref().map(|renderer| Self::watch_feature_results(renderer, cx));
         let raster_panel = cx.new(|cx| RasterPanel::new(window, cx));
 
         let raster_observation = cx.observe(&raster_panel, |_, _, cx| cx.notify());
@@ -212,7 +215,7 @@ impl MapView {
             feature_info: cx.new(|_| FeatureInfo::new()),
             vector_hover: None,
             hover_revision: 0,
-            _feature_task: Some(feature_task),
+            _feature_task: feature_task,
             pointer: None,
             raster: None,
             vector: None,
@@ -221,7 +224,7 @@ impl MapView {
             _raster_subscription: raster_subscription,
             _raster_observation: raster_observation,
             _theme_observation: theme_observation,
-            renderer: Some(renderer),
+            renderer,
             drag: None,
             coast: None,
             coast_frame_pending: false,
@@ -229,7 +232,7 @@ impl MapView {
             image: None,
             traced_frame_vector: None,
             error: None,
-            _frames_task: Some(task),
+            _frames_task: task,
         }
     }
 
@@ -1865,11 +1868,9 @@ mod tests {
         let mut view = None;
         let handle = cx.open_window(size(px(1200.0), px(760.0)), |window, cx| {
             let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                // The deterministic executor cannot receive foreign-thread wakeups.
-                // Pump worker channels on the test thread through production handlers.
-                map._frames_task = None;
-                map._feature_task = None;
+                let mut map = MapView::with_renderer(None, window, cx);
+                // Pump worker channels on the deterministic test thread instead
+                // of registering listeners that accept foreign-thread wakeups.
                 map.renderer = Some(renderer);
                 map
             });
@@ -2316,13 +2317,7 @@ mod tests {
         });
         let mut view = None;
         let handle = cx.open_window(size(px(800.0), px(600.0)), |window, cx| {
-            let map = cx.new(|cx| {
-                let mut map = MapView::new(window, cx);
-                // Exercise actual input dispatch without a GPU or network worker.
-                map.renderer = None;
-                map._frames_task = None;
-                map
-            });
+            let map = cx.new(|cx| new_test_map(window, cx));
             view = Some(map.clone());
             gpui_kit::base::Root::new(map, window, cx)
         });
@@ -2352,11 +2347,21 @@ mod tests {
         })
         .unwrap();
     }
+    #[gpui_kit::test]
+    fn ui_fixture_has_no_renderer_or_worker_listeners(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (view, _) = open_test_map(size(px(800.0), px(600.0)), cx);
+        cx.update(|cx| {
+            let map = view.read(cx);
+            assert!(map.renderer.is_none());
+            assert!(map._frames_task.is_none());
+            assert!(map._feature_task.is_none());
+        });
+        cx.run_until_parked();
+    }
+
     fn new_test_map(window: &mut Window, cx: &mut Context<MapView>) -> MapView {
-        let mut map = MapView::new(window, cx);
-        map.renderer = None;
-        map._frames_task = None;
-        map
+        MapView::with_renderer(None, window, cx)
     }
 
     fn open_test_map(viewport: gpui_kit::Size<Pixels>, cx: &mut TestAppContext) -> (Entity<MapView>, gpui_kit::WindowHandle<gpui_kit::base::Root>) {

@@ -136,13 +136,11 @@ fn local_vector_drop_to_display_timings(cx: &mut TestAppContext) {
     let mut view = None;
     let handle = cx.open_window(size(px(1200.0), px(760.0)), |window, cx| {
         let map = cx.new(|cx| {
-            let mut map = MapView::new(window, cx);
+            let mut map = MapView::with_renderer(None, window, cx);
             // GPUI's deterministic scheduler rejects foreign-thread wakeups.
             // Poll the real worker channel on the test thread, then use the
             // production apply_frame path; the app's async frame wakeup itself
             // is not part of this headless measurement.
-            map._frames_task = None;
-            map._feature_task = None;
             map.renderer = Some(renderer);
             map
         });

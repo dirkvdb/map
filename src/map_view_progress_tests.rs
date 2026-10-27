@@ -13,13 +13,7 @@ fn open_map(cx: &mut TestAppContext) -> (Entity<MapView>, AnyWindowHandle) {
     });
     let mut view = None;
     let handle = cx.open_window(size(px(900.0), px(600.0)), |window, cx| {
-        let map = cx.new(|cx| {
-            let mut map = MapView::new(window, cx);
-            map.renderer = None;
-            map._frames_task = None;
-            map._feature_task = None;
-            map
-        });
+        let map = cx.new(|cx| MapView::with_renderer(None, window, cx));
         view = Some(map.clone());
         Root::new(map, window, cx)
     });

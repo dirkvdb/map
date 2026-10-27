@@ -18,13 +18,13 @@ A GPUI desktop geospatial viewer with a MapLibre Native vector basemap.
 
 
 # Development
-- Test: `devenv shell -- cargo test --locked`.
+- Test: `devenv shell -- cargo test --locked` (debug) and `devenv shell -- just test` (release-mode Nextest, also used by CI).
 - Test a local NetCDF file: `MAP_TEST_NETCDF=/path/to/file.nc devenv shell -- cargo test --locked netcdf_local_file -- --ignored --nocapture`.
 - Package: `just exe` (Windows), `just appimage` (Linux), or `just dmg` (macOS).
 
 ## Complexity checks
 
-Run `devenv shell -- just check` after Rust changes, followed by `cargo test --workspace --all-features` in the development shell. The devenv `ci:checks` task also runs this gate before building/testing. The individual checks are:
+Run `devenv shell -- just check` after Rust changes, followed by `cargo test --workspace --all-features` and `just test` in the development shell. The devenv `ci:checks` task also runs this gate before building/testing. The individual checks are:
 
 | Command | Check |
 | --- | --- |
