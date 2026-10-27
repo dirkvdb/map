@@ -1259,6 +1259,155 @@ mod tests {
 
     #[test]
     #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
+    fn dataset_changes_skip_invisible_fallback_reads_but_initial_loading_keeps_them() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut sources = Vec::new();
+        for name in ["outgoing", "incoming"] {
+            let path = dir.path().join(format!("{name}.tif"));
+            crate::raster_source::test_support::write_raster(&path, 4326, 1)?;
+            sources.push(RasterSource::open(&path)?.remove(0));
+        }
+        let viewport = Viewport {
+            width: NonZeroU32::new(512).unwrap(),
+            height: NonZeroU32::new(512).unwrap(),
+            scale: 1.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::fit_bounds(sources[0].metadata().bounds, 512.0, 512.0),
+        };
+        let mut map = NativeMap::with_style(
+            viewport,
+            Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##),
+        )?;
+        map.render(request)?;
+        map.set_raster(Some(sources[0].clone()), 1.0)?;
+        map.apply_request(request);
+        assert!(map.poll_frame()?.is_some());
+        assert!(
+            map.numeric.borrow().pending_fallback_count() > 0,
+            "Initial loading still needs coarse tiles for progressive display"
+        );
+        map.render(request)?;
+
+        map.set_raster(Some(sources[1].clone()), 1.0)?;
+        map.apply_request(request);
+        assert!(map.poll_frame()?.is_some());
+        assert_eq!(
+            map.numeric.borrow().pending_fallback_count(),
+            0,
+            "An outgoing raster already covers loading; fallback reads must not compete with the visible tiles needed to start the fade"
+        );
+        map.render(request)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
+    fn single_band_dataset_changes_keep_outgoing_coverage_and_crossfade_independent_grids() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut sources = Vec::new();
+        for (name, bounds, value, palette) in [
+            ("coarse", [-40.0, -20.0, 40.0, 20.0], 64.0, inf::colormap::ColorMapPreset::Gray),
+            ("fine", [-8.0, -8.0, 8.0, 8.0], 192.0, inf::colormap::ColorMapPreset::Terrain),
+            ("shifted", [0.0, -16.0, 32.0, 16.0], 128.0, inf::colormap::ColorMapPreset::Gray),
+        ] {
+            let path = dir.path().join(format!("{name}.tif"));
+            let mut dataset = gdal::DriverManager::get_driver_by_name("GTiff")?.create_with_band_type::<f32, _>(&path, 64, 64, 1)?;
+            dataset.set_geo_transform(&[bounds[0], (bounds[2] - bounds[0]) / 64.0, 0.0, bounds[3], 0.0, -(bounds[3] - bounds[1]) / 64.0])?;
+            dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(4326)?)?;
+            let mut band = dataset.rasterband(1)?;
+            band.set_no_data_value(Some(-9999.0))?;
+            let values = (0..4096).map(|ix| if ix % 64 < 8 { -9999.0 } else { value }).collect();
+            band.write((0, 0), (64, 64), &mut gdal::raster::Buffer::new((64, 64), values))?;
+            dataset.flush_cache()?;
+            drop(dataset);
+            let opened = RasterSource::open(&path)?;
+            assert_eq!(opened.len(), 1, "Each fixture must be a separate single-band dataset");
+            sources.push(opened[0].restyled(palette, (0.0, 255.0))?);
+        }
+        assert!(sources[0].metadata().max_zoom < sources[1].metadata().max_zoom);
+        let viewport = Viewport {
+            width: NonZeroU32::new(256).unwrap(),
+            height: NonZeroU32::new(256).unwrap(),
+            scale: 1.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::fit_bounds(sources[0].metadata().bounds, 256.0, 256.0),
+        };
+        let mut map = NativeMap::with_style(
+            viewport,
+            Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##),
+        )?;
+        let background = map.render(request)?;
+        map.numeric.borrow_mut().set_reduce_motion(true);
+        let mut endpoints = Vec::new();
+        for source in &sources {
+            map.set_raster(Some(source.clone()), 0.6)?;
+            endpoints.push(map.render(request)?);
+        }
+        map.set_raster(Some(sources[0].clone()), 0.6)?;
+        map.render(request)?;
+        map.numeric.borrow_mut().set_reduce_motion(false);
+
+        // Exercise finer, shifted, and coarser replacements, including pixels
+        // covered by only one dataset and independent nodata masks/palettes.
+        for (from, to) in [(0, 1), (1, 2), (2, 0)] {
+            let outgoing = &endpoints[from];
+            let incoming = &endpoints[to];
+            let (probe, _) = outgoing
+                .pixels()
+                .zip(incoming.pixels())
+                .enumerate()
+                .max_by_key(|(_, (old, new))| old[0].abs_diff(new[0]))
+                .context("The fixture must contain pixels")?;
+            let old = outgoing.as_raw()[probe * 4];
+            let new = incoming.as_raw()[probe * 4];
+            assert!(
+                old.abs_diff(new) > 15,
+                "Dataset endpoints {from} -> {to} must be visibly different: {old} vs {new}"
+            );
+            map.set_raster(Some(sources[to].clone()), 0.6)?;
+            map.apply_request(request);
+            let texture = map.poll_frame()?.context("The outgoing dataset must remain renderable")?;
+            let loading = map.readback.read(&texture, &map.device, &map.queue)?;
+            assert_eq!(
+                loading.as_raw(),
+                outgoing.as_raw(),
+                "Loading a dataset must preserve the entire outgoing footprint"
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut intermediate = false;
+            loop {
+                ensure!(Instant::now() < deadline, "Dataset crossfade did not complete");
+                if let Some(texture) = map.poll_frame()? {
+                    let image = map.readback.read(&texture, &map.device, &map.queue)?;
+                    let blend = ((f32::from(image.as_raw()[probe * 4]) - f32::from(old)) / (f32::from(new) - f32::from(old))).clamp(0.0, 1.0);
+                    intermediate |= (0.1..0.9).contains(&blend);
+                    for ((actual, old), new) in image.as_raw().iter().zip(outgoing.as_raw()).zip(incoming.as_raw()) {
+                        let expected = f32::from(*old) * (1.0 - blend) + f32::from(*new) * blend;
+                        assert!(
+                            (f32::from(*actual) - expected).abs() <= 3.0,
+                            "Dataset footprints, palettes, nodata and opacity must blend without a flash: {actual} vs {expected}"
+                        );
+                    }
+                    if !map.numeric.borrow().is_loading() {
+                        assert_eq!(image.as_raw(), incoming.as_raw());
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(intermediate, "Dataset changes must interpolate rather than swap atomically");
+        }
+        map.set_raster(None, 0.6)?;
+        assert_eq!(map.render(request)?.as_raw(), background.as_raw());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
     fn band_fades_blend_independent_nodata_masks_and_opacity() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("nodata-bands.tif");

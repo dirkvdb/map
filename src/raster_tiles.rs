@@ -138,11 +138,29 @@ fn intersects_bounds(tile: VisibleTile, bounds: LatLonBounds) -> bool {
 /// Coverage for the application's north-up, unpitched camera. Projection of the
 /// quads still uses MapLibre's own matrix, not an independent screen transform.
 pub fn visible_tiles(parameters: &WgpuLayerParameters, source: &RasterSource) -> Vec<VisibleTile> {
+    tiles_at_zoom(parameters, selected_zoom(parameters, source), &[source.metadata().bounds.into()])
+}
+
+/// Visible union of both sources' geographic bounds on the finer selected tile
+/// grid, nearest the camera first. Each unwrapped tile occurs only once.
+///
+/// Both shader slots can sample cached ancestors on this grid without requiring
+/// descendants from the coarser source or drawing overlapping parent/child quads.
+/// Use [`visible_tiles`] to schedule each source's own data requests.
+pub fn transition_tiles(parameters: &WgpuLayerParameters, source: &RasterSource, previous: &RasterSource) -> Vec<VisibleTile> {
+    let z = selected_zoom(parameters, source).max(selected_zoom(parameters, previous));
+    tiles_at_zoom(parameters, z, &[source.metadata().bounds.into(), previous.metadata().bounds.into()])
+}
+
+fn selected_zoom(parameters: &WgpuLayerParameters, source: &RasterSource) -> i32 {
     let metadata = source.metadata();
     let tile_size = f64::from(metadata.tile_size.unwrap_or(256));
-    let z = (parameters.zoom + (512.0 / tile_size).log2())
+    (parameters.zoom + (512.0 / tile_size).log2())
         .ceil()
-        .clamp(0.0, f64::from(metadata.max_zoom.clamp(0, 22))) as i32;
+        .clamp(0.0, f64::from(metadata.max_zoom.clamp(0, 22))) as i32
+}
+
+fn tiles_at_zoom(parameters: &WgpuLayerParameters, z: i32, bounds: &[LatLonBounds]) -> Vec<VisibleTile> {
     let n = (1_u32 << z) as f64;
     let world = 512.0 * parameters.zoom.exp2();
     let center = normalized_mercator(Coordinate::latlon(parameters.latitude, parameters.longitude));
@@ -151,12 +169,11 @@ pub fn visible_tiles(parameters: &WgpuLayerParameters, source: &RasterSource) ->
     let right = ((center_x + parameters.width / (2.0 * world)) * n).ceil() as i64;
     let top = ((center_y - parameters.height / (2.0 * world)) * n).floor().max(0.0) as i32;
     let bottom = ((center_y + parameters.height / (2.0 * world)) * n).ceil().min(n) as i32;
-    let bounds = metadata.bounds.into();
     let mut tiles = Vec::new();
     for y in top..bottom {
         for x in left..right {
             let tile = VisibleTile { z, x, y };
-            if intersects_bounds(tile, bounds) {
+            if bounds.iter().any(|bounds| intersects_bounds(tile, *bounds)) {
                 tiles.push(tile);
             }
         }
@@ -195,7 +212,37 @@ pub fn tile_matrix(projection: &[f64; 16], zoom: f64, tile: VisibleTile) -> [[f3
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, path::Path};
+
     use super::*;
+
+    fn coverage_source(path: &Path, [west, south, east, north]: [f64; 4]) -> Result<Arc<RasterSource>> {
+        crate::raster_source::test_support::write_raster(path, 4326, 1)?;
+        let mut dataset = gdal::Dataset::open_ex(
+            path,
+            gdal::DatasetOptions {
+                open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
+                ..Default::default()
+            },
+        )?;
+        dataset.set_geo_transform(&[west, (east - west) / 64.0, 0.0, north, 0.0, (south - north) / 64.0])?;
+        dataset.close()?;
+        Ok(RasterSource::open(path)?.remove(0))
+    }
+
+    fn coverage_parameters() -> WgpuLayerParameters {
+        WgpuLayerParameters {
+            width: 512.0,
+            height: 512.0,
+            latitude: 0.0,
+            longitude: 0.0,
+            zoom: 0.0,
+            projection: [0.0; 16],
+            color_format: 0,
+            depth_format: 0,
+            depth_test: false,
+        }
+    }
 
     #[test]
     fn world_copies_share_a_numeric_tile_identity() {
@@ -276,6 +323,104 @@ mod tests {
         let high = visible_tiles(&parameters, &source);
         assert!(!high.is_empty());
         assert!(high.iter().all(|tile| tile.z == source.metadata().max_zoom));
+        Ok(())
+    }
+
+    #[test]
+    fn transition_coverage_uses_the_finer_selected_grid_for_the_geographic_union() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let coarse = coverage_source(&dir.path().join("coarse.tif"), [-40.0, -20.0, 40.0, 20.0])?;
+        let fine = coverage_source(&dir.path().join("fine.tif"), [100.0, -2.0, 104.0, 2.0])?;
+        assert!(coarse.metadata().max_zoom < fine.metadata().max_zoom);
+        let coarse_bounds: LatLonBounds = coarse.metadata().bounds.into();
+        let fine_bounds: LatLonBounds = fine.metadata().bounds.into();
+
+        for zoom in [0.25, 8.0] {
+            let mut parameters = coverage_parameters();
+            parameters.zoom = zoom;
+            parameters.width = 512.0 * zoom.exp2();
+            parameters.height = parameters.width;
+            let coarse_z = visible_tiles(&parameters, &coarse)[0].z;
+            let fine_z = visible_tiles(&parameters, &fine)[0].z;
+            assert!(coarse_z < fine_z);
+            let z = coarse_z.max(fine_z);
+            let n = 1_i32 << z;
+            let mut expected = HashSet::new();
+            for y in 0..n {
+                for x in 0..n {
+                    let tile = VisibleTile { z, x: i64::from(x), y };
+                    let bounds = tile.canonical().bounds();
+                    if bounds.intersects(&coarse_bounds) || bounds.intersects(&fine_bounds) {
+                        expected.insert(tile);
+                    }
+                }
+            }
+            let tiles = transition_tiles(&parameters, &coarse, &fine);
+            let actual: HashSet<_> = tiles.iter().copied().collect();
+            assert_eq!(actual, expected, "Coverage must be clipped geographically at the common zoom");
+            assert_eq!(tiles.len(), actual.len(), "Each unwrapped quad must occur only once");
+            assert!(tiles.iter().all(|tile| tile.z == z));
+            assert!(tiles.iter().any(|tile| !intersects_bounds(*tile, coarse_bounds)));
+            assert!(tiles.iter().any(|tile| !intersects_bounds(*tile, fine_bounds)));
+            assert_eq!(tiles, transition_tiles(&parameters, &fine, &coarse));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transition_coverage_deduplicates_overlapping_sources_and_preserves_single_source_coverage() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let coarse = coverage_source(&dir.path().join("coarse.tif"), [-40.0, -20.0, 40.0, 20.0])?;
+        let fine = coverage_source(&dir.path().join("fine.tif"), [-2.0, -2.0, 2.0, 2.0])?;
+        let mut parameters = coverage_parameters();
+        parameters.zoom = 8.0;
+        parameters.width = 512.0 * parameters.zoom.exp2();
+        parameters.height = parameters.width;
+        let fine_tiles = visible_tiles(&parameters, &fine);
+        let z = fine_tiles[0].z;
+        assert!(z > visible_tiles(&parameters, &coarse)[0].z);
+        let tiles = transition_tiles(&parameters, &coarse, &fine);
+        let unique: HashSet<_> = tiles.iter().copied().collect();
+        assert_eq!(tiles.len(), unique.len(), "Overlapping bounds must not duplicate quads");
+        assert!(fine_tiles.iter().all(|tile| unique.contains(tile)));
+        assert!(tiles.len() > fine_tiles.len(), "The previous source's wider coverage must remain visible");
+        assert_eq!(tiles, tiles_at_zoom(&parameters, z, &[coarse.metadata().bounds.into()]));
+        assert_eq!(transition_tiles(&parameters, &fine, &fine), fine_tiles);
+        Ok(())
+    }
+
+    #[test]
+    fn transition_coverage_preserves_world_copies_camera_order_and_viewport_clipping() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let west = coverage_source(&dir.path().join("west.tif"), [-178.0, -4.0, -170.0, 4.0])?;
+        let east = coverage_source(&dir.path().join("east.tif"), [170.0, -2.0, 174.0, 2.0])?;
+        let mut parameters = coverage_parameters();
+        parameters.width = 1536.0;
+        parameters.height = 1024.0;
+        parameters.longitude = 180.0;
+        let tiles = transition_tiles(&parameters, &west, &east);
+        let expected: HashSet<_> = (-1..5).flat_map(|x| (0..2).map(move |y| VisibleTile { z: 1, x, y })).collect();
+        assert_eq!(tiles.iter().copied().collect::<HashSet<_>>(), expected);
+        assert_eq!(tiles.len(), expected.len());
+        let distance = |tile: VisibleTile| (tile.x as f64 + 0.5 - 2.0).hypot(f64::from(tile.y) + 0.5 - 1.0);
+        assert!(tiles.windows(2).all(|pair| distance(pair[0]) <= distance(pair[1])));
+
+        parameters.longitude += 360.0;
+        let wrapped = transition_tiles(&parameters, &west, &east);
+        let shifted: Vec<_> = tiles.iter().map(|tile| VisibleTile { x: tile.x + 2, ..*tile }).collect();
+        assert_eq!(wrapped, shifted, "World copies retain distinct unwrapped identities and ordering");
+        for (tile, copy) in tiles.iter().zip(&wrapped) {
+            assert_eq!(tile.canonical(), copy.canonical());
+        }
+
+        parameters = coverage_parameters();
+        parameters.zoom = 8.0;
+        assert!(transition_tiles(&parameters, &west, &east).is_empty());
+        parameters.longitude = 172.0;
+        let east_tiles = transition_tiles(&parameters, &west, &east);
+        assert!(!east_tiles.is_empty());
+        assert!(east_tiles.iter().all(|tile| tile.z == east.metadata().max_zoom));
+        assert!(east_tiles.iter().all(|tile| intersects_bounds(*tile, east.metadata().bounds.into())));
         Ok(())
     }
 

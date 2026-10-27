@@ -99,8 +99,16 @@ impl RasterPanel {
         // A normalized domain keeps slider stepping useful for tiny or very
         // large data ranges without replacing retained component state.
         let range_slider = cx.new(|_| SliderState::new().min(0.0).max(1000.0).step(1.0).default_value(0.0..1000.0));
-        let min = cx.new(|cx| InputState::new(window, cx).placeholder("Minimum"));
-        let max = cx.new(|cx| InputState::new(window, cx).placeholder("Maximum"));
+        let min = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Minimum")
+                .validate(|value, _| value.split_once('.').is_none_or(|(_, fraction)| fraction.len() <= 2))
+        });
+        let max = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Maximum")
+                .validate(|value, _| value.split_once('.').is_none_or(|(_, fraction)| fraction.len() <= 2))
+        });
         let subscriptions = vec![
             cx.subscribe_in(&bands, window, |this, _, event, window, cx| {
                 let SelectEvent::Confirm(id) = event;
@@ -119,8 +127,8 @@ impl RasterPanel {
                     let (min, max) = this.range_domain;
                     let start = min + (max - min) * value.start() / 1000.0;
                     let end = min + (max - min) * value.end() / 1000.0;
-                    this.min.update(cx, |input, cx| input.set_value(start.to_string(), window, cx));
-                    this.max.update(cx, |input, cx| input.set_value(end.to_string(), window, cx));
+                    this.min.update(cx, |input, cx| input.set_value(format!("{start:.2}"), window, cx));
+                    this.max.update(cx, |input, cx| input.set_value(format!("{end:.2}"), window, cx));
                     this.apply_style(window, cx);
                 }
             }),
@@ -214,8 +222,8 @@ impl RasterPanel {
                 ColorMapPreset::Spectral => "Spectral",
                 _ => "Terrain",
             };
-            self.min.update(cx, |input, cx| input.set_value(range.0.to_string(), window, cx));
-            self.max.update(cx, |input, cx| input.set_value(range.1.to_string(), window, cx));
+            self.min.update(cx, |input, cx| input.set_value(format!("{:.2}", range.0), window, cx));
+            self.max.update(cx, |input, cx| input.set_value(format!("{:.2}", range.1), window, cx));
             self.palette.update(cx, |state, cx| state.set_selected_value(&palette, window, cx));
         }
         self.sync_range_slider(window, cx);
@@ -404,8 +412,8 @@ impl RasterPanel {
                 {
                     *current = source;
                 }
-                self.min.update(cx, |input, cx| input.set_value(range.0.to_string(), window, cx));
-                self.max.update(cx, |input, cx| input.set_value(range.1.to_string(), window, cx));
+                self.min.update(cx, |input, cx| input.set_value(format!("{:.2}", range.0), window, cx));
+                self.max.update(cx, |input, cx| input.set_value(format!("{:.2}", range.1), window, cx));
                 self.error = None;
                 self.sync_range_slider(window, cx);
                 self.watch_tile_errors(cx);
@@ -421,8 +429,8 @@ impl RasterPanel {
     fn reset_range(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(source) = self.active() else { return };
         let (min, max) = source.data_range();
-        self.min.update(cx, |input, cx| input.set_value(min.to_string(), window, cx));
-        self.max.update(cx, |input, cx| input.set_value(max.to_string(), window, cx));
+        self.min.update(cx, |input, cx| input.set_value(format!("{min:.2}"), window, cx));
+        self.max.update(cx, |input, cx| input.set_value(format!("{max:.2}"), window, cx));
         self.apply_style(window, cx);
     }
 
@@ -689,7 +697,7 @@ impl RasterPanel {
             .children(self.active().filter(|source| source.has_scale_metadata()).map(|source| {
                 Checkbox::new("raster-unscaling")
                     .small()
-                    .label("Unscale values")
+                    .label("Descale values")
                     .checked(source.unscaling_enabled())
                     .tooltip("Apply the raster’s scale and offset to pixel values")
                     .on_change(cx.listener(|this, enabled, window, cx| this.set_unscaling(*enabled, window, cx)))
@@ -818,7 +826,7 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert_eq!(window.within("raster-range-card").find("raster-unscaling").label(), Some("Unscale values"));
+            assert_eq!(window.within("raster-range-card").find("raster-unscaling").label(), Some("Descale values"));
             assert_eq!(window.find("raster-unscaling").checked(), Some(true));
             let checkbox = window.find("raster-unscaling").bounds();
             let minimum = window.find("raster-min").bounds();
@@ -847,8 +855,8 @@ mod tests {
             assert_eq!(state.active().unwrap().metadata().id, id);
             assert_eq!(state.active().unwrap().range(), (24.0, 54.0));
             assert_eq!(state.range_domain, (18.0, 136.0));
-            assert_eq!(state.min.read(cx).value().as_str(), "24");
-            assert_eq!(state.max.read(cx).value().as_str(), "54");
+            assert_eq!(state.min.read(cx).value().as_str(), "24.00");
+            assert_eq!(state.max.read(cx).value().as_str(), "54.00");
             window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
             assert!(
                 panel.read(cx).active().unwrap().has_scale_metadata(),
@@ -1132,6 +1140,46 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         assert_ne!(cx.update(|cx| panel.read(cx).selected), original_band);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            for (id, value) in [("raster-min", "-1.23"), ("raster-max", "200.45")] {
+                window.render_frame(cx);
+                window.click(id, cx);
+                window.press("secondary-a", cx);
+                window.input(value, cx);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(panel.read(cx).active().unwrap().range(), (-1.23, 200.45));
+        });
+        for id in ["raster-min", "raster-max"] {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.click(id, cx);
+                window.press("end", cx);
+                window.input("6", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update(|cx| {
+                let panel = panel.read(cx);
+                assert_eq!(panel.min.read(cx).value().as_str(), "-1.23");
+                assert_eq!(panel.max.read(cx).value().as_str(), "200.45");
+                assert_eq!(panel.active().unwrap().range(), (-1.23, 200.45));
+            });
+        }
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("reset-raster-range", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let panel = panel.read(cx);
+            for input in [&panel.min, &panel.max] {
+                assert_eq!(input.read(cx).value().split_once('.').unwrap().1.len(), 2);
+            }
+        });
 
         let original_id = cx.update(|cx| panel.read(cx).active().unwrap().id());
         cx.update_window(handle.into(), |_, window, cx| {

@@ -13,7 +13,7 @@ use inf::colormap::ColorMapPreset;
 use maplibre_native::{WgpuCustomLayer, WgpuLayerParameters, texture_format_from_webgpu};
 
 use crate::raster_source::{NumericTile, RasterSource};
-use crate::raster_tiles::{MAX_PENDING_TILES, TileWorkers, VisibleTile, parent_uv, tile_matrix, visible_tiles};
+use crate::raster_tiles::{MAX_PENDING_TILES, TileWorkers, VisibleTile, parent_uv, tile_matrix, transition_tiles, visible_tiles};
 
 const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CACHE_TILES: usize = 256;
@@ -151,16 +151,9 @@ impl RasterLayer {
         }
         self.queued = None;
         if changed {
-            // Both slots must address the same tile grid. Different files or
-            // resolutions use the normal progressive-load path instead.
-            let compatible = self.source.as_ref().zip(source.as_ref()).is_some_and(|(old, new)| {
-                let old = old.metadata();
-                let new = new.metadata();
-                old.path == new.path && old.bounds == new.bounds && old.max_zoom == new.max_zoom && old.tile_size == new.tile_size && dpi == self.dpi
-            });
-            if compatible {
-                // During loading, replace only the incoming slot. The outgoing
-                // band keeps its own values, nodata mask, range and palette.
+            if source.is_some() {
+                // During loading, replace only the incoming slot, even across
+                // datasets. The outgoing slot keeps its own data and style.
                 if self.previous.is_none() && !self.cache.is_empty() {
                     self.previous = self.source.clone().map(|source| PreviousRaster {
                         source,
@@ -234,6 +227,11 @@ impl RasterLayer {
         (self.requests, self.uploads)
     }
 
+    #[cfg(test)]
+    pub fn pending_fallback_count(&self) -> usize {
+        self.pending.iter().filter(|tile| !self.coverage.contains(tile)).count()
+    }
+
     fn request(&mut self, tile: Tile) {
         if self.cache.contains_key(&tile) || self.pending.contains(&tile) || self.pending.len() >= MAX_PENDING_TILES {
             return;
@@ -300,21 +298,33 @@ impl RasterLayer {
         let blend = self.fade_started.map_or(if self.previous.is_some() { 0.0 } else { 1.0 }, |start| {
             (now.duration_since(start).as_secs_f32() / BAND_FADE.as_secs_f32()).clamp(0.0, 1.0)
         });
-        // Retain ancestors across navigation. Only request a new parent when
-        // there is no cached fallback at all, and prioritize the visible tile.
+        // Before the fade, only exact incoming tiles can make progress: parent
+        // tiles are invisible and would delay readiness on the shared workers.
+        let loading_replacement = self.previous.is_some() && self.fade_started.is_none();
+        // Retain ancestors across navigation and initial progressive loading.
         for tile in &visible {
             let tile = tile.canonical();
             if let Some(cached) = self.cache.get_mut(&tile) {
                 cached.used = self.frame;
             }
             self.request(tile);
-            if !self.cache.contains_key(&tile)
+            if !loading_replacement
+                && !self.cache.contains_key(&tile)
                 && self.cached_ancestor(tile).is_none()
                 && let Some(parent) = tile.parent()
             {
                 self.request(parent);
             }
         }
+        // Loading only draws the outgoing grid. Once blending starts, draw both
+        // footprints on the finer grid so either slot can sample ancestors.
+        let visible = self.previous.as_ref().map_or(visible, |previous| {
+            if loading_replacement {
+                visible_tiles(parameters, &previous.source)
+            } else {
+                transition_tiles(parameters, &source, &previous.source)
+            }
+        });
         let Some(pipeline) = &mut self.pipeline else { return };
         let previous_source = self.previous.as_ref().map_or(&source, |previous| &previous.source);
         for (ix, source) in [&source, previous_source].into_iter().enumerate() {

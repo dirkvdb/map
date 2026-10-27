@@ -179,12 +179,24 @@ impl MapView {
         let raster_observation = cx.observe(&raster_panel, |_, _, cx| cx.notify());
         let theme_observation = cx.observe_global::<Theme>(|view, cx| view.request_render(cx));
         let raster_subscription = cx.subscribe(&raster_panel, |view, _, event: &crate::raster_panel::RasterEvent, cx| {
-            view.raster = event.source();
-            view.vector = event.vector_source();
+            let raster = event.source();
+            let vector = event.vector_source();
+            let selection_changed = view.raster.as_ref().map(|source| source.metadata().id) != raster.as_ref().map(|source| source.metadata().id)
+                || view.vector.as_ref().map(|source| source.id()) != vector.as_ref().map(|source| source.id());
+            view.raster = raster;
+            view.vector = vector;
             view.opacity = event.opacity();
             view.coast = None;
             view.drag = None;
-            view.fit_pending = event.should_fit();
+            view.fit_pending = event.should_fit()
+                || (selection_changed
+                    && view.source_bounds().is_some_and(|bounds| {
+                        view.viewport.is_none_or(|viewport| {
+                            !view
+                                .camera
+                                .intersects_bounds(bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get()))
+                        })
+                    }));
             view.fit_raster();
             view.request_render(cx);
         });
@@ -231,14 +243,16 @@ impl MapView {
         self.raster_panel.update(cx, |panel, cx| panel.open_paths(paths, cx));
     }
 
-    fn fit_raster(&mut self) {
-        let bounds = self
-            .raster
+    fn source_bounds(&self) -> Option<[f64; 4]> {
+        self.raster
             .as_ref()
             .map(|source| source.metadata().bounds)
-            .or_else(|| self.vector.as_ref().map(|source| source.bounds()));
+            .or_else(|| self.vector.as_ref().map(|source| source.bounds()))
+    }
+
+    fn fit_raster(&mut self) {
         if self.fit_pending
-            && let (Some(bounds), Some(viewport)) = (bounds, self.viewport)
+            && let (Some(bounds), Some(viewport)) = (self.source_bounds(), self.viewport)
         {
             self.camera = MapCamera::fit_bounds(bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get()));
             self.fit_pending = false;
@@ -931,6 +945,105 @@ mod tests {
             })
             .unwrap();
         }
+    }
+
+    #[gpui_kit::test]
+    fn selecting_offscreen_bands_fits_the_dataset_but_visible_bands_and_styles_keep_the_camera(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for (name, west) in [("near", -10.0), ("far", 100.0)] {
+            let path = directory.path().join(format!("{name}.tif"));
+            crate::raster_source::test_support::write_raster(&path, 4326, 2).unwrap();
+            let mut dataset = gdal::Dataset::open_ex(
+                &path,
+                gdal::DatasetOptions {
+                    open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE | gdal::GdalOpenFlags::GDAL_OF_RASTER,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            dataset.set_geo_transform(&[west, 20.0 / 64.0, 0.0, 10.0, 0.0, -20.0 / 64.0]).unwrap();
+            dataset.close().unwrap();
+            paths.push(path);
+        }
+        let mut view = None;
+        let handle = cx.open_window(size(px(900.), px(760.)), |window, cx| {
+            let map = cx.new(|cx| {
+                let mut map = MapView::new(window, cx);
+                map.renderer = None;
+                map._frames_task = None;
+                map
+            });
+            view = Some(map.clone());
+            gpui_kit::base::Root::new(map, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |map, cx| map.open_paths(paths, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let panned = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let camera = view.update(cx, |map, _| {
+                    assert_eq!(map.raster.as_ref().unwrap().metadata().bounds[0], 100.0);
+                    let viewport = map.viewport.unwrap();
+                    map.camera.zoom_at(1.0, (0.0, 0.0));
+                    map.camera.pan(f64::from(viewport.width.get()) * 0.4, 0.0);
+                    map.camera
+                });
+                window.scroll("raster-band", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+                camera
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().band_nr, Some(2));
+            assert_eq!(view.read(cx).camera, panned, "Overlapping bands must preserve the user's pan and zoom");
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let map = view.read(cx);
+            let source = map.raster.as_ref().unwrap();
+            assert_eq!(source.metadata().bounds[0], -10.0);
+            let viewport = map.viewport.unwrap();
+            let fitted = MapCamera::fit_bounds(source.metadata().bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get()));
+            assert_eq!(map.camera, fitted, "An offscreen dataset must be centered and fitted after selection");
+            assert_eq!(map.requested.as_ref().unwrap().map.camera, fitted);
+            view.update(cx, |map, _| map.camera.pan(10_000.0, 10_000.0));
+            window.scroll("raster-palette", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let map = view.read(cx);
+            let viewport = map.viewport.unwrap();
+            let bounds = map.raster.as_ref().unwrap().metadata().bounds;
+            assert!(
+                !map.camera
+                    .intersects_bounds(bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get())),
+                "Restyling an offscreen dataset must not move the camera"
+            );
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let map = view.read(cx);
+            let viewport = map.viewport.unwrap();
+            let bounds = map.raster.as_ref().unwrap().metadata().bounds;
+            assert_eq!(
+                map.camera,
+                MapCamera::fit_bounds(bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get())),
+                "Selecting another offscreen band in the same file must also bring it into view"
+            );
+        });
     }
 
     #[gpui_kit::test]

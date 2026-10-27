@@ -32,6 +32,33 @@ impl MapCamera {
         geo::Coordinate::latlon((PI * (1.0 - 2.0 * y)).sinh().atan().to_degrees(), x * 360.0 - 180.0)
     }
 
+    /// Test whether WGS84 `[west, south, east, north]` bounds overlap the north-up,
+    /// unpitched viewport, accounting for repeated longitude worlds.
+    /// Uses `geo::LatLonBounds::intersects`: touching-only edges and bounds entirely
+    /// beyond the Mercator latitude cap do not intersect; interior point bounds do.
+    /// Viewport dimensions are logical pixels. Nonfinite inputs, nonpositive
+    /// dimensions, and inverted latitude bounds do not intersect.
+    pub fn intersects_bounds(self, bounds: [f64; 4], width: f64, height: f64) -> bool {
+        let [west, south, east, north] = bounds;
+        if !bounds.into_iter().all(f64::is_finite) || !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 || south > north {
+            return false;
+        }
+
+        let half_width = width / self.world_size() / 2.0;
+        // Keep longitude edges unwrapped: the viewport can span multiple worlds.
+        let viewport = geo::LatLonBounds::from([
+            (self.x - half_width) * 360.0 - 180.0,
+            self.coordinate_at((0.0, height / 2.0)).latitude,
+            (self.x + half_width) * 360.0 - 180.0,
+            self.coordinate_at((0.0, -height / 2.0)).latitude,
+        ]);
+        let east = if east < west { east + 360.0 } else { east };
+        let center_longitude = self.x * 360.0 - 180.0;
+        let shift = ((center_longitude - (west + east) / 2.0) / 360.0).round() * 360.0;
+        let dataset = geo::LatLonBounds::from([west + shift, south, east + shift, north]);
+        viewport.intersects(&dataset)
+    }
+
     pub fn fit_bounds(bounds: [f64; 4], width: f64, height: f64) -> Self {
         let [west, south, east, north] = bounds;
         let project_y = |latitude: f64| (1.0 - latitude.clamp(-85.05112878, 85.05112878).to_radians().tan().asinh() / PI) / 2.0;
@@ -132,6 +159,152 @@ mod tests {
         assert!((0.0..1.0).contains(&camera.x) && camera.y == 0.0 && camera.zoom == MAX_ZOOM);
         camera.zoom_at(-100.0, (0.0, 0.0));
         assert_eq!(camera.zoom, MIN_ZOOM);
+    }
+
+    #[test]
+    fn intersection_includes_contained_and_partially_visible_bounds() {
+        let camera = MapCamera { x: 0.5, y: 0.5, zoom: 0.0 };
+        for bounds in [[-10.0, -10.0, 10.0, 10.0], [30.0, -10.0, 60.0, 10.0], [-10.0, 30.0, 10.0, 60.0]] {
+            assert!(camera.intersects_bounds(bounds, 128.0, 128.0), "bounds: {bounds:?}");
+        }
+    }
+
+    #[test]
+    fn intersection_includes_bounds_spanning_viewport_with_all_corners_outside() {
+        let camera = MapCamera { x: 0.5, y: 0.5, zoom: 0.0 };
+        for bounds in [[-80.0, -10.0, 80.0, 10.0], [-10.0, -60.0, 10.0, 60.0], [-80.0, -60.0, 80.0, 60.0]] {
+            assert!(camera.intersects_bounds(bounds, 128.0, 128.0), "bounds: {bounds:?}");
+        }
+    }
+
+    #[test]
+    fn intersection_rejects_bounds_separated_on_either_axis() {
+        let camera = MapCamera { x: 0.5, y: 0.5, zoom: 0.0 };
+        for bounds in [
+            [60.0, -10.0, 80.0, 10.0],
+            [-80.0, -10.0, -60.0, 10.0],
+            [-10.0, 50.0, 10.0, 60.0],
+            [-10.0, -60.0, 10.0, -50.0],
+        ] {
+            assert!(!camera.intersects_bounds(bounds, 128.0, 128.0), "bounds: {bounds:?}");
+        }
+    }
+
+    #[test]
+    fn intersection_rejects_touching_only_edges_and_boundary_points() {
+        let camera = MapCamera { x: 0.5, y: 0.5, zoom: 0.0 };
+        let south = camera.coordinate_at((0.0, 64.0)).latitude;
+        let north = camera.coordinate_at((0.0, -64.0)).latitude;
+        for bounds in [
+            [45.0, -10.0, 60.0, 10.0],
+            [-60.0, -10.0, -45.0, 10.0],
+            [-10.0, north, 10.0, 60.0],
+            [-10.0, -60.0, 10.0, south],
+            [45.0, 0.0, 45.0, 0.0],
+        ] {
+            assert!(!camera.intersects_bounds(bounds, 128.0, 128.0), "bounds: {bounds:?}");
+        }
+    }
+
+    #[test]
+    fn intersection_includes_point_bounds_inside_viewport() {
+        let camera = MapCamera { x: 0.5, y: 0.5, zoom: 0.0 };
+        assert!(camera.intersects_bounds([0.0, 0.0, 0.0, 0.0], 128.0, 128.0));
+    }
+
+    #[test]
+    fn intersection_finds_visible_world_copies_on_both_sides_of_dateline() {
+        for (x, bounds) in [(0.01, [175.0, -10.0, 179.0, 10.0]), (0.99, [-179.0, -10.0, -175.0, 10.0])] {
+            let camera = MapCamera { x, y: 0.5, zoom: 0.0 };
+            for shift in [-720.0, 0.0, 720.0] {
+                let shifted = [bounds[0] + shift, bounds[1], bounds[2] + shift, bounds[3]];
+                assert!(camera.intersects_bounds(shifted, 64.0, 64.0), "camera x: {x}, bounds: {shifted:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn intersection_handles_antimeridian_bounds_near_both_world_edges() {
+        for x in [0.0, 0.99] {
+            let camera = MapCamera { x, y: 0.5, zoom: 0.0 };
+            assert!(camera.intersects_bounds([170.0, -10.0, -170.0, 10.0], 64.0, 64.0), "camera x: {x}");
+        }
+    }
+
+    #[test]
+    fn intersection_does_not_treat_antimeridian_bounds_as_crossing_greenwich() {
+        let camera = MapCamera { x: 0.5, y: 0.5, zoom: 0.0 };
+        assert!(!camera.intersects_bounds([170.0, -10.0, -170.0, 10.0], 64.0, 64.0));
+    }
+
+    #[test]
+    fn intersection_handles_full_world_and_multiple_world_viewports() {
+        let camera = MapCamera { x: 0.2, y: 0.5, zoom: 0.0 };
+        for width in [512.0, 768.0, 1536.0] {
+            for bounds in [[-179.0, -10.0, -175.0, 10.0], [175.0, -10.0, 179.0, 10.0], [170.0, -10.0, -170.0, 10.0]] {
+                assert!(camera.intersects_bounds(bounds, width, 64.0), "width: {width}, bounds: {bounds:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn intersection_still_checks_latitude_for_full_world_viewports() {
+        let camera = MapCamera { x: 0.2, y: 0.5, zoom: 0.0 };
+        assert!(!camera.intersects_bounds([-180.0, 70.0, 180.0, 80.0], 1536.0, 64.0));
+    }
+
+    #[test]
+    fn intersection_includes_full_world_bounds_in_narrow_viewports() {
+        for x in [0.0, 0.2, 0.99] {
+            let camera = MapCamera { x, y: 0.5, zoom: 0.0 };
+            assert!(camera.intersects_bounds([-180.0, -90.0, 180.0, 90.0], 64.0, 64.0), "camera x: {x}");
+        }
+    }
+
+    #[test]
+    fn intersection_includes_polar_bounds_overlapping_visible_latitudes() {
+        for (y, bounds) in [(0.0, [-10.0, 80.0, 10.0, 90.0]), (1.0, [-10.0, -90.0, 10.0, -80.0])] {
+            let camera = MapCamera { x: 0.5, y, zoom: 0.0 };
+            assert!(camera.intersects_bounds(bounds, 128.0, 128.0), "camera y: {y}");
+        }
+    }
+
+    #[test]
+    fn intersection_rejects_polar_bounds_entirely_beyond_mercator_cap() {
+        for (y, bounds) in [(0.0, [-10.0, 86.0, 10.0, 90.0]), (1.0, [-10.0, -90.0, 10.0, -86.0])] {
+            let camera = MapCamera { x: 0.5, y, zoom: 0.0 };
+            assert!(!camera.intersects_bounds(bounds, 128.0, 128.0), "camera y: {y}");
+        }
+    }
+
+    #[test]
+    fn intersection_does_not_wrap_latitude_at_poles() {
+        let camera = MapCamera { x: 0.5, y: 0.0, zoom: 0.0 };
+        assert!(!camera.intersects_bounds([-10.0, -90.0, 10.0, -80.0], 128.0, 128.0));
+    }
+
+    #[test]
+    fn intersection_uses_zoom_scaled_world_size() {
+        let camera = MapCamera { x: 0.5, y: 0.5, zoom: 2.0 };
+        assert!(!camera.intersects_bounds([30.0, -10.0, 60.0, 10.0], 128.0, 128.0));
+    }
+
+    #[test]
+    fn intersection_rejects_invalid_bounds_and_viewport_dimensions() {
+        let camera = MapCamera::default();
+        for (bounds, width, height) in [
+            ([-180.0, -90.0, 180.0, 90.0], 0.0, 128.0),
+            ([-180.0, -90.0, 180.0, 90.0], 128.0, -1.0),
+            ([-180.0, -90.0, 180.0, 90.0], f64::INFINITY, 128.0),
+            ([-180.0, -90.0, 180.0, 90.0], 128.0, f64::NAN),
+            ([f64::NAN, -90.0, 180.0, 90.0], 128.0, 128.0),
+            ([-180.0, 10.0, 180.0, -10.0], 128.0, 128.0),
+        ] {
+            assert!(
+                !camera.intersects_bounds(bounds, width, height),
+                "bounds: {bounds:?}, viewport: {width} x {height}"
+            );
+        }
     }
 
     #[test]
