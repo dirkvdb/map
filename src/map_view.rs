@@ -1696,7 +1696,7 @@ mod tests {
             cx.run_until_parked();
             cx.update_window(handle.into(), |_, window, cx| {
                 window.render_frame(cx);
-                let bounds = window.find(0_usize).bounds();
+                let bounds = window.within("dialog").find("surface").bounds();
                 assert!((bounds.center().x - viewport.width / 2.).abs() <= px(1.));
                 assert!((bounds.center().y - viewport.height / 2.).abs() <= px(1.));
                 assert!(bounds.left() >= px(0.) && bounds.right() <= viewport.width);
@@ -1833,7 +1833,7 @@ mod tests {
             let id = (ElementId::from("theme"), name.clone());
             for _ in 0..100 {
                 let card = window.find(id.clone());
-                let dialog = window.find(0_usize).bounds();
+                let dialog = window.within("dialog").find("surface").bounds();
                 let top = dialog.top() + px(80.);
                 let bottom = window.find("settings-done").bounds().top() - px(8.);
                 if card.visible() && card.bounds().top() >= top && card.bounds().bottom() <= bottom {
@@ -1876,7 +1876,8 @@ mod tests {
         let view = view.unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert!(window.try_find("open-settings").is_none());
+            assert_eq!(window.find("open-settings").label(), Some("Settings"));
+            assert!(window.find("open-settings").visible());
             window.press("secondary-,", cx);
         })
         .unwrap();
@@ -3104,9 +3105,9 @@ mod tests {
             let band = window.within("title-bar").find("raster-band").bounds();
             assert!(band.left() < title_bar.center().x);
             assert!(band.top() >= title_bar.top() && band.bottom() <= title_bar.bottom());
-            assert!(open.left() > band.right() && open.right() < title_bar.center().x);
+            assert!(open.left() >= title_bar.left() && open.right() < band.left());
             assert!(open.top() >= title_bar.top() && open.bottom() <= title_bar.bottom());
-            assert_eq!(open.left() - band.right(), window.rem_size() * 0.5);
+            assert_eq!(band.left() - open.right(), window.rem_size() * 0.5);
             assert!(window.within("raster-layers-card").try_find("raster-band").is_none());
             assert!(window.within("raster-layers-card").try_find("open-raster").is_none());
             assert_eq!(title_bar.origin, point(px(0.0), px(0.0)));
@@ -3260,7 +3261,8 @@ mod tests {
             let band = window.within("title-bar").find("raster-band");
             assert!(band.visible());
             assert!(band.bounds().left() < title_bar.center().x);
-            assert!(open.bounds().left() > band.bounds().right() && open.bounds().right() < title_bar.right());
+            assert!(open.bounds().left() >= title_bar.left() && open.bounds().right() < band.bounds().left());
+            assert!(band.bounds().right() <= title_bar.right());
             assert_eq!(map.size, size(px(640.0), px(400.0) - title_bar.size.height));
             assert!(layers.right() < map.right() && layers.left() > map.left());
             window.scroll("raster-layers-card", ScrollDelta::Lines(point(0.0, -30.0)), cx);

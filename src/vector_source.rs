@@ -1174,28 +1174,4 @@ mod tests {
         assert!(error.to_string().contains("no coordinate reference system"), "{error:#}");
         Ok(())
     }
-
-    #[test]
-    #[ignore = "requires Dirk's exact local PMTiles file and the GDAL PMTiles driver"]
-    fn open_local_wbgt_pmtiles() -> Result<()> {
-        let path = Path::new("/home/dirk/Downloads/AD_WBGT_20240620-20240626_construction.pmtiles");
-        let sources = VectorSource::open(path)?.context("Local PMTiles was not recognized as vector")?;
-        ensure!(!sources.is_empty(), "No PMTiles layers");
-        assert_eq!(sources[0].name(), "construction");
-        for source in sources {
-            let data = source.source_json();
-            assert_eq!(data["type"], "vector");
-            assert_eq!(data["url"], format!("pmtiles://{}", url::Url::from_file_path(path).unwrap()));
-            assert!(data.get("data").is_none(), "PMTiles must not be materialized as GeoJSON");
-            let dataset = gdalio::dataset::open_read_only(path)?;
-            assert_eq!(
-                source.bounds(),
-                bounds_array(gdalio::layer_bounds(&dataset.layer_by_name(source.name())?)?.unwrap_or_else(geo::LatLonBounds::world))
-            );
-            for layer in source.layers_json(1.0, "red") {
-                assert_eq!(layer["source-layer"], source.name());
-            }
-        }
-        Ok(())
-    }
 }

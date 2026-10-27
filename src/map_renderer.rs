@@ -1368,65 +1368,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a graphics device and Dirk's local WBGT PMTiles file"]
-    fn local_pmtiles_vectors_render_without_network() -> Result<()> {
-        let path = std::path::Path::new("/home/dirk/Downloads/AD_WBGT_20240620-20240626_construction.pmtiles");
-        let directory = tempfile::tempdir()?;
-        let escaped_path = directory.path().join("construction # café.pmtiles");
-        std::fs::copy(path, &escaped_path)?;
-        let source = VectorSource::open(&escaped_path)?.context("Expected vector PMTiles")?.remove(0);
-        assert_eq!(source.source_json()["type"], "vector");
-        let viewport = Viewport {
-            width: NonZeroU32::new(800).unwrap(),
-            height: NonZeroU32::new(600).unwrap(),
-            scale: 1.0,
-        };
-        let request = MapRequest {
-            viewport,
-            camera: MapCamera::fit_bounds(source.bounds(), 800.0, 600.0),
-        };
-        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
-        let background = map.render(request)?;
-        map.set_vector(Some(source.clone()), 1.0, "hsla(217, 90%, 60%, 1)")?;
-        let rendered = map.render(request)?;
-        let changed = rendered.pixels().zip(background.pixels()).filter(|(a, b)| a != b).count();
-        assert!(changed > 100, "Expected construction features to render, got {changed} changed pixels");
-        // Sample changed pixels at scale 1, where readback and logical coordinates
-        // coincide. Antialiasing can change pixels outside the queryable geometry.
-        let mut queried = Vec::new();
-        for (x, y, _) in rendered
-            .enumerate_pixels()
-            .filter(|(x, y, pixel)| *pixel != background.get_pixel(*x, *y))
-            .step_by((changed / 128).max(1))
-            .take(128)
-        {
-            queried.extend(map.query_vector_features((f64::from(x), f64::from(y)))?);
-            // Some construction sites have no WBGT measurements for this date.
-            if queried.iter().any(|feature| feature["properties"]["20240620"].is_number()) {
-                break;
-            }
-        }
-        assert!(!queried.is_empty(), "Expected a native feature query to hit a rendered construction feature");
-        assert!(
-            queried.iter().any(|feature| feature["properties"]["20240620"].is_number()),
-            "Native PMTiles queries must preserve the numeric WBGT date attribute: {queried:?}"
-        );
-        map.set_vector(Some(source.clone()), 0.0, "hsla(217, 90%, 60%, 1)")?;
-        assert_eq!(map.render(request)?.as_raw(), background.as_raw());
-        map.set_vector(Some(source), 1.0, "hsla(217, 90%, 60%, 1)")?;
-        let mut zoomed = request;
-        zoomed.camera.zoom_at(2.0, (0.0, 0.0));
-        assert_ne!(map.render(zoomed)?.as_raw(), rendered.as_raw());
-        map.load_style(BasemapStyle::Light, Some(LIGHT_STYLE))?;
-        let _ = map.render(request)?;
-        map.load_style(BasemapStyle::Dark, Some(DARK_STYLE))?;
-        assert_eq!(map.render(request)?.as_raw(), rendered.as_raw(), "Native PMTiles must survive style reloads");
-        map.set_vector(None, 1.0, "hsla(217, 90%, 60%, 1)")?;
-        assert_eq!(map.render(request)?.as_raw(), background.as_raw());
-        Ok(())
-    }
-
-    #[test]
     #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
     fn local_raster_tiles_render_restyle_and_clear_without_network() -> Result<()> {
         let dir = tempfile::tempdir()?;

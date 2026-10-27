@@ -1440,7 +1440,8 @@ mod tests {
         })
         .unwrap();
         cx.simulate_path_prompt_response(|options| {
-            assert_eq!(options.prompt.as_deref(), Some("Open datasets"));
+            assert_eq!(options.prompt.as_deref(), Some("Open dataset"));
+            assert!(options.files && options.multiple && !options.directories);
             Some(vec![vector, raster])
         });
         cx.run_until_parked();
