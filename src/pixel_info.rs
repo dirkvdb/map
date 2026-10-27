@@ -53,13 +53,27 @@ impl CachedTile {
             format!("{error:#}")
         });
         log::debug!("Pixel tile {key:?} loaded in {:?}", start.elapsed());
-        // The sampled dimension already includes DPI; apply it only once.
-        let sample_size = tile_size as usize * usize::from(key.dpi);
-        Self {
-            key,
-            reference: GeoReference::from_tile(&key.tile, sample_size, 1),
-            data,
-        }
+        let reference = data
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map(|data| Self::tile_reference(key.tile, data))
+            .unwrap_or_default();
+        Self { key, reference, data }
+    }
+
+    fn tile_reference(tile: Tile, data: &AnyDenseArray) -> GeoReference {
+        let bounds = tile.web_mercator_bounds();
+        // Derive cell sizes directly: zoom-based helpers assume power-of-two
+        // resolutions and misregister DPI 3/4 samples and larger COG tiles.
+        let cell_size = geo::CellSize::new(bounds.width() / f64::from(data.columns().0), -bounds.height() / f64::from(data.rows().0));
+        GeoReference::with_top_left_origin(
+            "EPSG:3857",
+            geo::RasterSize::with_rows_cols(data.rows(), data.columns()),
+            bounds.top_left(),
+            cell_size,
+            Some(f64::NAN),
+        )
     }
 
     fn read(source: &RasterSource, request: &TileRequest) -> Result<Option<AnyDenseArray>> {
@@ -82,7 +96,16 @@ impl CachedTile {
     fn value(&self, coordinate: Coordinate) -> PixelValue {
         match &self.data {
             Ok(Some(data)) => {
-                let cell = self.reference.point_to_cell(crs::lat_lon_to_web_mercator(coordinate));
+                let point = crs::lat_lon_to_web_mercator(coordinate);
+                if !point.x().is_finite() || !point.y().is_finite() {
+                    return PixelValue::NoData;
+                }
+                let cell = self.reference.point_to_cell(point);
+                // Tile selection and projection can round opposite ways at an
+                // edge. Check each axis before flattening the cell to an index.
+                if !(0..data.rows().0).contains(&cell.row) || !(0..data.columns().0).contains(&cell.col) {
+                    return PixelValue::NoData;
+                }
                 data.cell_value::<f64>(cell)
                     .filter(|value| value.is_finite())
                     .map_or(PixelValue::NoData, PixelValue::Data)
@@ -383,12 +406,50 @@ mod tests {
                 crs::web_mercator_to_lat_lon(geo::Point::new(15625.0, -15625.0))
             };
             let mut cache = PixelValueCache::default();
-            for dpi in [1, 2] {
+            for dpi in [1, 2, 3, 4] {
                 assert_eq!(cache.sample(&sources[0], coordinate, dpi).unwrap(), Some(74.0), "EPSG {epsg}, DPI {dpi}");
                 assert_eq!(cache.sample(&sources[1], coordinate, dpi).unwrap(), Some(84.0));
             }
             let restyled = sources[1].restyled(ColorMapPreset::Blues, (0.0, 1.0)).unwrap();
             assert_eq!(cache.sample(&restyled, coordinate, 2).unwrap(), Some(84.0));
+        }
+    }
+
+    #[test]
+    fn cached_tile_sampling_rejects_outside_cells_and_nonfinite_coordinates() {
+        let reference = GeoReference::with_top_left_origin(
+            "EPSG:3857",
+            geo::RasterSize::with_rows_cols(geo::Rows(4), geo::Columns(4)),
+            geo::Point::new(0.0, 1000.0),
+            geo::CellSize::square(100.0),
+            None::<f64>,
+        );
+        let data = AnyDenseArray::filled_with(
+            Some(42.0),
+            geo::ArrayMetadata::sized_with_nodata(reference.raster_size(), None),
+            geo::ArrayDataType::Float32,
+        );
+        let tile = CachedTile {
+            key: TileKey {
+                layer: LayerId::new(1),
+                tile: Tile { x: 2, y: 1, z: 2 },
+                dpi: 1,
+            },
+            reference,
+            data: Ok(Some(data)),
+        };
+        let inside = crs::web_mercator_to_lat_lon(tile.reference.cell_center(geo::Cell::from_row_col(1, 1)));
+        assert_eq!(tile.value(inside), PixelValue::Data(42.0));
+        for (row, col) in [(-1, 1), (4, 1), (1, -1), (1, 4)] {
+            let coordinate = crs::web_mercator_to_lat_lon(tile.reference.cell_center(geo::Cell::from_row_col(row, col)));
+            assert_eq!(tile.value(coordinate), PixelValue::NoData, "Cell ({row}, {col})");
+        }
+        for coordinate in [
+            Coordinate::latlon(f64::NAN, 0.0),
+            Coordinate::latlon(0.0, f64::NAN),
+            Coordinate::latlon(90.0, 0.0),
+        ] {
+            assert_eq!(tile.value(coordinate), PixelValue::NoData);
         }
     }
 

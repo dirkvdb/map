@@ -831,7 +831,8 @@ impl MapView {
                     .absolute()
                     .top_3()
                     .right_3()
-                    .bottom_3()
+                    // Keep the bottom-left pointer readout clear of the controls.
+                    .bottom_12()
                     .flex()
                     .flex_col()
                     .w_80()
@@ -1052,7 +1053,7 @@ mod tests {
                     map.camera.pan(f64::from(viewport.width.get()) * 0.4, 0.0);
                     map.camera
                 });
-                window.scroll("raster-band", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+                window.click("next-raster-band", cx);
                 camera
             })
             .unwrap();
@@ -1061,7 +1062,6 @@ mod tests {
             assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().band_nr, Some(2));
             assert_eq!(view.read(cx).camera, panned, "Overlapping bands must preserve the user's pan and zoom");
             window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
-            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
         })
         .unwrap();
         cx.run_until_parked();
@@ -1069,6 +1069,11 @@ mod tests {
             let map = view.read(cx);
             let source = map.raster.as_ref().unwrap();
             assert_eq!(source.metadata().bounds[0], -10.0);
+            assert_eq!(
+                source.metadata().band_nr,
+                Some(1),
+                "Title scrolling must select the other file, not another band"
+            );
             let viewport = map.viewport.unwrap();
             let fitted = MapCamera::fit_bounds(source.metadata().bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get()));
             assert_eq!(map.camera, fitted, "An offscreen dataset must be centered and fitted after selection");
@@ -1087,7 +1092,7 @@ mod tests {
                     .intersects_bounds(bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get())),
                 "Restyling an offscreen dataset must not move the camera"
             );
-            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            window.click("next-raster-band", cx);
         })
         .unwrap();
         cx.run_until_parked();
@@ -1095,6 +1100,8 @@ mod tests {
             let map = view.read(cx);
             let viewport = map.viewport.unwrap();
             let bounds = map.raster.as_ref().unwrap().metadata().bounds;
+            assert_eq!(bounds[0], -10.0);
+            assert_eq!(map.raster.as_ref().unwrap().metadata().band_nr, Some(2));
             assert_eq!(
                 map.camera,
                 MapCamera::fit_bounds(bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get())),
@@ -1731,9 +1738,7 @@ mod tests {
                 assert_ne!(navigated, fitted);
                 let band = view.read(cx).raster.as_ref().unwrap().metadata().id;
                 assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().band_nr, Some(1));
-                window.click("raster-band", cx);
-                window.press("down", cx);
-                window.press("enter", cx);
+                window.click("next-raster-band", cx);
                 (fitted, navigated, band)
             })
             .unwrap();
@@ -1741,15 +1746,16 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert_ne!(view.read(cx).raster.as_ref().unwrap().metadata().id, original_band);
+            assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().band_nr, Some(2));
             assert_eq!(view.read(cx).camera, navigated, "Changing bands must preserve pan and zoom");
-            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            window.click("previous-raster-band", cx);
         })
         .unwrap();
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().id, original_band);
-            assert_eq!(view.read(cx).camera, navigated, "Scrolling the selector must not zoom the map");
+            assert_eq!(view.read(cx).camera, navigated, "Band navigation must not zoom the map");
             window.press("secondary-0", cx);
         })
         .unwrap();
@@ -1957,6 +1963,7 @@ mod tests {
             window.render_frame(cx);
             window.hover("map-surface", cx);
             let info = window.find("pixel-info");
+            assert_pixel_info_bottom_left(window);
             assert!(info.label().unwrap().contains("Lat:"));
             assert_eq!(info.label().unwrap().split_whitespace().count(), 4);
             assert!(
@@ -1975,14 +1982,13 @@ mod tests {
                 window.render_frame(cx);
                 let info = window.find("pixel-info");
                 let text = info.label().unwrap();
+                assert_pixel_info_bottom_left(window);
                 assert!(text.contains("Lat: 0.000000") && text.contains("Lon: 0.000000"), "{text}");
                 let value: f64 = text.split_whitespace().nth(4).unwrap().parse().unwrap();
                 assert!((value - 74.0).abs() <= 1.0, "Expected the first band's center value, got {value}");
                 window.hover("raster-layers-card", cx);
                 assert!(window.find("pixel-info").label().is_none(), "Controls must not sample the map underneath");
-                window.click("raster-band", cx);
-                window.press("down", cx);
-                window.press("enter", cx);
+                window.click("next-raster-band", cx);
                 value
             })
             .unwrap();
@@ -1994,6 +2000,7 @@ mod tests {
             let info = window.find("pixel-info");
             let value: f64 = info.label().unwrap().split_whitespace().nth(4).unwrap().parse().unwrap();
             assert_eq!(value, first_value + 10.0, "Band changes must invalidate the cached numeric tile");
+            assert_pixel_info_bottom_left(window);
             assert_cached_pointer_value(window, cx);
         })
         .unwrap();
@@ -2010,9 +2017,243 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert_eq!(window.find("pixel-info").label().unwrap().split_whitespace().count(), 4);
+            assert_pixel_info_bottom_left(window);
             assert!(view.read(cx).raster.is_none());
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn multiband_right_pane_stacks_below_styles_and_keeps_readout_clear_at_supported_sizes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Annual precipitation.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 5).unwrap();
+        let (view, handle) = open_test_map(size(px(1200.0), px(760.0)), cx);
+        cx.update_window(handle.into(), |_, _, cx| view.update(cx, |map, cx| map.open_paths(vec![path], cx)))
+            .unwrap();
+        cx.run_until_parked();
+        for (viewport, font_size) in [(size(px(1200.0), px(760.0)), px(16.0)), (size(px(640.0), px(400.0)), px(18.0))] {
+            cx.simulate_window_resize(handle.into(), viewport);
+            cx.update(|cx| gpui_kit::component::Theme::update(cx, |theme| theme.font_size = font_size));
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(window.rem_size(), font_size);
+                reveal_right_band_controls(window, cx);
+                assert_right_band_pane_layout(window);
+                hover_unobstructed_map(window, cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert_right_pane_readout_clear(window);
+                assert_eq!(
+                    window.find("raster-band-name").label(),
+                    Some(view.read(cx).raster.as_ref().unwrap().metadata().name.as_str())
+                );
+            })
+            .unwrap();
+            check_right_band_input(&view, handle.into(), cx);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn single_band_right_pane_also_reserves_the_readout_row_at_supported_sizes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("single-band.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
+        let (view, handle) = open_test_map(size(px(1200.0), px(760.0)), cx);
+        cx.update_window(handle.into(), |_, _, cx| view.update(cx, |map, cx| map.open_paths(vec![path], cx)))
+            .unwrap();
+        cx.run_until_parked();
+        for (viewport, font_size) in [(size(px(1200.0), px(760.0)), px(16.0)), (size(px(640.0), px(400.0)), px(18.0))] {
+            cx.simulate_window_resize(handle.into(), viewport);
+            cx.update(|cx| gpui_kit::component::Theme::update(cx, |theme| theme.font_size = font_size));
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(window.rem_size(), font_size);
+                assert!(window.try_find("raster-band-controls").is_none());
+                let map = window.find("map-surface").bounds();
+                assert!(window.find("raster-controls").bounds().bottom() <= map.bottom() - window.rem_size() * 3.0 + px(1.0));
+                hover_unobstructed_map(window, cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert_right_pane_readout_clear(window);
+            })
+            .unwrap();
+        }
+    }
+
+    fn assert_pixel_info_bottom_left(window: &Window) {
+        let map = window.find("map-surface").bounds();
+        let info = window.find("pixel-info").bounds();
+        let inset = window.rem_size() * 0.75;
+        assert!(
+            (info.left() - map.left() - inset).abs() <= px(1.0),
+            "Pixel info must stay at the map’s left inset"
+        );
+        assert!(
+            (map.bottom() - info.bottom() - inset).abs() <= px(1.0),
+            "Pixel info must stay at the map’s bottom inset"
+        );
+    }
+
+    fn reveal_right_band_controls(window: &mut Window, cx: &mut App) {
+        let controls = window.find("raster-controls").bounds();
+        // The scroll wrapper has no observation; wheel its right-hand card padding.
+        let band = window.within("raster-controls-scroll").find("raster-band-controls").bounds();
+        window.dispatch_event(
+            ScrollEvent {
+                position: point(band.right() - window.rem_size() * 0.5, controls.center().y),
+                delta: ScrollDelta::Lines(point(0.0, -30.0)),
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    }
+
+    fn hover_unobstructed_map(window: &mut Window, cx: &mut App) {
+        let map = window.find("map-surface").bounds();
+        let position = map.origin + point(map.size.width * 0.35, map.size.height * 0.25);
+        assert!(!window.find("raster-controls").bounds().contains(&position));
+        window.dispatch_event(
+            MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+    }
+
+    fn assert_right_band_pane_layout(window: &Window) {
+        let layers = window.find("raster-layers-card").bounds();
+        let range = window.find("raster-range-card").bounds();
+        let card = window.find("raster-band-controls").bounds();
+        let controls = window.find("raster-controls").bounds();
+        let map = window.find("map-surface").bounds();
+        let gap = window.rem_size() * 0.75;
+        // Layout order is meaningful even when upper cards have scrolled out of view.
+        for (above, below) in [(layers, range), (range, card)] {
+            assert!(
+                (below.top() - above.bottom() - gap).abs() <= px(1.0),
+                "Peer panes must share gap_3: {above:?}, {below:?}"
+            );
+            assert!((below.left() - above.left()).abs() <= px(1.0));
+            assert!((below.right() - above.right()).abs() <= px(1.0));
+        }
+        assert!((controls.size.width - window.rem_size() * 20.0).abs() <= px(1.0));
+        assert!((map.right() - controls.right() - gap).abs() <= px(1.0));
+        assert!((controls.top() - map.top() - gap).abs() <= px(1.0));
+        assert!(controls.bottom() <= map.bottom() - window.rem_size() * 3.0 + px(1.0));
+        assert_right_band_controls_contained(window);
+    }
+
+    fn assert_right_band_controls_contained(window: &Window) {
+        let map = window.find("map-surface").bounds();
+        let controls = window.find("raster-controls").bounds();
+        let card = window.find("raster-band-controls").bounds();
+        for id in ["raster-band-controls", "raster-band-slider", "raster-band-name"] {
+            let element = window.find(id);
+            let bounds = element.bounds();
+            assert!(element.visible(), "{id} must be revealed: {element:?}");
+            assert!(bounds.size.width > px(0.0) && bounds.size.height > px(0.0));
+            for container in [map, controls, card] {
+                assert!(
+                    bounds.left() >= container.left() && bounds.right() <= container.right(),
+                    "{id} {bounds:?} must fit {container:?}"
+                );
+                assert!(
+                    bounds.top() >= container.top() && bounds.bottom() <= container.bottom(),
+                    "{id} {bounds:?} must fit {container:?}"
+                );
+            }
+        }
+    }
+
+    fn assert_right_pane_readout_clear(window: &Window) {
+        let info = window.find("pixel-info");
+        let readout = info.bounds();
+        let text = info.label().expect("Hovering the unobstructed map must populate pixel info");
+        assert!(text.contains("Lat:") && text.contains("Lon:"), "{text}");
+        assert!(
+            text.split_whitespace().nth(4).unwrap().parse::<f64>().is_ok(),
+            "A real raster value must be visible: {text}"
+        );
+        assert_pixel_info_bottom_left(window);
+        let map = window.find("map-surface").bounds();
+        assert!(readout.left() >= map.left() && readout.right() <= map.right());
+        let controls = window.find("raster-controls").bounds();
+        assert!(
+            !controls.intersects(&readout),
+            "Right pane {controls:?} must not overlap pixel info {readout:?}"
+        );
+        assert!(controls.bottom() <= readout.top(), "The right pane must reserve the bottom readout row");
+        if let Some(card) = window.try_find("raster-band-controls") {
+            assert!(!card.bounds().intersects(&readout), "Band navigation must not cover the readout");
+        }
+    }
+
+    fn check_band_card_scroll(window: &mut Window, cx: &mut App) {
+        let layers = window.find("raster-layers-card").bounds();
+        let card = window.find("raster-band-controls").bounds();
+        let clipped_above = layers.top() < window.find("raster-controls").bounds().top();
+        window.scroll("raster-band-controls", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+        if clipped_above {
+            let shift = window.find("raster-band-controls").bounds().top() - card.top();
+            assert!(shift > px(0.0), "Wheel input over the band card must scroll the shared panel");
+            assert!((window.find("raster-layers-card").bounds().top() - layers.top() - shift).abs() <= px(1.0));
+        }
+        // Restore the bottom before dragging or clicking, including in the short window.
+        reveal_right_band_controls(window, cx);
+        assert_right_band_controls_contained(window);
+    }
+
+    fn check_right_band_input(view: &Entity<MapView>, handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
+        let camera = cx.update(|cx| view.read(cx).camera);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            check_band_card_scroll(window, cx);
+            let from = window.find("raster-band-name").bounds().center();
+            window.drag(from, from + point(px(20.0), px(0.0)), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(view.read(cx).camera, camera, "Band card gestures must not pan or zoom the map"));
+        for (id, position, band) in [
+            ("raster-band-slider", 0.5, 3),
+            ("next-raster-band", 0.5, 4),
+            ("previous-raster-band", 0.5, 3),
+            ("raster-band-slider", 0.05, 1),
+        ] {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                let bounds = window.find(id).bounds();
+                window.click_at(id, point(bounds.size.width * position, bounds.size.height * 0.5), cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update(|cx| {
+                let map = view.read(cx);
+                assert_eq!(map.raster.as_ref().unwrap().metadata().band_nr, Some(band), "{id} must remain clickable");
+                assert_eq!(map.camera, camera, "{id} must not pan or zoom the map underneath");
+                assert!(map.drag.is_none());
+                assert!(map.coast.is_none());
+            });
+        }
     }
 
     #[gpui_kit::test]
@@ -3479,9 +3720,7 @@ mod tests {
                 .to_platform_input(),
                 cx,
             );
-            window.click("raster-band", cx);
-            window.press("down", cx);
-            window.press("enter", cx);
+            window.click("next-raster-band", cx);
         })
         .unwrap();
         cx.run_until_parked();
