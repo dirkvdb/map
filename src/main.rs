@@ -15,6 +15,8 @@ mod raster_panel;
 mod raster_playback;
 mod raster_source;
 mod raster_tiles;
+mod recent_files;
+mod recent_files_picker;
 mod settings;
 mod shortcuts;
 mod vector_source;

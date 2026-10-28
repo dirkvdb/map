@@ -209,6 +209,7 @@ impl RasterDataset {
 
 #[derive(Default)]
 struct LoadedDatasets {
+    opened_paths: Vec<PathBuf>,
     sources: Vec<Arc<RasterSource>>,
     raster_datasets: Vec<RasterDataset>,
     vectors: Vec<Arc<VectorSource>>,
@@ -289,6 +290,7 @@ impl Default for PlaybackState {
 }
 
 pub struct RasterPanel {
+    recent_files: crate::recent_files::RecentFiles,
     sources: Vec<Arc<RasterSource>>,
     raster_datasets: Vec<RasterDataset>,
     source_indices: HashMap<tiler::LayerId, usize>,
@@ -375,6 +377,7 @@ impl RasterPanel {
             cx.subscribe_in(&max, window, Self::on_range_input),
         ];
         Self {
+            recent_files: initial_recent_files(),
             sources: Vec::new(),
             raster_datasets: Vec::new(),
             source_indices: HashMap::new(),
@@ -629,6 +632,12 @@ impl RasterPanel {
         }
     }
 
+    pub(crate) fn open_recent_files(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.loading {
+            crate::recent_files_picker::open(self.recent_files.paths().to_vec(), cx.weak_entity(), window, cx);
+        }
+    }
+
     pub fn prompt(&mut self, cx: &mut Context<Self>) {
         if self.loading {
             return;
@@ -711,6 +720,11 @@ impl RasterPanel {
         self.loading = false;
         self.load_progress = None;
         let installed = Instant::now();
+        for path in &loaded.opened_paths {
+            if let Err(error) = self.recent_files.record(path) {
+                log::warn!("Could not save recent files: {error:#}");
+            }
+        }
         self.install_rasters(loaded.sources, loaded.raster_datasets);
         self.vectors.extend(loaded.vectors);
         let items = self.choices();
@@ -1696,6 +1710,15 @@ async fn receive_load_progress(
     futures_lite::future::pending().await
 }
 
+fn initial_recent_files() -> crate::recent_files::RecentFiles {
+    // Headless tests must never read or overwrite the user's history.
+    if cfg!(test) {
+        crate::recent_files::RecentFiles::default()
+    } else {
+        crate::recent_files::RecentFiles::load()
+    }
+}
+
 fn load_paths(paths: Vec<PathBuf>, progress: async_channel::Sender<LoadProgress>) -> LoadedDatasets {
     let mut loaded = LoadedDatasets::default();
     let path_count = paths.len() as f64;
@@ -1731,6 +1754,7 @@ fn load_path(path: PathBuf, index: usize, path_count: f64, progress: &async_chan
         Ok(Some(opened)) => {
             loaded.selected = opened.first().map(|source| SelectionId::Vector(source.id()));
             loaded.vectors.extend(opened);
+            loaded.opened_paths.push(path.clone());
         }
         Ok(None) => match RasterSource::open(&path) {
             Ok(opened) => {
@@ -1745,6 +1769,7 @@ fn load_path(path: PathBuf, index: usize, path_count: f64, progress: &async_chan
                     loaded.selected = Some(SelectionId::Raster(first.metadata().id));
                 }
                 loaded.sources.extend(opened);
+                loaded.opened_paths.push(path.clone());
             }
             Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
         },

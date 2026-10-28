@@ -32,12 +32,13 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn workspace_key_bindings(cx: &App) -> anyhow::Result<[gpui_kit::KeyBinding; 7]> {
+fn workspace_key_bindings(cx: &App) -> anyhow::Result<[gpui_kit::KeyBinding; 8]> {
     Ok([
         key_binding("?", crate::shortcuts::ShowShortcuts, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-,", crate::settings::OpenSettings, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-\\", crate::appearance::CycleAppearance, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-o", OpenDataset, Some("RasterWorkspace"), cx)?,
+        key_binding("secondary-alt-o", crate::recent_files_picker::OpenRecentFiles, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-0", FitRaster, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-l", ToggleRasterControls, Some("RasterWorkspace"), cx)?,
         key_binding("secondary-shift-d", ToggleTileBoundaries, Some("RasterWorkspace"), cx)?,
@@ -910,6 +911,11 @@ impl Render for MapView {
             }))
             .on_action(|_: &crate::appearance::CycleAppearance, window, cx| crate::appearance::cycle_mode(window, cx))
             .on_action(cx.listener(|view, _: &OpenDataset, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx))))
+            .on_action(cx.listener(|view, _: &crate::recent_files_picker::OpenRecentFiles, window, cx| {
+                view.coast = None;
+                view.drag = None;
+                view.raster_panel.update(cx, |panel, cx| panel.open_recent_files(window, cx));
+            }))
             .on_action(cx.listener(|view, _: &FitRaster, _, cx| view.raster_panel.update(cx, |panel, cx| panel.fit(cx))))
             .on_action(cx.listener(|view, _: &ClearRasters, window, cx| view.raster_panel.update(cx, |panel, cx| panel.clear(window, cx))))
             .on_action(cx.listener(|view, _: &ToggleRasterControls, window, cx| view.raster_panel.update(cx, |panel, cx| panel.toggle_controls(window, cx))))

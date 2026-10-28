@@ -34,6 +34,13 @@ pub(crate) fn open(window: &mut Window, cx: &mut App) {
                             window,
                         ))
                         .child(shortcut(
+                            "shortcut-recent-files",
+                            "Open recent file…",
+                            &crate::recent_files_picker::OpenRecentFiles,
+                            "RasterWorkspace",
+                            window,
+                        ))
+                        .child(shortcut(
                             "shortcut-fit",
                             "Fit raster",
                             &crate::raster_panel::FitRaster,
@@ -70,21 +77,23 @@ pub(crate) fn open(window: &mut Window, cx: &mut App) {
                         ))
                         .child(shortcut("shortcut-help", "Keyboard shortcuts", &ShowShortcuts, "RasterWorkspace", window)),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(section_heading("Map navigation", cx))
-                        .child(shortcut("shortcut-zoom-in", "Zoom in", &crate::map_view::ZoomIn, "MapNavigation", window))
-                        .child(shortcut("shortcut-zoom-out", "Zoom out", &crate::map_view::ZoomOut, "MapNavigation", window))
-                        .child(shortcut("shortcut-pan-left", "Pan left", &crate::map_view::PanLeft, "MapNavigation", window))
-                        .child(shortcut("shortcut-pan-right", "Pan right", &crate::map_view::PanRight, "MapNavigation", window))
-                        .child(shortcut("shortcut-pan-up", "Pan up", &crate::map_view::PanUp, "MapNavigation", window))
-                        .child(shortcut("shortcut-pan-down", "Pan down", &crate::map_view::PanDown, "MapNavigation", window)),
-                ),
+                .child(map_navigation_shortcuts(window, cx)),
         )
     });
+}
+
+fn map_navigation_shortcuts(window: &Window, cx: &App) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(section_heading("Map navigation", cx))
+        .child(shortcut("shortcut-zoom-in", "Zoom in", &crate::map_view::ZoomIn, "MapNavigation", window))
+        .child(shortcut("shortcut-zoom-out", "Zoom out", &crate::map_view::ZoomOut, "MapNavigation", window))
+        .child(shortcut("shortcut-pan-left", "Pan left", &crate::map_view::PanLeft, "MapNavigation", window))
+        .child(shortcut("shortcut-pan-right", "Pan right", &crate::map_view::PanRight, "MapNavigation", window))
+        .child(shortcut("shortcut-pan-up", "Pan up", &crate::map_view::PanUp, "MapNavigation", window))
+        .child(shortcut("shortcut-pan-down", "Pan down", &crate::map_view::PanDown, "MapNavigation", window))
 }
 
 fn section_heading(title: &'static str, cx: &App) -> impl IntoElement {

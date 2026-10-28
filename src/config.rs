@@ -22,12 +22,7 @@ impl ConfigPaths {
 
     pub(crate) fn discover() -> anyhow::Result<Self> {
         let project = ProjectDirs::from("", "", "map").context("The configuration directory is unavailable")?;
-        let state = std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| BaseDirs::new().map(|dirs| dirs.home_dir().join(".local/state")))
-            .context("The state directory is unavailable")?;
-        Ok(Self::new(project.config_dir().join("config.json"), state.join("map/config.json")))
+        Ok(Self::new(project.config_dir().join("config.json"), state_dir()?.join("config.json")))
     }
 
     fn read_path(&self) -> anyhow::Result<&Path> {
@@ -81,6 +76,15 @@ impl ConfigPaths {
     }
 }
 
+pub(crate) fn state_dir() -> anyhow::Result<PathBuf> {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| BaseDirs::new().map(|dirs| dirs.home_dir().join(".local/state")))
+        .map(|path| path.join("map"))
+        .context("The state directory is unavailable")
+}
+
 fn exists(path: &Path) -> anyhow::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -126,7 +130,7 @@ fn permissions_allow_write(metadata: &fs::Metadata, _: bool) -> bool {
     !metadata.permissions().readonly()
 }
 
-fn write_json(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_json(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     let directory = path.parent().context("The settings path has no parent directory")?;
     fs::create_dir_all(directory).with_context(|| format!("Could not create {}", directory.display()))?;
     // A same-directory temporary file keeps replacement atomic and private (0600 on Unix).
