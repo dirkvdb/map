@@ -1627,6 +1627,138 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
+    fn clamp_colors_masks_only_outside_raw_and_physical_ranges_without_reloading_tiles() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("clamp-scaled.tif");
+        let source = scaled_band_sources(&path)?.remove(1);
+        assert!(source.clamp_colors(), "Endpoint clamping must remain the default");
+        assert_eq!(source.scale(), geo::RasterScale { scale: -2.0, offset: 200.0 });
+        let (mut map, request, background) = clamp_test_map(&source)?;
+        let counts = map.numeric.borrow().tile_counts();
+        assert!(counts.0 > 0 && counts.1 > 0, "Warm the raw tile cache before toggling clamping");
+        std::fs::rename(&path, path.with_extension("cached.tif"))?;
+
+        for (physical, value) in [(false, 40.0), (true, 120.0)] {
+            let units = source.with_unscaling(physical)?;
+            for (range, visible, gray) in [
+                ((value + 1.0, value + 10.0), false, 0),
+                ((value - 10.0, value - 1.0), false, 255),
+                ((value, value + 10.0), true, 0),
+                ((value - 10.0, value), true, 255),
+            ] {
+                let clamped = units.restyled(inf::colormap::ColorMapPreset::Gray, range)?;
+                assert_clamp_range_roundtrip(&mut map, request, clamped, &background, visible, gray)?;
+                assert_eq!(
+                    map.numeric.borrow().tile_counts(),
+                    counts,
+                    "Clamp/unit/range changes must reuse raw tiles without uploads"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn clamp_test_map(source: &Arc<RasterSource>) -> Result<(NativeMap, MapRequest, RgbaImage)> {
+        let viewport = Viewport {
+            width: NonZeroU32::new(256).unwrap(),
+            height: NonZeroU32::new(256).unwrap(),
+            scale: 1.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::fit_bounds(source.metadata().bounds, 256.0, 256.0),
+        };
+        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
+        let background = map.render(request)?;
+        map.render_raster(request, Some(source.clone()), 1.0)?;
+        Ok((map, request, background))
+    }
+
+    fn assert_clamp_range_roundtrip(
+        map: &mut NativeMap,
+        request: MapRequest,
+        clamped: Arc<RasterSource>,
+        background: &RgbaImage,
+        visible: bool,
+        gray: u8,
+    ) -> Result<()> {
+        let reference = map.render_raster(request, Some(clamped.clone()), 1.0)?;
+        assert_legend_center(&reference, image::Rgba([gray, gray, gray, 255]));
+        let unclamped = clamped.with_clamp_colors(false)?;
+        assert!(!unclamped.clamp_colors());
+        let clipped = map.render_raster(request, Some(unclamped.clone()), 1.0)?;
+        let expected = if visible { &reference } else { background };
+        assert_eq!(
+            clipped.get_pixel(128, 128),
+            expected.get_pixel(128, 128),
+            "Only values strictly outside the display range must disappear: physical={}, range={:?}",
+            clamped.unscaling_enabled(),
+            clamped.range()
+        );
+        let restored = map.render_raster(request, Some(unclamped.with_clamp_colors(true)?), 1.0)?;
+        assert_eq!(restored.as_raw(), reference.as_raw(), "Re-enabling clamping must restore the original pixels");
+        for image in [&reference, &clipped, &restored] {
+            assert_eq!(image.get_pixel(16, 128), background.get_pixel(16, 128), "Nodata must stay transparent");
+        }
+        assert!(clamped.clamp_colors(), "Toggling must not mutate the original snapshot");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only local raster data"]
+    fn band_fades_keep_current_and_previous_clamp_colors_independent() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("clamp-fades.tif");
+        let sources = open_nodata_band_fixture(&path)?;
+        let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 50.0))?;
+        let second = sources[1].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
+        let (mut map, request, background) = clamp_test_map(&first)?;
+        let endpoints = raster_fade_endpoints(&mut map, request, &[first.clone(), second.clone()])?;
+        let counts = map.numeric.borrow().tile_counts();
+        assert!(counts.0 > 0 && counts.1 > 0);
+        std::fs::rename(&path, path.with_extension("cached.tif"))?;
+        assert_cached_clamp_fades(&mut map, request, &first, &second, &endpoints, &background)?;
+        assert_eq!(
+            map.numeric.borrow().tile_counts(),
+            counts,
+            "Fading clamp snapshots must reuse both bands' raw tiles"
+        );
+        Ok(())
+    }
+
+    fn assert_cached_clamp_fades(
+        map: &mut NativeMap,
+        request: MapRequest,
+        first: &RasterSource,
+        second: &RasterSource,
+        endpoints: &[RgbaImage],
+        background: &RgbaImage,
+    ) -> Result<()> {
+        for (previous_clamps, current_clamps) in [(false, true), (true, false)] {
+            let previous = first.with_clamp_colors(previous_clamps)?;
+            let current = second.with_clamp_colors(current_clamps)?;
+            let (outgoing, incoming) = nodata_fade_endpoints(map, request, previous, &current)?;
+            let expected_outgoing = if previous_clamps { &endpoints[0] } else { background };
+            let expected_incoming = if current_clamps { &endpoints[1] } else { background };
+            assert_eq!(
+                outgoing.as_raw(),
+                expected_outgoing.as_raw(),
+                "The previous band's clamp flag must control its endpoint"
+            );
+            assert_eq!(
+                incoming.as_raw(),
+                expected_incoming.as_raw(),
+                "The current band's clamp flag must control its endpoint"
+            );
+            map.set_raster(Some(current), 0.6)?;
+            map.apply_request(request);
+            assert_nodata_band_fade(map, &outgoing, &incoming)?;
+        }
+        Ok(())
+    }
+
     fn scaled_band_sources(path: &std::path::Path) -> Result<Vec<Arc<RasterSource>>> {
         crate::raster_source::test_support::write_raster(path, 4326, 2)?;
         let mut dataset = gdal::Dataset::open_ex(
@@ -2677,7 +2809,7 @@ mod tests {
     fn assert_nodata_band_fade(map: &mut NativeMap, outgoing: &RgbaImage, incoming: &RgbaImage) -> Result<()> {
         let a = f32::from(outgoing.get_pixel(128, 128)[0]);
         let b = f32::from(incoming.get_pixel(128, 128)[0]);
-        assert!(b - a > 50.0, "The fixture needs distinguishable endpoint colors");
+        assert!((b - a).abs() > 50.0, "The fixture needs distinguishable endpoint colors");
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut intermediate = false;
         loop {

@@ -34,6 +34,7 @@ struct DrawUniform {
     tile_size: f32,
     padding: f32,
     tile_id: [u32; 4],
+    clamp_colors: [u32; 4],
 }
 
 struct TileTexture {
@@ -428,6 +429,12 @@ impl RasterLayer {
                 tile_size: (512.0 * parameters.zoom.exp2() / f64::from(1_u32 << tile.z)) as f32,
                 padding: 0.0,
                 tile_id: [tile.z as u32, tile.x as u32, tile.y as u32, 0],
+                clamp_colors: [
+                    u32::from(source.clamp_colors()),
+                    u32::from(self.previous.as_ref().map_or(source.clamp_colors(), |previous| previous.source.clamp_colors())),
+                    0,
+                    0,
+                ],
             }),
         );
         pass.set_bind_group(0, &draw.bindings, &[]);

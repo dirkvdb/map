@@ -26,6 +26,7 @@ pub struct RasterSource {
     metadata: Arc<LayerMetadata>,
     source_files: Option<Arc<tempfile::TempDir>>,
     unscaling_enabled: bool,
+    clamp_colors: bool,
     legend: Legend,
     palette: ColorMapPreset,
     color_map_direction: ColorMapDirection,
@@ -64,6 +65,7 @@ impl RasterSource {
             ColorMapDirection::Regular,
             range,
             unscaling_enabled,
+            true,
         )
     }
 
@@ -74,6 +76,7 @@ impl RasterSource {
         color_map_direction: ColorMapDirection,
         range: (f32, f32),
         unscaling_enabled: bool,
+        clamp_colors: bool,
     ) -> Result<Arc<Self>> {
         ensure!(valid_range(range), "Minimum must be less than maximum; both must be finite numbers.");
         let legend = Legend::linear(&ColorMap::Preset(palette, color_map_direction), range.0..range.1, None)?;
@@ -83,6 +86,7 @@ impl RasterSource {
             metadata,
             source_files,
             unscaling_enabled,
+            clamp_colors,
             legend,
             palette,
             color_map_direction,
@@ -100,6 +104,7 @@ impl RasterSource {
             self.color_map_direction,
             range,
             self.unscaling_enabled,
+            self.clamp_colors,
         )
     }
 
@@ -112,6 +117,25 @@ impl RasterSource {
             direction,
             self.range,
             self.unscaling_enabled,
+            self.clamp_colors,
+        )
+    }
+
+    /// Whether out-of-range values use the nearest endpoint color rather than nodata.
+    pub fn clamp_colors(&self) -> bool {
+        self.clamp_colors
+    }
+
+    /// Changes out-of-range rendering without reloading numeric data.
+    pub fn with_clamp_colors(&self, enabled: bool) -> Result<Arc<Self>> {
+        Self::styled(
+            self.metadata.clone(),
+            self.source_files.clone(),
+            self.palette,
+            self.color_map_direction,
+            self.range,
+            self.unscaling_enabled,
+            enabled,
         )
     }
 
@@ -154,6 +178,7 @@ impl RasterSource {
             self.color_map_direction,
             range,
             enabled,
+            self.clamp_colors,
         )
     }
 
@@ -1557,6 +1582,42 @@ mod tests {
         assert_eq!(physical.palette_rgba(), restyled.palette_rgba());
         assert_eq!(raw.palette_rgba(), restyled.palette_rgba());
         assert_eq!(raw.legend().total_value_range(), 20.0..=40.0);
+        Ok(())
+    }
+
+    #[test]
+    fn clamp_colors_defaults_on_and_survives_style_and_unit_snapshots_without_reads() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = open_scaled_fixture(dir.path(), Some(-2.0), Some(10.0))?;
+        assert!(source.clamp_colors());
+        std::fs::remove_file(&source.metadata().path)?;
+        let unclamped = source.with_clamp_colors(false)?;
+        let restyled = unclamped.restyled(ColorMapPreset::Blues, (-70.0, -30.0))?;
+        let reversed = restyled.with_color_map_direction(ColorMapDirection::Reversed)?;
+        let raw = reversed.with_unscaling(false)?;
+        let physical = raw.with_unscaling(true)?;
+        for snapshot in [&unclamped, &restyled, &reversed, &raw, &physical] {
+            assert!(!snapshot.clamp_colors());
+            assert_shared_raster_snapshot(&source, snapshot);
+        }
+        assert_eq!(unclamped.range(), source.range());
+        assert_eq!(unclamped.palette_rgba(), source.palette_rgba());
+        assert_eq!(raw.range(), (20.0, 40.0));
+        assert_eq!(physical.range(), restyled.range());
+        assert!(source.clamp_colors(), "Snapshots must not mutate the original style");
+        Ok(())
+    }
+
+    #[test]
+    fn clamp_colors_can_be_reenabled_without_changing_palette_or_range() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = open_scaled_fixture(dir.path(), None, None)?;
+        let unclamped = source.with_clamp_colors(false)?;
+        let restored = unclamped.with_clamp_colors(true)?;
+        assert!(restored.clamp_colors());
+        assert!(!unclamped.clamp_colors());
+        assert_eq!(restored.range(), source.range());
+        assert_eq!(restored.palette_rgba(), source.palette_rgba());
         Ok(())
     }
 

@@ -888,6 +888,25 @@ impl RasterPanel {
         }
     }
 
+    fn set_clamp_colors(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let Some(source) = self.active() else { return };
+        if source.clamp_colors() == enabled {
+            return;
+        }
+        match source.with_clamp_colors(enabled) {
+            Ok(source) => {
+                self.replace_raster(source);
+                self.error = None;
+                self.watch_tile_errors(cx);
+                self.emit(false, cx);
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not change color clamping: {error}").into());
+                cx.notify();
+            }
+        }
+    }
+
     fn reset_range(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(range) = self.data_range() else { return };
         self.set_range_inputs(range, window, cx);
@@ -1288,6 +1307,14 @@ impl RasterPanel {
                         ),
                     ),
             )
+            .children(self.active().filter(|source| source.is_numeric()).map(|source| {
+                Checkbox::new("raster-clamp-colors")
+                    .small()
+                    .label("Clamp colors")
+                    .checked(source.clamp_colors())
+                    .tooltip("Use endpoint colors outside the range; when off, render those values as nodata")
+                    .on_change(cx.listener(|this, enabled, _, cx| this.set_clamp_colors(*enabled, cx)))
+            }))
             .children(self.active().filter(|source| source.has_scale_metadata()).map(|source| {
                 Checkbox::new("raster-unscaling")
                     .small()
@@ -2609,6 +2636,67 @@ mod tests {
                 .unwrap();
             }
         }
+    }
+
+    #[gpui_kit::test]
+    fn clamp_colors_checkbox_updates_style_and_retains_per_band_state_through_the_ui(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[2]);
+        let (panel, handle) = open_test_panel(cx, 900.0);
+        load_test_paths(&panel, handle, paths, cx);
+        let events = record_events(&panel, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let original = panel.read(cx).active().unwrap().clone();
+            assert_eq!(window.within("raster-range-card").find("raster-clamp-colors").label(), Some("Clamp colors"));
+            assert_eq!(window.find("raster-clamp-colors").checked(), Some(true));
+            assert!(window.find("raster-clamp-colors").bounds().top() >= window.find("raster-max").bounds().bottom());
+            window.click("raster-clamp-colors", cx);
+            let unclamped = panel.read(cx).active().unwrap().clone();
+            assert!(!unclamped.clamp_colors());
+            assert_eq!(unclamped.metadata().id, original.metadata().id);
+            assert_eq!(unclamped.range(), original.range());
+            assert_eq!(unclamped.palette(), original.palette());
+            assert_eq!(window.find("raster-clamp-colors").checked(), Some(false));
+            window.click("next-raster-band", cx);
+            assert_ne!(panel.read(cx).active().unwrap().metadata().id, original.metadata().id);
+            assert!(panel.read(cx).active().unwrap().clamp_colors());
+            assert_eq!(window.find("raster-clamp-colors").checked(), Some(true));
+            window.click("previous-raster-band", cx);
+            assert_eq!(panel.read(cx).active().unwrap().metadata().id, original.metadata().id);
+            assert!(!panel.read(cx).active().unwrap().clamp_colors());
+            assert_eq!(window.find("raster-clamp-colors").checked(), Some(false));
+            window.click("reset-raster-range", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("raster-clamp-colors").checked(),
+                Some(false),
+                "Resetting the range must retain clamping mode"
+            );
+            window.click("raster-min", cx);
+            for _ in 0..20 {
+                if window.find("raster-clamp-colors").focused() == Some(true) {
+                    break;
+                }
+                window.press("tab", cx);
+            }
+            assert_eq!(window.find("raster-clamp-colors").focused(), Some(true));
+            window.press("space", cx);
+            assert_eq!(window.find("raster-clamp-colors").checked(), Some(true));
+            assert!(panel.read(cx).active().unwrap().clamp_colors());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(events.read(cx).last().unwrap().source().unwrap().clamp_colors());
+            assert!(events.read(cx).iter().all(|event| !event.fit));
+            assert!(panel.read(cx).active().unwrap().clamp_colors());
+        });
     }
 
     #[gpui_kit::test]
