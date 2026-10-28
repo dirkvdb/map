@@ -292,7 +292,7 @@ impl VectorSource {
             points_only,
             property: range.map(|_| 0),
             numeric_properties: numeric_properties.into(),
-            palette: ColorMapPreset::Terrain,
+            palette: ColorMapPreset::Turbo,
             range,
         }
     }

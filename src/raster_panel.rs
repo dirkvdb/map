@@ -12,7 +12,9 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IndexPath, Sizable};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
     PathPromptOptions, Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, WeakEntity,
@@ -25,7 +27,32 @@ use crate::vector_source::{VectorLoadProgress, VectorSource};
 
 gpui_kit::actions!(raster, [OpenDataset, FitRaster, ClearRasters, ToggleRasterControls]);
 
-const PALETTES: [&str; 5] = ["Terrain", "Blues", "Gray", "Turbo", "Spectral"];
+const PALETTES: [(&str, ColorMapPreset); 24] = [
+    ("Blues", ColorMapPreset::Blues),
+    ("BrBG", ColorMapPreset::BrBg),
+    ("Cool", ColorMapPreset::Cool),
+    ("Copper", ColorMapPreset::Copper),
+    ("GistEarth", ColorMapPreset::GistEarth),
+    ("Gray", ColorMapPreset::Gray),
+    ("Greens", ColorMapPreset::Greens),
+    ("Hot", ColorMapPreset::Hot),
+    ("Jet", ColorMapPreset::Jet),
+    ("Oranges", ColorMapPreset::Oranges),
+    ("PiYG", ColorMapPreset::PiYg),
+    ("PRGn", ColorMapPreset::PrGn),
+    ("PuOr", ColorMapPreset::PuOr),
+    ("Purples", ColorMapPreset::Purples),
+    ("RdBu", ColorMapPreset::RdBu),
+    ("RdGy", ColorMapPreset::RdGy),
+    ("RdYlBu", ColorMapPreset::RdYlBu),
+    ("RdYlGn", ColorMapPreset::RdYlGn),
+    ("Reds", ColorMapPreset::Reds),
+    ("Spectral", ColorMapPreset::Spectral),
+    ("Terrain", ColorMapPreset::Terrain),
+    ("Turbo", ColorMapPreset::Turbo),
+    ("YlGnBu", ColorMapPreset::YlGnBu),
+    ("YlOrRd", ColorMapPreset::YlOrRd),
+];
 const LOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(60);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -171,7 +198,11 @@ impl EventEmitter<RasterEvent> for RasterPanel {}
 impl RasterPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let bands = cx.new(|cx| SelectState::new(Vec::<BandChoice>::new(), None, window, cx));
-        let palette = cx.new(|cx| SelectState::new(PALETTES.to_vec(), Some(IndexPath::default()), window, cx));
+        let palette = cx.new(|cx| {
+            let items = PALETTES.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+            let selected = items.iter().position(|name| *name == "Turbo").map(IndexPath::new);
+            SelectState::new(items, selected, window, cx)
+        });
         let property = cx.new(|cx| SelectState::new(SearchableVec::new(Vec::<SharedString>::new()), None, window, cx).searchable(true));
         let opacity = cx.new(|_| SliderState::new().min(0.0).max(100.0).step(1.0).default_value(100.0));
         let band_slider = cx.new(|_| SliderState::new().min(1.0).max(1.0).step(1.0).default_value(1.0));
@@ -204,11 +235,7 @@ impl RasterPanel {
             }),
             cx.subscribe_in(&range_slider, window, |this, _, event: &SliderEvent, window, cx| {
                 if let SliderEvent::Change(value) = event {
-                    let (min, max) = this.range_domain;
-                    let start = range_value((min, max), f64::from(value.start()) / 1000.0);
-                    let end = range_value((min, max), f64::from(value.end()) / 1000.0);
-                    this.set_range_inputs((start, end), window, cx);
-                    this.apply_style(window, cx);
+                    this.apply_slider_range((value.start(), value.end()), window, cx);
                 }
             }),
             cx.subscribe_in(&min, window, Self::on_range_input),
@@ -427,12 +454,12 @@ impl RasterPanel {
         if self.color_range().is_none() {
             return;
         }
-        let Some(ix) = PALETTES.iter().position(|palette| Some(palette) == self.palette.read(cx).selected_value()) else {
+        let Some(ix) = PALETTES.iter().position(|(name, _)| Some(name) == self.palette.read(cx).selected_value()) else {
             return;
         };
         let next = scroll_index(event, &mut self.palette_scroll, ix, PALETTES.len(), cx);
         if next != ix {
-            self.palette.update(cx, |state, cx| state.set_selected_value(&PALETTES[next], window, cx));
+            self.palette.update(cx, |state, cx| state.set_selected_value(&PALETTES[next].0, window, cx));
             self.apply_style(window, cx);
         }
     }
@@ -604,6 +631,15 @@ impl RasterPanel {
             .or_else(|| self.active_vector().filter(|source| source.property().is_some()).map(|source| source.palette()))
     }
 
+    fn apply_slider_range(&mut self, positions: (f32, f32), window: &mut Window, cx: &mut Context<Self>) {
+        let Some(range) = slider_range(self.range_domain, positions, self.active().is_some()) else {
+            self.sync_range_slider(window, cx);
+            return;
+        };
+        self.set_range_inputs(range, window, cx);
+        self.apply_style(window, cx);
+    }
+
     fn set_range_inputs(&self, range: (f64, f64), window: &mut Window, cx: &mut Context<Self>) {
         let format = |value: f64| if self.active().is_some() { format!("{value:.2}") } else { value.to_string() };
         self.min.update(cx, |input, cx| input.set_value(format(range.0), window, cx));
@@ -642,13 +678,7 @@ impl RasterPanel {
             self.set_range_inputs(range, window, cx);
         }
         if let Some(preset) = self.color_palette() {
-            let palette = match preset {
-                ColorMapPreset::Gray => "Gray",
-                ColorMapPreset::Blues => "Blues",
-                ColorMapPreset::Turbo => "Turbo",
-                ColorMapPreset::Spectral => "Spectral",
-                _ => "Terrain",
-            };
+            let palette = PALETTES.iter().find(|(_, value)| *value == preset).map_or("Turbo", |(name, _)| *name);
             self.palette.update(cx, |state, cx| state.set_selected_value(&palette, window, cx));
         }
         self.sync_range_slider(window, cx);
@@ -754,13 +784,10 @@ impl RasterPanel {
     }
 
     fn selected_palette(&self, cx: &App) -> ColorMapPreset {
-        match self.palette.read(cx).selected_value().copied() {
-            Some("Gray") => ColorMapPreset::Gray,
-            Some("Blues") => ColorMapPreset::Blues,
-            Some("Turbo") => ColorMapPreset::Turbo,
-            Some("Spectral") => ColorMapPreset::Spectral,
-            _ => ColorMapPreset::Terrain,
-        }
+        PALETTES
+            .iter()
+            .find(|(name, _)| Some(name) == self.palette.read(cx).selected_value())
+            .map_or(ColorMapPreset::Turbo, |(_, preset)| *preset)
     }
 
     fn restyle_active_source(&mut self, cx: &App) -> anyhow::Result<()> {
@@ -813,36 +840,46 @@ impl RasterPanel {
         let dataset = self.active_dataset().filter(|dataset| dataset.bands.len() > 1)?;
         let count = dataset.bands.len();
         let band = dataset.bands.iter().position(|&id| id == dataset.selected)? + 1;
-        let label = format!("Band {band} of {count}");
-        let name = self.active()?.metadata().name.clone();
+        let metadata = self.active()?.metadata();
+        let name = if metadata.source_format == tiler::LayerSourceType::Netcdf && metadata.description.is_empty() {
+            metadata.name.as_str()
+        } else {
+            metadata.description.as_str()
+        };
+        let label = band_title(name, band, count);
+        let tooltip_label = label.clone();
         Some(
             overlay_card("raster-band-controls", cx)
                 .w_full()
                 .child(
                     div()
                         .flex()
-                        .flex_col()
-                        .gap_1()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(Icon::new(IconName::Layers).small())
                         .child(
-                            div().flex().items_center().gap_2().child(Icon::new(IconName::Layers).small()).child(
+                            div().id("raster-band-name").test_support().flex_1().min_w_0().child(
                                 div()
                                     .id("raster-band-label")
                                     .test_support()
                                     .aria_label(label.clone())
                                     .font_weight(FontWeight::SEMIBOLD)
+                                    .when(label.chars().count() > 32, |title| title.text_sm())
+                                    .when(label.chars().count() > 64, |title| title.text_xs())
+                                    .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).max_w_96().build(window, cx))
+                                    .truncate()
                                     .child(label),
                             ),
                         )
-                        .child(
+                        .children((!name.trim().is_empty()).then(|| {
                             div()
-                                .id("raster-band-name")
+                                .id("raster-band-number")
                                 .test_support()
-                                .aria_label(name.clone())
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .truncate()
-                                .child(name),
-                        ),
+                                .child(band.to_string())
+                        })),
                 )
                 .child(
                     div()
@@ -859,13 +896,12 @@ impl RasterPanel {
                                 .on_click(cx.listener(move |this, _, window, cx| this.select_band(band - 1, window, cx))),
                         )
                         .child(
-                            div()
-                                .id("raster-band-slider")
-                                .test_support()
-                                .flex_1()
-                                .min_w_0()
-                                .px_2()
-                                .child(Slider::new(&self.band_slider).accessibility_label("Band")),
+                            div().id("raster-band-slider").test_support().flex_1().min_w_0().px_2().child(
+                                Slider::new(&self.band_slider)
+                                    .accessibility_label("Band")
+                                    .bg(cx.theme().foreground)
+                                    .text_color(cx.theme().background),
+                            ),
                         )
                         .child(
                             Button::new("next-raster-band")
@@ -876,7 +912,8 @@ impl RasterPanel {
                                 .disabled(band == count)
                                 .on_click(cx.listener(move |this, _, window, cx| this.select_band(band + 1, window, cx))),
                         ),
-                ),
+                )
+                .child(render_band_ticks(count, cx)),
         )
     }
 
@@ -1222,6 +1259,55 @@ fn scroll_index(event: &ScrollEvent, scroll: &mut f32, ix: usize, count: usize, 
     (ix as f32 - steps).clamp(0.0, (count - 1) as f32) as usize
 }
 
+fn band_title(name: &str, band: usize, count: usize) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        format!("Band {band}/{count}")
+    } else {
+        format!("Band {name}")
+    }
+}
+
+fn band_tick_values(count: usize) -> Vec<usize> {
+    let intervals = (count - 1).min(12);
+    (0..=intervals).map(|tick| 1 + tick * (count - 1) / intervals).collect()
+}
+
+fn render_band_ticks(count: usize, cx: &App) -> impl IntoElement + use<> {
+    div()
+        .id("raster-band-ticks")
+        .test_support()
+        .relative()
+        // Match the small navigation buttons, row gaps, and slider's thumb inset.
+        .mx_11()
+        .mt_neg_3()
+        .h_6()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .children(band_tick_values(count).into_iter().enumerate().map(|(tick, band)| {
+            let major = tick % 2 == 0 || count <= 7 || band == count;
+            div()
+                .id(("raster-band-tick", band))
+                .test_support()
+                .aria_label(band.to_string())
+                .absolute()
+                .left(gpui_kit::relative((band - 1) as f32 / (count - 1) as f32))
+                .ml_neg_4()
+                .w_8()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .border_l_1()
+                        .border_color(cx.theme().muted_foreground)
+                        .h(gpui_kit::rems(if major { 0.375 } else { 0.25 })),
+                )
+                .children(major.then(|| band.to_string()))
+        }))
+}
+
 fn overlay_card(id: &'static str, cx: &App) -> impl IntoElement + ParentElement + Styled + InteractiveElement + use<> {
     div()
         .id(id)
@@ -1246,6 +1332,17 @@ fn field_label(label: &'static str, cx: &App) -> impl IntoElement {
         .font_weight(FontWeight::MEDIUM)
         .text_color(cx.theme().muted_foreground)
         .child(label)
+}
+
+fn slider_range(domain: (f64, f64), positions: (f32, f32), raster: bool) -> Option<(f64, f64)> {
+    let mut min = range_value(domain, f64::from(positions.0) / 1000.0);
+    let mut max = range_value(domain, f64::from(positions.1) / 1000.0);
+    if raster {
+        // Validate the same precision used by the inputs and raster styling.
+        min = f64::from(format!("{min:.2}").parse::<f32>().ok()?);
+        max = f64::from(format!("{max:.2}").parse::<f32>().ok()?);
+    }
+    (min.is_finite() && max.is_finite() && min < max).then_some((min, max))
 }
 
 // Keep interpolation finite even for ranges spanning both f64 extremes.
@@ -1289,6 +1386,82 @@ mod tests {
     use gpui_kit::{TestAppContext, point, px, size};
 
     use super::*;
+
+    #[gpui_kit::test]
+    fn band_title_uses_band_metadata_in_the_rendered_selector(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&directory, &[3]);
+        std::fs::write(
+            paths[0].with_extension("tif.aux.xml"),
+            "<PAMDataset><PAMRasterBand band=\"1\"><Description>Near infrared</Description></PAMRasterBand></PAMDataset>",
+        )
+        .unwrap();
+        let (panel, handle) = open_test_panel(cx, 760.0);
+        load_test_paths(&panel, handle, paths, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("raster-band-label").label(), Some("Band Near infrared"));
+            assert!(window.find("raster-band-number").visible());
+        })
+        .unwrap();
+        click_band_slider(&panel, handle, 0.5, 2, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("raster-band-label").label(), Some("Band 2/3"));
+            assert!(window.try_find("raster-band-number").is_none());
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn band_titles_prefer_metadata_and_fall_back_to_one_based_indices() {
+        assert_eq!(band_title("Near infrared", 2, 5), "Band Near infrared");
+        assert_eq!(band_title("  ", 2, 5), "Band 2/5");
+        assert_eq!(band_title("", 1, 5), "Band 1/5");
+    }
+
+    #[test]
+    fn band_ticks_include_endpoints_and_bound_large_scales() {
+        assert_eq!(band_tick_values(2), [1, 2]);
+        assert_eq!(band_tick_values(5), [1, 2, 3, 4, 5]);
+        let ticks = band_tick_values(1000);
+        assert_eq!(ticks.len(), 13);
+        assert_eq!(ticks.first(), Some(&1));
+        assert_eq!(ticks.last(), Some(&1000));
+        assert!(ticks.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn palette_names_are_unique_and_alphabetically_sorted() {
+        assert!(PALETTES.windows(2).all(|pair| pair[0].0.to_ascii_lowercase() < pair[1].0.to_ascii_lowercase()));
+    }
+
+    #[gpui_kit::test]
+    fn every_palette_can_be_scrolled_applied_and_restored(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[1]);
+        let (panel, handle) = open_test_panel(cx, 760.0);
+        load_test_paths(&panel, handle, paths, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(panel.read(cx).palette.read(cx).selected_value(), Some(&"Turbo"));
+            for _ in 0..PALETTES.len() {
+                window.scroll("raster-palette", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            }
+            for (name, preset) in PALETTES {
+                assert_eq!(panel.read(cx).active().unwrap().palette(), preset);
+                panel.update(cx, |panel, cx| {
+                    panel.palette.update(cx, |state, cx| state.set_selected_index(None, window, cx));
+                    panel.sync_color_controls(window, cx);
+                });
+                assert_eq!(panel.read(cx).palette.read(cx).selected_value(), Some(&name));
+                window.scroll("raster-palette", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+            }
+        })
+        .unwrap();
+    }
 
     struct PanelHarness(Entity<RasterPanel>);
 
@@ -1469,8 +1642,7 @@ mod tests {
             assert_eq!(panel.choices().len(), 1);
             assert_eq!(panel.sources.len(), 3);
             assert_ne!(panel.active().unwrap().metadata().id, original);
-            assert_eq!(window.find("raster-band-label").label(), Some("Band 1 of 3"));
-            assert_eq!(window.find("raster-band-name").label(), Some(panel.active().unwrap().metadata().name.as_str()));
+            assert_eq!(window.find("raster-band-label").label(), Some("Band 1/3"));
         })
         .unwrap();
     }
@@ -1488,7 +1660,11 @@ mod tests {
             .update_window(handle.into(), |_, window, cx| {
                 window.render_frame(cx);
                 assert_band_card_below_peer_panes(window);
-                assert_eq!(window.find("raster-band-label").label(), Some("Band 1 of 5"));
+                assert_eq!(window.find("raster-band-label").label(), Some("Band 1/5"));
+                assert!(window.find("raster-band-ticks").visible());
+                for band in 1_usize..=5 {
+                    assert!(window.find(("raster-band-tick", band)).visible());
+                }
                 band_slider_snapshot(window).path().to_vec()
             })
             .unwrap();
@@ -1497,7 +1673,7 @@ mod tests {
             cx.update_window(handle.into(), |_, window, cx| {
                 window.render_frame(cx);
                 assert_eq!(band_slider_snapshot(window).path(), identity);
-                assert_eq!(window.find("raster-band-label").label(), Some(format!("Band {band} of 5").as_str()));
+                assert_eq!(window.find("raster-band-label").label(), Some(format!("Band {band}/5").as_str()));
             })
             .unwrap();
         }
@@ -1579,20 +1755,20 @@ mod tests {
         let (panel, handle) = open_test_panel(cx, 760.0);
         load_test_paths(&panel, handle, paths, cx);
         let first = style_active_band(&panel, handle, 1, (25.0, 45.0), cx);
-        assert_eq!(first.palette(), ColorMapPreset::Blues);
+        assert_eq!(first.palette(), ColorMapPreset::YlGnBu);
         assert_eq!(first.range(), (25.0, 45.0));
         click_band_slider(&panel, handle, 0.5, 2, cx);
         cx.update(|cx| {
             let source = panel.read(cx).active().unwrap();
             assert_eq!(source.metadata().band_nr, Some(2));
-            assert_eq!(source.palette(), ColorMapPreset::Terrain);
+            assert_eq!(source.palette(), ColorMapPreset::Turbo);
             assert_eq!(source.range(), source.data_range());
             assert_ne!(source.metadata().id, first.metadata().id);
         });
         let second = style_active_band(&panel, handle, 2, (35.0, 55.0), cx);
-        assert_eq!(second.palette(), ColorMapPreset::Gray);
+        assert_eq!(second.palette(), ColorMapPreset::YlOrRd);
         assert_eq!(second.range(), (35.0, 55.0));
-        for (position, band, source, palette) in [(0.05, 1, &first, "Blues"), (0.5, 2, &second, "Gray")] {
+        for (position, band, source, palette) in [(0.05, 1, &first, "YlGnBu"), (0.5, 2, &second, "YlOrRd")] {
             click_band_slider(&panel, handle, position, band, cx);
             cx.update(|cx| {
                 assert_eq!(panel.read(cx).active().unwrap().id(), source.id());
@@ -1623,7 +1799,7 @@ mod tests {
             assert_band_selection(&panel, 5, files[1], cx);
             window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
             assert_band_selection(&panel, 1, files[0], cx);
-            assert_eq!(window.find("raster-band-label").label(), Some("Band 1 of 3"));
+            assert_eq!(window.find("raster-band-label").label(), Some("Band 1/3"));
         })
         .unwrap();
         click_band_slider(&panel, handle, 0.5, 2, cx);
@@ -1640,12 +1816,12 @@ mod tests {
             window.render_frame(cx);
             assert_band_selection(&panel, 5, files[1], cx);
             assert_ne!(panel.read(cx).selected, files[1]);
-            assert_eq!(window.find("raster-band-label").label(), Some("Band 5 of 5"));
+            assert_eq!(window.find("raster-band-label").label(), Some("Band 5/5"));
             assert_eq!(band_slider_snapshot(window).path(), identity);
             window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
             assert_band_selection(&panel, 2, files[0], cx);
             assert_ne!(panel.read(cx).selected, files[0]);
-            assert_eq!(window.find("raster-band-label").label(), Some("Band 2 of 3"));
+            assert_eq!(window.find("raster-band-label").label(), Some("Band 2/3"));
             assert_eq!(band_slider_snapshot(window).path(), identity);
         })
         .unwrap();
@@ -1722,7 +1898,7 @@ mod tests {
             assert_eq!(window.find("next-raster-band").disabled(), Some(true));
             window.click("next-raster-band", cx);
             assert_band_selection(&panel, 3, file, cx);
-            assert_eq!(window.find("raster-band-label").label(), Some("Band 3 of 3"));
+            assert_eq!(window.find("raster-band-label").label(), Some("Band 3/3"));
         })
         .unwrap();
         cx.run_until_parked();
@@ -1731,6 +1907,68 @@ mod tests {
             assert_eq!(events.len(), 5, "Disabled endpoint buttons must not emit or wrap");
             assert!(events.iter().skip(1).all(|event| !event.should_fit()));
         });
+    }
+
+    #[test]
+    fn slider_ranges_reject_equal_or_reversed_endpoints() {
+        for position in [0.0, 500.0, 1000.0] {
+            for raster in [false, true] {
+                assert_eq!(slider_range((0.0, 25.56), (position, position), raster), None);
+            }
+        }
+        assert_eq!(slider_range((0.0, 25.56), (600.0, 500.0), false), None);
+    }
+
+    #[test]
+    fn slider_ranges_reject_endpoints_that_round_to_the_same_raster_value() {
+        assert_eq!(slider_range((25.55, 25.56), (999.0, 1000.0), true), None);
+        assert_eq!(slider_range((1e10, 1e10 + 1.0), (0.0, 1000.0), true), None);
+    }
+
+    #[test]
+    fn slider_ranges_preserve_valid_raster_and_tiny_vector_ranges() {
+        assert_eq!(slider_range((0.0, 100.0), (250.0, 750.0), true), Some((25.0, 75.0)));
+        assert_eq!(slider_range((1e-12, 9e-12), (0.0, 1000.0), false), Some((1e-12, 9e-12)));
+    }
+
+    #[gpui_kit::test]
+    fn collapsed_slider_ranges_preserve_inputs_style_and_slider_without_errors(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[1]);
+        let (panel, handle) = open_test_panel(cx, 900.0);
+        load_test_paths(&panel, handle, paths, cx);
+        let events = record_events(&panel, cx);
+        for position in [0.0, 500.0, 1000.0] {
+            cx.update_window(handle.into(), |_, window, cx| {
+                let (slider, range, inputs) = {
+                    let panel = panel.read(cx);
+                    (
+                        panel.range_slider.clone(),
+                        panel.color_range(),
+                        (panel.min.read(cx).value(), panel.max.read(cx).value()),
+                    )
+                };
+                slider.update(cx, |slider, cx| {
+                    slider.set_value(position..position, window, cx);
+                    cx.emit(SliderEvent::Change(slider.value()));
+                });
+                (range, inputs)
+            })
+            .map(|before| {
+                cx.run_until_parked();
+                cx.update(|cx| {
+                    let panel = panel.read(cx);
+                    assert_eq!(panel.color_range(), before.0);
+                    assert_eq!((panel.min.read(cx).value(), panel.max.read(cx).value()), before.1);
+                    assert!(panel.error.is_none());
+                    let value = panel.range_slider.read(cx).value();
+                    assert!(value.start() < value.end());
+                    assert!(events.read(cx).is_empty());
+                });
+            })
+            .unwrap();
+        }
     }
 
     #[test]
@@ -1864,7 +2102,7 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, _, cx| {
             let source = panel.read(cx).active_vector().unwrap().clone();
-            assert_eq!(source.palette(), ColorMapPreset::Blues);
+            assert_eq!(source.palette(), ColorMapPreset::YlGnBu);
             assert_eq!(source.range(), Some((0.200001, 0.800001)));
             assert_eq!(source.source_json(), original.source_json());
             assert_eq!(panel.read(cx).range_domain, (0.125, 0.875));
@@ -1878,7 +2116,7 @@ mod tests {
             // Cross another numeric layer, a nonnumeric vector, and a raster.
             window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
             assert_eq!(panel.read(cx).active_vector().unwrap().property(), Some("a_count"));
-            assert_eq!(panel.read(cx).active_vector().unwrap().palette(), ColorMapPreset::Terrain);
+            assert_eq!(panel.read(cx).active_vector().unwrap().palette(), ColorMapPreset::Turbo);
             window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
             assert!(window.try_find("vector-property").is_none());
             assert!(window.try_find("raster-palette").is_none());

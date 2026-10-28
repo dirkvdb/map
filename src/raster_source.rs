@@ -56,7 +56,7 @@ impl RasterSource {
         validate_raster_scaling(&metadata)?;
         let unscaling_enabled = metadata.scale.is_some();
         let range = scaled_range(&metadata, metadata.scale.unwrap_or_default());
-        Self::styled(Arc::new(metadata), source_files, ColorMapPreset::Terrain, range, unscaling_enabled)
+        Self::styled(Arc::new(metadata), source_files, ColorMapPreset::Turbo, range, unscaling_enabled)
     }
 
     fn styled(
@@ -322,6 +322,7 @@ fn refresh_band_metadata(metadata: &mut LayerMetadata) -> Result<()> {
     let Some(band_nr) = metadata.band_nr else { return Ok(()) };
     let dataset = gdal::Dataset::open(&metadata.path)?;
     let band = dataset.rasterband(band_nr)?;
+    metadata.description = band.description()?.trim().to_owned();
     metadata.scale = match (band.scale(), band.offset()) {
         (None, None) => None,
         (scale, offset) => Some(RasterScale {

@@ -1171,7 +1171,7 @@ mod tests {
             let map = view.read(cx);
             let source = map.vector.as_ref().unwrap();
             assert_ne!(source.style_id(), property_style_id);
-            assert_eq!(source.palette(), inf::colormap::ColorMapPreset::Blues);
+            assert_eq!(source.palette(), inf::colormap::ColorMapPreset::YlGnBu);
             assert_eq!(source.id(), original.id());
             assert_eq!(source.source_json(), original.source_json());
             assert_eq!(map.requested.as_ref().unwrap().vector_style_id, Some(source.style_id()));
@@ -2052,10 +2052,8 @@ mod tests {
             cx.update_window(handle.into(), |_, window, cx| {
                 window.render_frame(cx);
                 assert_right_pane_readout_clear(window);
-                assert_eq!(
-                    window.find("raster-band-name").label(),
-                    Some(view.read(cx).raster.as_ref().unwrap().metadata().name.as_str())
-                );
+                let band = view.read(cx).raster.as_ref().unwrap().metadata().band_nr.unwrap();
+                assert_eq!(window.find("raster-band-label").label(), Some(format!("Band {band}/5").as_str()));
             })
             .unwrap();
             check_right_band_input(&view, handle.into(), cx);

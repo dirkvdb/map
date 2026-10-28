@@ -42,7 +42,7 @@ fn metadata_discovers_integers_fractions_and_mixed_missing_values() {
     assert_eq!(source.property(), Some("fraction"));
     assert_eq!(source.range(), Some((0.125, 0.875)));
     assert_eq!(source.data_range(), source.range());
-    assert_eq!(source.palette(), ColorMapPreset::Terrain);
+    assert_eq!(source.palette(), ColorMapPreset::Turbo);
 }
 
 #[test]
