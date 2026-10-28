@@ -12,6 +12,8 @@ use geo::Tile;
 use inf::colormap::{ColorMapDirection, ColorMapPreset};
 use maplibre_native::{WgpuCustomLayer, WgpuLayerParameters, texture_format_from_webgpu};
 
+use crate::multiband_layer::MultibandLayer;
+use crate::raster_playback::{PlaybackFrame, PlaybackRequest};
 use crate::raster_source::{NumericTile, RasterSource};
 use crate::raster_tiles::{MAX_PENDING_TILES, TileWorkers, VisibleTile, parent_uv, tile_matrix, transition_tiles, visible_tiles};
 
@@ -102,6 +104,7 @@ pub struct RasterLayer {
     queued: Option<(Arc<RasterSource>, u8)>,
     reduce_motion: bool,
     debug: bool,
+    multiband: Option<MultibandLayer>,
     #[cfg(test)]
     requests: u64,
     #[cfg(test)]
@@ -131,6 +134,7 @@ impl RasterLayer {
             queued: None,
             reduce_motion: false,
             debug: false,
+            multiband: None,
             #[cfg(test)]
             requests: 0,
             #[cfg(test)]
@@ -181,16 +185,46 @@ impl RasterLayer {
         self.waiting = false;
     }
 
+    pub fn set_playback(&mut self, request: Option<PlaybackRequest>, opacity: f32) -> Result<()> {
+        if let Some(request) = request {
+            if self.multiband.is_none() {
+                self.reset_for_source_change(false);
+                self.multiband = Some(MultibandLayer::new(self.device.clone(), self.queue.clone())?);
+            }
+            if let Some(layer) = &mut self.multiband {
+                layer.set_reduce_motion(self.reduce_motion);
+                layer.set_debug(self.debug);
+                layer.set_playback(request, opacity);
+            }
+        } else if self.multiband.take().is_some() {
+            self.reset_for_source_change(false);
+        }
+        Ok(())
+    }
+
+    pub fn playback_frame(&self) -> Option<PlaybackFrame> {
+        self.multiband.as_ref().and_then(MultibandLayer::playback_frame)
+    }
+
     pub fn set_reduce_motion(&mut self, reduce: bool) {
         self.reduce_motion = reduce;
+        if let Some(layer) = &mut self.multiband {
+            layer.set_reduce_motion(reduce);
+        }
     }
 
     pub fn set_debug(&mut self, debug: bool) {
         self.debug = debug;
+        if let Some(layer) = &mut self.multiband {
+            layer.set_debug(debug);
+        }
     }
 
     /// Called by the renderer's existing frame pump, never from a tile worker.
     pub fn poll_tiles(&mut self) -> bool {
+        if let Some(layer) = &mut self.multiband {
+            return layer.poll_tiles();
+        }
         let mut changed = false;
         for result in self.workers.completed() {
             if result.generation != self.generation {
@@ -226,7 +260,10 @@ impl RasterLayer {
     }
 
     pub fn is_loading(&self) -> bool {
-        self.waiting || !self.pending.is_empty() || self.previous.is_some()
+        self.multiband.as_ref().map_or_else(
+            || self.waiting || !self.pending.is_empty() || self.previous.is_some(),
+            MultibandLayer::is_loading,
+        )
     }
 
     #[cfg(test)]
@@ -265,6 +302,10 @@ impl RasterLayer {
     }
 
     fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
+        if let Some(layer) = &mut self.multiband {
+            layer.render(pass, parameters);
+            return;
+        }
         let now = Instant::now();
         self.finish_fade(now);
         let Some(source) = self.source.clone() else { return };

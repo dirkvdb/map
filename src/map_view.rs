@@ -18,6 +18,7 @@ use crate::map_camera::MapCamera;
 use crate::map_renderer::{BasemapStyle, MapFrame, MapRenderer, MapRequest, MapSource, Viewport};
 use crate::pixel_info::PixelInfo;
 use crate::raster_panel::{ClearRasters, FitRaster, OpenDataset, RasterPanel, ToggleRasterControls};
+use crate::raster_playback::{PlaybackFrame, PlaybackRequest, PlaybackStyle};
 use crate::raster_source::RasterSource;
 use crate::shortcuts::key_binding;
 use crate::vector_source::VectorSource;
@@ -135,6 +136,8 @@ fn basemap_style(cx: &App) -> BasemapStyle {
 struct RenderKey {
     map: MapRequest,
     raster_id: Option<u64>,
+    playback_revision: Option<u64>,
+    playback_style: Option<PlaybackStyle>,
     vector_id: Option<u64>,
     vector_style_id: Option<u64>,
     vector_color: String,
@@ -165,6 +168,8 @@ pub struct MapView {
     _feature_task: Option<Task<()>>,
     pointer: Option<Point<Pixels>>,
     raster: Option<Arc<RasterSource>>,
+    playback: Option<PlaybackRequest>,
+    playback_frame: Option<PlaybackFrame>,
     vector: Option<Arc<VectorSource>>,
     opacity: f32,
     fit_pending: bool,
@@ -218,6 +223,8 @@ impl MapView {
             _feature_task: feature_task,
             pointer: None,
             raster: None,
+            playback: None,
+            playback_frame: None,
             vector: None,
             opacity: 1.0,
             fit_pending: false,
@@ -237,15 +244,30 @@ impl MapView {
     }
 
     fn apply_raster_event(&mut self, event: &crate::raster_panel::RasterEvent, cx: &mut Context<Self>) {
-        let raster = event.source();
+        let playback = event.playback();
+        // The first raw band anchors the renderer; feedback selects the hover band only.
+        let raster = playback
+            .as_ref()
+            .and_then(|request| request.bands().first().cloned())
+            .or_else(|| event.source());
         let vector = event.vector_source();
         let selection_changed = self.raster.as_ref().map(|source| source.metadata().id) != raster.as_ref().map(|source| source.metadata().id)
             || self.vector.as_ref().map(|source| source.id()) != vector.as_ref().map(|source| source.id());
+        let playback_changed = self.playback.as_ref().map(|request| (request.dataset_id(), request.revision()))
+            != playback.as_ref().map(|request| (request.dataset_id(), request.revision()));
+        self.playback_frame = self.playback_frame.filter(|frame| {
+            playback
+                .as_ref()
+                .is_some_and(|request| Some(frame.dataset_id()) == request.dataset_id() && frame.revision() == request.revision())
+        });
         self.raster = raster;
+        self.playback = playback;
         self.vector = vector;
         self.opacity = event.opacity();
-        self.coast = None;
-        self.drag = None;
+        if selection_changed || playback_changed || event.should_fit() {
+            self.coast = None;
+            self.drag = None;
+        }
         self.fit_pending = event.should_fit() || (selection_changed && self.source_is_offscreen());
         self.fit_raster();
         self.request_render(cx);
@@ -337,6 +359,11 @@ impl MapView {
         if !self.frame_is_current(&frame, cx) {
             return;
         }
+        if let Some(playback) = frame.playback {
+            self.playback_frame = Some(playback);
+            self.raster_panel.update(cx, |panel, cx| panel.apply_playback_frame(playback, window, cx));
+            self.update_pixel_info(cx);
+        }
         match frame.image {
             Ok(image) => {
                 self.trace_vector_frame(frame.vector_layer_id, cx);
@@ -367,6 +394,7 @@ impl MapView {
             && frame.basemap == basemap_style(cx)
             && frame.tile_boundaries == self.tile_boundaries
             && self.raster.as_ref().map(|source| source.metadata().id) == frame.raster_layer_id
+            && self.playback.as_ref().map(PlaybackRequest::revision) == frame.playback.map(PlaybackFrame::revision)
             && self.vector.as_ref().map(|source| source.id()) == frame.vector_layer_id
     }
 
@@ -403,6 +431,8 @@ impl MapView {
         let key = RenderKey {
             map: request,
             raster_id: self.raster.as_ref().map(|source| source.id()),
+            playback_revision: self.playback.as_ref().map(PlaybackRequest::revision),
+            playback_style: self.playback.as_ref().map(PlaybackRequest::style),
             vector_id: self.vector.as_ref().map(|source| source.id()),
             vector_style_id: self.vector.as_ref().map(|source| source.style_id()),
             vector_color: vector_color.clone(),
@@ -422,7 +452,10 @@ impl MapView {
         let source = self
             .raster
             .clone()
-            .map(MapSource::Raster)
+            .map(|source| match &self.playback {
+                Some(playback) => MapSource::Multiband(source, playback.resumed_from(self.playback_frame)),
+                None => MapSource::Raster(source),
+            })
             .or_else(|| self.vector.clone().map(|source| MapSource::Vector(source, vector_color)));
         if let Err(error) = renderer.render_layer(request, source, self.opacity, reduce_motion, basemap, self.tile_boundaries) {
             self.error = Some(format!("Couldn’t load the map. {error}").into());
@@ -533,7 +566,20 @@ impl MapView {
         let offset = position - bounds.center();
         let coordinate = self.camera.coordinate_at((f64::from(f32::from(offset.x)), f64::from(f32::from(offset.y))));
         let dpi = self.viewport.map_or(1, |viewport| viewport.scale.round().clamp(1.0, 4.0) as u8);
-        self.pixel_info.update(cx, |info, cx| info.show(coordinate, self.raster.clone(), dpi, cx));
+        let raster = self
+            .playback
+            .as_ref()
+            .and_then(|request| {
+                let position = self.playback_frame.map_or(request.position(), PlaybackFrame::position);
+                request.bands().get(position.floor() as usize).cloned()
+            })
+            .or_else(|| self.raster.clone());
+        let scale = raster.as_ref().map_or_else(Default::default, |source| {
+            self.playback
+                .as_ref()
+                .map_or_else(|| source.scale(), |request| request.style().scale_for(source))
+        });
+        self.pixel_info.update(cx, |info, cx| info.show_with_scale(coordinate, raster, dpi, scale, cx));
     }
 
     fn update_vector_hover(&mut self, hover: VectorHover, cx: &mut Context<Self>) {
@@ -883,6 +929,10 @@ impl Render for MapView {
             .child(alerts)
     }
 }
+
+#[cfg(test)]
+#[path = "map_view_playback_tests.rs"]
+mod playback_tests;
 
 #[cfg(test)]
 #[path = "map_view_progress_tests.rs"]
@@ -1385,6 +1435,7 @@ mod tests {
             view.update(cx, |view, cx| {
                 view.apply_frame(
                     MapFrame {
+                        playback: None,
                         viewport: view.viewport.unwrap(),
                         basemap: basemap_style(cx),
                         raster_layer_id: None,
@@ -1409,6 +1460,7 @@ mod tests {
             view.update(cx, |view, cx| {
                 view.apply_frame(
                     MapFrame {
+                        playback: None,
                         viewport: view.viewport.unwrap(),
                         basemap: basemap_style(cx),
                         raster_layer_id: None,
@@ -2463,6 +2515,7 @@ mod tests {
                     view.update(cx, |view, cx| {
                         view.apply_frame(
                             MapFrame {
+                                playback: None,
                                 viewport,
                                 basemap: basemap_style(cx),
                                 raster_layer_id: None,
@@ -3760,6 +3813,7 @@ mod tests {
                 let obsolete = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
                 view.apply_frame(
                     MapFrame {
+                        playback: None,
                         viewport: view.viewport.unwrap(),
                         basemap: basemap_style(cx),
                         raster_layer_id: Some(obsolete_source.metadata().id),
@@ -3815,6 +3869,7 @@ mod tests {
         let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
         map.apply_frame(
             MapFrame {
+                playback: None,
                 viewport: map.viewport.unwrap(),
                 basemap: expected,
                 tile_boundaries: false,
@@ -3828,6 +3883,7 @@ mod tests {
         );
         map.apply_frame(
             MapFrame {
+                playback: None,
                 viewport: map.viewport.unwrap(),
                 basemap: if expected == BasemapStyle::Light {
                     BasemapStyle::Dark
@@ -3876,6 +3932,7 @@ mod tests {
         let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]));
         map.apply_frame(
             MapFrame {
+                playback: None,
                 viewport: map.viewport.unwrap(),
                 basemap: basemap_style(cx),
                 raster_layer_id: None,
@@ -3890,6 +3947,7 @@ mod tests {
         assert!(map.image.is_none(), "A frame for the previous vector source must be rejected");
         map.apply_frame(
             MapFrame {
+                playback: None,
                 viewport: map.viewport.unwrap(),
                 basemap: basemap_style(cx),
                 raster_layer_id: None,
@@ -4118,6 +4176,7 @@ mod tests {
     fn apply_completed_range_frame(view: &mut MapView, source: &RasterSource, image: &Arc<RenderImage>, window: &mut Window, cx: &mut Context<MapView>) {
         view.apply_frame(
             MapFrame {
+                playback: None,
                 viewport: view.viewport.unwrap(),
                 basemap: basemap_style(cx),
                 raster_layer_id: Some(source.metadata().id),

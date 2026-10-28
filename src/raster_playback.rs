@@ -1,0 +1,292 @@
+//! Commands and renderer feedback for temporal COG playback.
+
+use std::sync::Arc;
+
+use anyhow::{Result, ensure};
+use geo::RasterScale;
+use inf::colormap::{ColorMapDirection, ColorMapPreset};
+
+use crate::raster_source::RasterSource;
+
+/// Runtime display overrides shared by every playback band, without rebuilding sources.
+/// Unspecified properties retain each band's existing display style.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct PlaybackStyle {
+    range: Option<(f32, f32)>,
+    palette: Option<ColorMapPreset>,
+    color_map_direction: Option<ColorMapDirection>,
+    clamp_colors: Option<bool>,
+    unscaling: Option<bool>,
+}
+
+impl PlaybackStyle {
+    pub fn with_range(mut self, range: (f32, f32)) -> Result<Self> {
+        ensure!(
+            range.0.is_finite() && range.1.is_finite() && (range.1 - range.0).is_finite() && range.0 < range.1,
+            "Minimum must be less than maximum; both must be finite numbers."
+        );
+        self.range = Some(range);
+        Ok(self)
+    }
+
+    pub fn with_palette(mut self, palette: ColorMapPreset) -> Self {
+        self.palette = Some(palette);
+        self
+    }
+
+    pub fn with_color_map_direction(mut self, direction: ColorMapDirection) -> Self {
+        self.color_map_direction = Some(direction);
+        self
+    }
+
+    pub fn with_clamp_colors(mut self, enabled: bool) -> Self {
+        self.clamp_colors = Some(enabled);
+        self
+    }
+
+    pub fn with_unscaling(mut self, enabled: bool) -> Self {
+        self.unscaling = Some(enabled);
+        self
+    }
+
+    pub fn range(self) -> Option<(f32, f32)> {
+        self.range
+    }
+    pub fn palette(self) -> Option<ColorMapPreset> {
+        self.palette
+    }
+    pub fn color_map_direction(self) -> Option<ColorMapDirection> {
+        self.color_map_direction
+    }
+    pub fn clamp_colors(self) -> Option<bool> {
+        self.clamp_colors
+    }
+    pub fn unscaling(self) -> Option<bool> {
+        self.unscaling
+    }
+
+    pub fn range_for(self, source: &RasterSource) -> (f32, f32) {
+        self.range().unwrap_or_else(|| source.range())
+    }
+    pub fn palette_for(self, source: &RasterSource) -> ColorMapPreset {
+        self.palette().unwrap_or_else(|| source.palette())
+    }
+    pub fn color_map_direction_for(self, source: &RasterSource) -> ColorMapDirection {
+        self.color_map_direction().unwrap_or_else(|| source.color_map_direction())
+    }
+    pub fn clamp_colors_for(self, source: &RasterSource) -> bool {
+        self.clamp_colors().unwrap_or_else(|| source.clamp_colors())
+    }
+    pub fn unscaling_for(self, source: &RasterSource) -> bool {
+        self.unscaling().unwrap_or_else(|| source.unscaling_enabled()) && source.has_scale_metadata()
+    }
+    pub fn scale_for(self, source: &RasterSource) -> RasterScale {
+        if self.unscaling_for(source) {
+            source.metadata().scale.unwrap_or_default()
+        } else {
+            RasterScale::default()
+        }
+    }
+}
+
+/// Immutable UI command. The renderer owns time advancement and buffering.
+#[derive(Clone)]
+pub struct PlaybackRequest {
+    bands: Arc<[Arc<RasterSource>]>,
+    position: f64,
+    revision: u64,
+    playing: bool,
+    bands_per_second: f64,
+    interpolation: bool,
+    style: PlaybackStyle,
+}
+
+impl PlaybackRequest {
+    pub fn new(bands: Vec<Arc<RasterSource>>, position: f64, revision: u64, playing: bool, bands_per_second: f64, interpolation: bool) -> Self {
+        Self {
+            bands: bands.into(),
+            position,
+            revision,
+            playing,
+            bands_per_second,
+            interpolation,
+            style: PlaybackStyle::default(),
+        }
+    }
+
+    pub fn style(&self) -> PlaybackStyle {
+        self.style
+    }
+
+    pub fn with_style(mut self, style: PlaybackStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Changes playback controls while retaining the immutable band allocation and style.
+    pub fn with_controls(mut self, position: f64, revision: u64, playing: bool, bands_per_second: f64) -> Self {
+        self.position = position;
+        self.revision = revision;
+        self.playing = playing;
+        self.bands_per_second = bands_per_second;
+        self
+    }
+
+    /// Only the exact same immutable band allocation can reuse renderer validation.
+    pub fn shares_bands(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.bands, &other.bands)
+    }
+
+    /// Seeds a replacement renderer from accepted feedback without issuing a seek.
+    pub fn resumed_from(&self, frame: Option<PlaybackFrame>) -> Self {
+        let mut request = self.clone();
+        if let Some(frame) = frame.filter(|frame| Some(frame.dataset_id()) == self.dataset_id() && frame.revision() == self.revision) {
+            request.position = frame.position();
+        }
+        request
+    }
+
+    pub fn bands(&self) -> &[Arc<RasterSource>] {
+        &self.bands
+    }
+    pub fn dataset_id(&self) -> Option<tiler::LayerId> {
+        self.bands.first().map(|band| band.metadata().id)
+    }
+    pub fn position(&self) -> f64 {
+        self.position
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+    pub fn bands_per_second(&self) -> f64 {
+        self.bands_per_second
+    }
+    pub fn interpolation(&self) -> bool {
+        self.interpolation
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sources(directory: &std::path::Path, scaled: bool) -> Result<Vec<Arc<RasterSource>>> {
+        let path = directory.join("styles.tif");
+        crate::raster_source::test_support::write_raster(&path, 3857, 2)?;
+        if scaled {
+            std::fs::write(
+                directory.join("styles.tif.aux.xml"),
+                "<PAMDataset><PAMRasterBand band=\"1\"><Scale>-2</Scale><Offset>10</Offset></PAMRasterBand></PAMDataset>",
+            )?;
+        }
+        RasterSource::open(&path)
+    }
+
+    #[test]
+    fn range_validation_matches_source_semantics() -> Result<()> {
+        for range in [(0.0, 0.0), (1.0, 0.0), (f32::NAN, 1.0), (0.0, f32::INFINITY), (-f32::MAX, f32::MAX)] {
+            assert!(PlaybackStyle::default().with_range(range).is_err(), "Accepted invalid range {range:?}");
+        }
+        assert_eq!(PlaybackStyle::default().with_range((-10.0, 20.0))?.range(), Some((-10.0, 20.0)));
+        Ok(())
+    }
+
+    #[test]
+    fn default_style_preserves_each_bands_existing_properties() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let bands = sources(directory.path(), true)?;
+        let second = bands[1]
+            .restyled(ColorMapPreset::Gray, (-10.0, 1000.0))?
+            .with_color_map_direction(ColorMapDirection::Reversed)?
+            .with_clamp_colors(false)?;
+        let style = PlaybackStyle::default();
+        assert!(style.range().is_none() && style.palette().is_none() && style.color_map_direction().is_none());
+        assert!(style.clamp_colors().is_none() && style.unscaling().is_none());
+        for source in [&bands[0], &second] {
+            assert_eq!(style.range_for(source), source.range());
+            assert!(style.palette_for(source) == source.palette());
+            assert!(style.color_map_direction_for(source) == source.color_map_direction());
+            assert_eq!(style.clamp_colors_for(source), source.clamp_colors());
+            assert_eq!(style.unscaling_for(source), source.unscaling_enabled());
+            assert_eq!(style.scale_for(source), source.scale());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn overrides_resolve_without_changing_sources_or_inventing_scale_metadata() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let bands = sources(directory.path(), true)?;
+        let style = PlaybackStyle::default()
+            .with_range((0.0, 100.0))?
+            .with_palette(ColorMapPreset::Gray)
+            .with_color_map_direction(ColorMapDirection::Reversed)
+            .with_clamp_colors(false)
+            .with_unscaling(true);
+        assert_eq!(style.range_for(&bands[0]), (0.0, 100.0));
+        assert!(style.palette() == Some(ColorMapPreset::Gray));
+        assert!(style.color_map_direction() == Some(ColorMapDirection::Reversed));
+        assert_eq!(style.clamp_colors(), Some(false));
+        assert_eq!(style.unscaling(), Some(true));
+        assert_eq!(style.scale_for(&bands[0]), RasterScale { scale: -2.0, offset: 10.0 });
+        assert_eq!(style.with_unscaling(false).scale_for(&bands[0]), RasterScale::default());
+        assert!(!style.unscaling_for(&bands[1]));
+        assert_eq!(style.scale_for(&bands[1]), RasterScale::default());
+        Ok(())
+    }
+
+    #[test]
+    fn control_style_and_resume_builders_share_the_original_band_allocation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let bands = sources(directory.path(), false)?;
+        let base = PlaybackRequest::new(bands.clone(), 0.0, 1, false, 2.0, true);
+        let style = PlaybackStyle::default().with_range((10.0, 30.0))?;
+        let changed = base.clone().with_style(style).with_controls(1.5, 7, true, 4.0);
+        assert!(base.shares_bands(&changed));
+        assert!(changed.style() == style);
+        assert_eq!(
+            (changed.position(), changed.revision(), changed.is_playing(), changed.bands_per_second()),
+            (1.5, 7, true, 4.0)
+        );
+        assert!(changed.interpolation());
+        let resumed = changed.resumed_from(Some(PlaybackFrame::new(changed.dataset_id().unwrap(), 7, 0.5, false)));
+        assert!(base.shares_bands(&resumed) && resumed.style() == style);
+        assert!(!base.shares_bands(&PlaybackRequest::new(bands, 0.0, 1, false, 2.0, true)));
+        Ok(())
+    }
+}
+
+/// Accepted renderer position, never a request to seek or start new work.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlaybackFrame {
+    dataset_id: tiler::LayerId,
+    revision: u64,
+    position: f64,
+    buffering: bool,
+}
+
+impl PlaybackFrame {
+    pub fn new(dataset_id: tiler::LayerId, revision: u64, position: f64, buffering: bool) -> Self {
+        Self {
+            dataset_id,
+            revision,
+            position,
+            buffering,
+        }
+    }
+    pub fn dataset_id(self) -> tiler::LayerId {
+        self.dataset_id
+    }
+    pub fn revision(self) -> u64 {
+        self.revision
+    }
+    pub fn position(self) -> f64 {
+        self.position
+    }
+    pub fn is_buffering(self) -> bool {
+        self.buffering
+    }
+}

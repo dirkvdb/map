@@ -15,6 +15,7 @@ use maplibre_native::{
 use crate::map_camera::MapCamera;
 use crate::map_readback::GpuReadback;
 use crate::raster_layer::{RasterLayer, RasterLayerHost};
+use crate::raster_playback::{PlaybackFrame, PlaybackRequest};
 use crate::raster_source::{RasterSource, RasterTiles};
 use crate::vector_source::VectorSource;
 
@@ -56,12 +57,14 @@ pub struct MapFrame {
     /// Current-request image with native resources, render work, and raster fades idle.
     /// Source identity or a successful readback alone does not establish readiness.
     pub settled: bool,
+    pub playback: Option<PlaybackFrame>,
     pub image: Result<Arc<RenderImage>>,
 }
 
 #[derive(Clone)]
 pub enum MapSource {
     Raster(Arc<RasterSource>),
+    Multiband(Arc<RasterSource>, PlaybackRequest),
     Vector(Arc<VectorSource>, String),
 }
 
@@ -69,6 +72,7 @@ pub enum MapSource {
 struct RenderRequest {
     map: MapRequest,
     raster: Option<Arc<RasterSource>>,
+    playback: Option<PlaybackRequest>,
     vector: Option<Arc<VectorSource>>,
     vector_color: String,
     opacity: f32,
@@ -76,6 +80,26 @@ struct RenderRequest {
     basemap: BasemapStyle,
     tile_boundaries: bool,
     enqueued_at: Option<Instant>,
+}
+
+impl RenderRequest {
+    fn resume_playback(&mut self, map: Option<&NativeMap>) {
+        if let Some(playback) = &self.playback {
+            self.playback = Some(playback.resumed_from(map.and_then(|map| map.numeric.borrow().playback_frame())));
+        }
+    }
+
+    fn playback_frame(&self, map: Option<&NativeMap>) -> Option<PlaybackFrame> {
+        let request = self.playback.as_ref()?;
+        let frame = map.and_then(|map| map.numeric.borrow().playback_frame());
+        frame
+            .filter(|frame| Some(frame.dataset_id()) == request.dataset_id() && frame.revision() == request.revision())
+            .or_else(|| {
+                request
+                    .dataset_id()
+                    .map(|id| PlaybackFrame::new(id, request.revision(), request.position(), true))
+            })
+    }
 }
 
 struct FeatureQuery {
@@ -166,15 +190,17 @@ impl MapRenderer {
         basemap: BasemapStyle,
         tile_boundaries: bool,
     ) -> Result<()> {
-        let (raster, vector, vector_color) = match source {
-            Some(MapSource::Raster(source)) => (Some(source), None, String::new()),
-            Some(MapSource::Vector(source, color)) => (None, Some(source), color),
-            None => (None, None, String::new()),
+        let (raster, playback, vector, vector_color) = match source {
+            Some(MapSource::Raster(source)) => (Some(source), None, None, String::new()),
+            Some(MapSource::Multiband(source, playback)) => (Some(source), Some(playback), None, String::new()),
+            Some(MapSource::Vector(source, color)) => (None, None, Some(source), color),
+            None => (None, None, None, String::new()),
         };
         self.sender
             .send(RenderRequest {
                 map,
                 raster,
+                playback,
                 vector,
                 vector_color,
                 opacity,
@@ -267,7 +293,7 @@ fn run_renderer(
             progress.reset();
             current_request = Some(request);
         }
-        let Some(current_request) = &current_request else { continue };
+        let Some(current_request) = &mut current_request else { continue };
 
         let frame_started = Instant::now();
         let image = poll_map_image(&mut map, current_request, request_changed, next_frame, style_json.as_deref());
@@ -286,6 +312,7 @@ fn run_renderer(
             raster_layer_id: current_request.raster.as_ref().map(|source| source.metadata().id),
             vector_layer_id: current_request.vector.as_ref().map(|source| source.id()),
             settled,
+            playback: current_request.playback_frame(map.as_ref()),
             image,
         };
         if let Err(async_channel::TrySendError::Full(frame)) = frames.try_send(frame) {
@@ -413,11 +440,12 @@ fn receive_latest_request(requests: &mpsc::Receiver<RenderRequest>, timeout: Opt
 
 fn poll_map_image(
     map: &mut Option<NativeMap>,
-    request: &RenderRequest,
+    request: &mut RenderRequest,
     mut request_changed: bool,
     next_frame: Instant,
     style_json: Option<&str>,
 ) -> Result<Option<Arc<RenderImage>>> {
+    request.resume_playback(map.as_ref());
     if map.as_ref().is_none_or(|map| map.viewport.scale != request.map.viewport.scale) {
         *map = Some(initialize_map(request, style_json)?);
         request_changed = true;
@@ -499,6 +527,7 @@ struct NativeMap {
     deadline: Instant,
     raster: Option<Arc<RasterSource>>,
     opacity: f32,
+    playback_playing: bool,
     vector: Option<Arc<VectorSource>>,
     vector_opacity: f32,
     vector_color: String,
@@ -570,6 +599,7 @@ impl NativeMap {
             deadline: Instant::now() + Duration::from_secs(30),
             raster: None,
             opacity: 1.0,
+            playback_playing: false,
             vector: None,
             vector_opacity: 1.0,
             vector_color: String::new(),
@@ -626,7 +656,15 @@ impl NativeMap {
         } else {
             MapDebugOptions::NoDebug
         });
-        self.set_raster(request.raster.clone(), request.opacity)?;
+        // The displayed band/style is not a static source change during playback.
+        // Keep attachment identity anchored to the immutable dataset instead.
+        let raster = request
+            .playback
+            .as_ref()
+            .map_or_else(|| request.raster.clone(), |playback| playback.bands().first().cloned());
+        self.set_raster(raster, request.opacity)?;
+        self.numeric.borrow_mut().set_playback(request.playback.clone(), request.opacity)?;
+        self.playback_playing = request.playback.as_ref().is_some_and(PlaybackRequest::is_playing);
         self.set_vector(request.vector.clone(), request.opacity, &request.vector_color)?;
         self.apply_request(request.map);
         Ok(())
@@ -902,6 +940,11 @@ impl NativeMap {
         }
         // Dispatch a pending idle callback before judging the deadline. Keep the
         // deadline fixed so stalled native work or repeated repaints still fail.
+        if self.playback_playing && self.idle.get() && !self.numeric.borrow().is_loading() {
+            // Only active playback with native resources and tile work idle may
+            // renew the deadline. Paused or stalled prefetch cannot mask a timeout.
+            self.deadline = Instant::now() + Duration::from_secs(30);
+        }
         ensure!(self.is_settled() || Instant::now() < self.deadline, "Map rendering timed out");
         if self.needs_frame.replace(false) {
             self.idle.set(false);
@@ -923,6 +966,10 @@ fn wait_until_ready(run_loop: &RunLoopHandle, deadline: Instant, is_ready: impl 
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "map_renderer_playback_tests.rs"]
+mod playback_tests;
 
 #[cfg(test)]
 #[path = "map_renderer_progress_tests.rs"]

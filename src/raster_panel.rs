@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 
 use gpui_kit::component::input::{InputEvent, InputState, NumberInput};
@@ -13,15 +14,16 @@ use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectDelegate, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Disableable, Icon, IndexPath, Sizable};
+use gpui_kit::component::{ActiveTheme, Disableable, Icon, IndexPath, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    AnyElement, App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    PathPromptOptions, Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, WeakEntity,
-    Window, div, rgba,
+    AnyElement, App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, PathPromptOptions, Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt,
+    WeakEntity, Window, div, rgba,
 };
 use inf::colormap::{ColorMapDirection, ColorMapPreset, ProcessedColorMap};
 
+use crate::raster_playback::{PlaybackFrame, PlaybackRequest, PlaybackStyle};
 use crate::raster_source::RasterSource;
 use crate::vector_source::{VectorLoadProgress, VectorSource};
 
@@ -192,6 +194,7 @@ struct RasterDataset {
     path: PathBuf,
     bands: Vec<tiler::LayerId>,
     selected: tiler::LayerId,
+    playback: Option<PlaybackRequest>,
 }
 
 impl RasterDataset {
@@ -214,6 +217,7 @@ struct LoadedDatasets {
 }
 
 pub struct RasterEvent {
+    playback: Option<PlaybackRequest>,
     source: Option<Arc<RasterSource>>,
     vector_source: Option<Arc<VectorSource>>,
     opacity: f32,
@@ -221,6 +225,11 @@ pub struct RasterEvent {
 }
 
 impl RasterEvent {
+    /// Playback configuration for eligible COGs, including paused selections.
+    pub fn playback(&self) -> Option<PlaybackRequest> {
+        self.playback.clone()
+    }
+
     pub fn source(&self) -> Option<Arc<RasterSource>> {
         self.source.clone()
     }
@@ -257,9 +266,35 @@ impl SelectItem for BandChoice {
     }
 }
 
+struct PlaybackState {
+    position: f64,
+    revision: u64,
+    playing: bool,
+    bands_per_second: f64,
+    buffering: bool,
+}
+
+const PLAYBACK_SPEEDS: [u8; 4] = [1, 2, 3, 5];
+
+impl Default for PlaybackState {
+    fn default() -> Self {
+        Self {
+            position: 0.0,
+            revision: 0,
+            playing: false,
+            bands_per_second: 3.0,
+            buffering: false,
+        }
+    }
+}
+
 pub struct RasterPanel {
     sources: Vec<Arc<RasterSource>>,
     raster_datasets: Vec<RasterDataset>,
+    source_indices: HashMap<tiler::LayerId, usize>,
+    dataset_indices: HashMap<tiler::LayerId, usize>,
+    legend_colors: Arc<[inf::Color]>,
+    legend_palette: Option<(ColorMapPreset, ColorMapDirection)>,
     vectors: Vec<Arc<VectorSource>>,
     selected: Option<SelectionId>,
     band_scroll: f32,
@@ -269,6 +304,8 @@ pub struct RasterPanel {
     property: Entity<SelectState<SearchableVec<SharedString>>>,
     opacity: Entity<SliderState>,
     band_slider: Entity<SliderState>,
+    playback: PlaybackState,
+
     range_slider: Entity<SliderState>,
     range_domain: (f64, f64),
     min: Entity<InputState>,
@@ -283,6 +320,7 @@ pub struct RasterPanel {
     focus: FocusHandle,
     load_task: Option<Task<()>>,
     tile_errors_task: Option<Task<()>>,
+    tile_errors_source: Option<u64>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -299,6 +337,8 @@ impl RasterPanel {
         let property = cx.new(|cx| SelectState::new(SearchableVec::new(Vec::<SharedString>::new()), None, window, cx).searchable(true));
         let opacity = cx.new(|_| SliderState::new().min(0.0).max(100.0).step(1.0).default_value(100.0));
         let band_slider = cx.new(|_| SliderState::new().min(1.0).max(1.0).step(1.0).default_value(1.0));
+        let playback = PlaybackState::default();
+
         // A normalized domain keeps slider stepping useful for tiny or very
         // large data ranges without replacing retained component state.
         let range_slider = cx.new(|_| SliderState::new().min(0.0).max(1000.0).step(1.0).default_value(0.0..1000.0));
@@ -337,6 +377,10 @@ impl RasterPanel {
         Self {
             sources: Vec::new(),
             raster_datasets: Vec::new(),
+            source_indices: HashMap::new(),
+            dataset_indices: HashMap::new(),
+            legend_colors: Arc::from([]),
+            legend_palette: None,
             vectors: Vec::new(),
             selected: None,
             band_scroll: 0.0,
@@ -346,6 +390,8 @@ impl RasterPanel {
             property,
             opacity,
             band_slider,
+            playback,
+
             range_slider,
             range_domain: (0.0, 1.0),
             min,
@@ -360,14 +406,14 @@ impl RasterPanel {
             focus: cx.focus_handle(),
             load_task: None,
             tile_errors_task: None,
+            tile_errors_source: None,
             _subscriptions: subscriptions,
         }
     }
 
     fn active(&self) -> Option<&Arc<RasterSource>> {
-        self.sources
-            .iter()
-            .find(|source| Some(SelectionId::Raster(source.metadata().id)) == self.selected)
+        let SelectionId::Raster(id) = self.selected? else { return None };
+        self.sources.get(*self.source_indices.get(&id)?)
     }
 
     fn active_vector(&self) -> Option<&Arc<VectorSource>> {
@@ -431,6 +477,7 @@ impl RasterPanel {
     fn emit(&self, fit: bool, cx: &mut Context<Self>) {
         let opacity = self.opacity.read(cx).value().end() / 100.0;
         cx.emit(RasterEvent {
+            playback: self.playback_request(),
             source: self.active().cloned(),
             vector_source: self.active_vector().cloned(),
             opacity,
@@ -446,6 +493,10 @@ impl RasterPanel {
             self.load_progress = None;
         }
         self.selected = id;
+        let position = self
+            .active_dataset()
+            .and_then(|dataset| dataset.bands.iter().position(|&band| Some(SelectionId::Raster(band)) == id));
+        self.reset_playback(position.unwrap_or(0) as f64);
         self.sync_band_controls(window, cx);
         self.palette_scroll = 0.0;
         self.error = None;
@@ -458,7 +509,7 @@ impl RasterPanel {
 
     fn active_dataset(&self) -> Option<&RasterDataset> {
         let SelectionId::Raster(id) = self.selected? else { return None };
-        self.raster_datasets.iter().find(|dataset| dataset.bands.contains(&id))
+        self.raster_datasets.get(*self.dataset_indices.get(&id)?)
     }
 
     fn selected_layer(&self) -> Option<SelectionId> {
@@ -480,7 +531,7 @@ impl RasterPanel {
         let Some(&id) = band.checked_sub(1).and_then(|ix| dataset.bands.get(ix)) else {
             return;
         };
-        if self.selected == Some(SelectionId::Raster(id)) {
+        if self.selected == Some(SelectionId::Raster(id)) && self.playback_dataset().is_none() {
             return;
         }
         let collapsed = self.collapsed;
@@ -490,7 +541,7 @@ impl RasterPanel {
 
     fn sync_band_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(SelectionId::Raster(id)) = self.selected else { return };
-        let Some(dataset) = self.raster_datasets.iter_mut().find(|dataset| dataset.bands.contains(&id)) else {
+        let Some(dataset) = self.dataset_indices.get(&id).and_then(|ix| self.raster_datasets.get_mut(*ix)) else {
             return;
         };
         dataset.selected = id;
@@ -508,12 +559,19 @@ impl RasterPanel {
 
     fn install_rasters(&mut self, sources: Vec<Arc<RasterSource>>, datasets: Vec<RasterDataset>) {
         for dataset in datasets {
-            if let Some(ix) = self.raster_datasets.iter().position(|current| current.path == dataset.path) {
-                let previous = &self.raster_datasets[ix];
-                self.sources.retain(|source| !previous.bands.contains(&source.metadata().id));
-                self.raster_datasets[ix] = dataset;
-            } else {
+            let Some(ix) = self.raster_datasets.iter().position(|current| current.path == dataset.path) else {
                 self.raster_datasets.push(dataset);
+                continue;
+            };
+            let previous = &self.raster_datasets[ix];
+            let replaces_selected = self
+                .selected
+                .is_some_and(|id| matches!(id, SelectionId::Raster(id) if previous.bands.contains(&id)));
+            self.sources.retain(|source| !previous.bands.contains(&source.metadata().id));
+            self.raster_datasets[ix] = dataset;
+            if replaces_selected {
+                self.selected = None;
+                self.reset_playback(0.0);
             }
         }
         self.sources.extend(
@@ -521,13 +579,27 @@ impl RasterPanel {
                 .into_iter()
                 .filter(|source| self.raster_datasets.iter().any(|dataset| dataset.bands.contains(&source.metadata().id))),
         );
+        self.source_indices = self.sources.iter().enumerate().map(|(ix, source)| (source.metadata().id, ix)).collect();
+        self.dataset_indices = self
+            .raster_datasets
+            .iter()
+            .enumerate()
+            .flat_map(|(ix, dataset)| dataset.bands.iter().map(move |id| (*id, ix)))
+            .collect();
     }
 
     fn watch_tile_errors(&mut self, cx: &mut Context<Self>) {
-        self.tile_errors_task = self.active().map(|source| {
-            let errors = source.errors();
-            cx.spawn(async move |this, cx| receive_tile_errors(this, errors, cx).await)
-        });
+        let source = self
+            .playback_dataset()
+            .and_then(|dataset| dataset.playback.as_ref()?.bands().first())
+            .or_else(|| self.active());
+        let id = source.map(|source| source.id());
+        if self.tile_errors_source == id {
+            return;
+        }
+        let errors = source.map(|source| source.errors());
+        self.tile_errors_source = id;
+        self.tile_errors_task = errors.map(|errors| cx.spawn(async move |this, cx| receive_tile_errors(this, errors, cx).await));
     }
 
     fn scroll_bands(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -703,7 +775,7 @@ impl RasterPanel {
     fn color_range(&self) -> Option<(f64, f64)> {
         self.active()
             .map(|source| {
-                let (min, max) = source.range();
+                let (min, max) = self.playback_style().range_for(source);
                 (f64::from(min), f64::from(max))
             })
             .or_else(|| self.active_vector().and_then(|source| source.range()))
@@ -712,7 +784,11 @@ impl RasterPanel {
     fn data_range(&self) -> Option<(f64, f64)> {
         self.active()
             .map(|source| {
-                let (min, max) = source.data_range();
+                let (min, max) = if self.playback_dataset().is_some() {
+                    source.data_range_with_scale(self.playback_style().scale_for(source))
+                } else {
+                    source.data_range()
+                };
                 (f64::from(min), f64::from(max))
             })
             .or_else(|| self.active_vector().and_then(|source| source.data_range()))
@@ -720,13 +796,13 @@ impl RasterPanel {
 
     fn color_palette(&self) -> Option<ColorMapPreset> {
         self.active()
-            .map(|source| source.palette())
+            .map(|source| self.playback_style().palette_for(source))
             .or_else(|| self.active_vector().filter(|source| source.property().is_some()).map(|source| source.palette()))
     }
 
     fn color_map_direction(&self) -> ColorMapDirection {
         self.active()
-            .map(|source| source.color_map_direction())
+            .map(|source| self.playback_style().color_map_direction_for(source))
             .or_else(|| self.active_vector().map(|source| source.color_map_direction()))
             .unwrap_or_default()
     }
@@ -736,7 +812,10 @@ impl RasterPanel {
         if self.color_range().is_none() || self.color_map_direction() == direction {
             return;
         }
-        let result = if let Some(source) = self.active() {
+        let result = if self.playback_dataset().is_some() {
+            self.set_playback_style(self.playback_style().with_color_map_direction(direction));
+            Ok(())
+        } else if let Some(source) = self.active() {
             source.with_color_map_direction(direction).map(|source| self.replace_raster(source))
         } else if let Some(source) = self.active_vector() {
             source.with_color_map_direction(direction).map(|source| self.replace_vector(source))
@@ -757,7 +836,8 @@ impl RasterPanel {
         }
     }
 
-    fn sync_palette(&self, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_legend_colors();
         let direction = self.color_map_direction();
         let preset = self.color_palette().unwrap_or(ColorMapPreset::Turbo);
         let palette = PALETTES.iter().find(|(_, value)| *value == preset).map_or("Turbo", |(name, _)| *name);
@@ -765,6 +845,29 @@ impl RasterPanel {
             state.set_items(palette_choices(direction), window, cx);
             state.set_selected_value(&palette, window, cx);
         });
+    }
+
+    fn refresh_legend_colors(&mut self) {
+        let Some(palette) = self.color_palette() else { return };
+        let key = (palette, self.color_map_direction());
+        if self.legend_palette == Some(key) {
+            return;
+        }
+        self.legend_colors = if let Some(source) = self.active().filter(|_| self.playback_dataset().is_none()) {
+            let range = source.range();
+            (0..256)
+                .map(|ix| {
+                    source
+                        .legend()
+                        .color_for_value(range_value((f64::from(range.0), f64::from(range.1)), ix as f64 / 255.0) as f32, None)
+                })
+                .collect::<Vec<_>>()
+                .into()
+        } else {
+            let colors = ProcessedColorMap::<256>::create_for_preset(key.0, key.1);
+            (0..=255).map(|ix| colors.get_color_by_value(ix)).collect::<Vec<_>>().into()
+        };
+        self.legend_palette = Some(key);
     }
 
     fn apply_slider_range(&mut self, positions: (f32, f32), window: &mut Window, cx: &mut Context<Self>) {
@@ -850,6 +953,22 @@ impl RasterPanel {
         }
     }
 
+    fn playback_style(&self) -> PlaybackStyle {
+        self.playback_dataset()
+            .and_then(|dataset| dataset.playback.as_ref())
+            .map_or(PlaybackStyle::default(), PlaybackRequest::style)
+    }
+
+    fn set_playback_style(&mut self, style: PlaybackStyle) {
+        let Some(SelectionId::Raster(id)) = self.selected else { return };
+        let Some(dataset) = self.dataset_indices.get(&id).and_then(|ix| self.raster_datasets.get_mut(*ix)) else {
+            return;
+        };
+        if let Some(request) = &mut dataset.playback {
+            *request = request.clone().with_style(style);
+        }
+    }
+
     fn replace_vector(&mut self, source: Arc<VectorSource>) {
         if let Some(current) = self.vectors.iter_mut().find(|current| current.id() == source.id()) {
             *current = source;
@@ -866,14 +985,25 @@ impl RasterPanel {
     }
 
     fn set_unscaling(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(source) = self.active() else { return };
-        if !source.has_scale_metadata() || source.unscaling_enabled() == enabled {
+        let Some(source) = self.active().cloned() else { return };
+        if !source.has_scale_metadata() || self.playback_style().unscaling_for(&source) == enabled {
             return;
         }
-        match source.with_unscaling(enabled) {
-            Ok(source) => {
+        let result = if self.playback_dataset().is_some() {
+            self.playback_style_in_units(enabled).map(|style| {
+                let range = style.range_for(&source);
+                self.set_playback_style(style);
+                range
+            })
+        } else {
+            source.with_unscaling(enabled).map(|source| {
                 let range = source.range();
                 self.replace_raster(source);
+                range
+            })
+        };
+        match result {
+            Ok(range) => {
                 self.min.update(cx, |input, cx| input.set_value(format!("{:.2}", range.0), window, cx));
                 self.max.update(cx, |input, cx| input.set_value(format!("{:.2}", range.1), window, cx));
                 self.error = None;
@@ -888,14 +1018,37 @@ impl RasterPanel {
         }
     }
 
+    fn playback_style_in_units(&self, enabled: bool) -> anyhow::Result<PlaybackStyle> {
+        let source = self.active().ok_or_else(|| anyhow::anyhow!("No raster selected"))?;
+        let current = self.playback_style();
+        let target = current.with_unscaling(enabled);
+        let old_scale = current.scale_for(source);
+        let scale = target.scale_for(source);
+        let range = current.range_for(source);
+        let convert = |value: f32| ((f64::from(value) - old_scale.offset) / old_scale.scale * scale.scale + scale.offset) as f32;
+        let first = convert(range.0);
+        let last = convert(range.1);
+        if old_scale.scale != 0.0
+            && let Ok(style) = target.with_range((first.min(last), first.max(last)))
+        {
+            return Ok(style);
+        }
+        target.with_range(source.data_range_with_scale(scale))
+    }
+
     fn set_clamp_colors(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let Some(source) = self.active() else { return };
-        if source.clamp_colors() == enabled {
+        if self.playback_style().clamp_colors_for(source) == enabled {
             return;
         }
-        match source.with_clamp_colors(enabled) {
-            Ok(source) => {
-                self.replace_raster(source);
+        let result = if self.playback_dataset().is_some() {
+            self.set_playback_style(self.playback_style().with_clamp_colors(enabled));
+            Ok(())
+        } else {
+            source.with_clamp_colors(enabled).map(|source| self.replace_raster(source))
+        };
+        match result {
+            Ok(()) => {
                 self.error = None;
                 self.watch_tile_errors(cx);
                 self.emit(false, cx);
@@ -914,13 +1067,17 @@ impl RasterPanel {
     }
 
     pub fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_playback(0.0);
         self.load_generation += 1;
         self.load_task = None;
         self.tile_errors_task = None;
+        self.tile_errors_source = None;
         self.loading = false;
         self.load_progress = None;
         self.sources.clear();
         self.raster_datasets.clear();
+        self.source_indices.clear();
+        self.dataset_indices.clear();
         self.vectors.clear();
         self.band_scroll = 0.0;
         self.palette_scroll = 0.0;
@@ -957,11 +1114,14 @@ impl RasterPanel {
     }
 
     fn restyle_raster(&mut self, palette: ColorMapPreset, cx: &App) -> anyhow::Result<()> {
-        let Some(source) = self.active() else { return Ok(()) };
         let min = self.min.read(cx).value().trim().parse::<f32>()?;
         let max = self.max.read(cx).value().trim().parse::<f32>()?;
-        // Repeated commits must not invalidate raster tiles.
-        if source.palette() != palette || source.range() != (min, max) {
+        if self.playback_dataset().is_some() {
+            let style = self.playback_style().with_range((min, max))?.with_palette(palette);
+            self.set_playback_style(style);
+        } else if let Some(source) = self.active()
+            && (source.palette() != palette || source.range() != (min, max))
+        {
             let source = source.restyled(palette, (min, max))?;
             self.replace_raster(source);
         }
@@ -974,6 +1134,7 @@ impl RasterPanel {
         }
         match self.restyle_active_source(cx) {
             Ok(()) => {
+                self.refresh_legend_colors();
                 self.error = None;
                 self.watch_tile_errors(cx);
                 self.sync_range_slider(window, cx);
@@ -988,6 +1149,189 @@ impl RasterPanel {
 }
 
 impl RasterPanel {
+    fn playback_dataset(&self) -> Option<&RasterDataset> {
+        self.active_dataset().filter(|dataset| dataset.playback.is_some())
+    }
+
+    /// Current playback command, with each band's retained style. The renderer owns the clock.
+    /// Style snapshots refresh on every emit without changing the command revision.
+    pub fn playback_request(&self) -> Option<PlaybackRequest> {
+        let request = self.playback_dataset()?.playback.as_ref()?;
+        Some(request.clone().with_controls(
+            self.playback.position,
+            self.playback.revision,
+            self.playback.playing,
+            self.playback.bands_per_second,
+        ))
+    }
+
+    fn revise_playback(&mut self) {
+        self.playback.revision = self.playback.revision.wrapping_add(1);
+        self.playback.buffering = false;
+    }
+
+    fn reset_playback(&mut self, position: f64) {
+        self.playback.position = position;
+        self.playback.playing = false;
+        self.revise_playback();
+    }
+
+    fn toggle_playback(&mut self, cx: &mut Context<Self>) {
+        if self.playback_dataset().is_none() {
+            return;
+        }
+        self.playback.playing = !self.playback.playing;
+        self.revise_playback();
+        self.emit(false, cx);
+    }
+
+    fn set_playback_speed(&mut self, speed: u8, cx: &mut Context<Self>) {
+        if self.playback_dataset().is_none() || !PLAYBACK_SPEEDS.contains(&speed) {
+            return;
+        }
+        let speed = f64::from(speed);
+        if self.playback.bands_per_second == speed {
+            return;
+        }
+        self.playback.bands_per_second = speed;
+        self.revise_playback();
+        self.emit(false, cx);
+    }
+
+    fn sync_playback_color_controls(&mut self, previous: Option<&RasterSource>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(source) = self.active() else { return };
+        let style = self.playback_style();
+        let range = style.range_for(source);
+        let palette_changed = previous.is_none_or(|previous| {
+            style.palette_for(previous) != style.palette_for(source) || style.color_map_direction_for(previous) != style.color_map_direction_for(source)
+        });
+        let range_changed = previous.is_none_or(|previous| style.range_for(previous) != range);
+        let editing_range = [&self.min, &self.max].iter().any(|input| input.read(cx).focus_handle(cx).is_focused(window));
+        if palette_changed {
+            self.sync_palette(window, cx);
+        }
+        // Feedback must not replace unfinished text or rebuild an unchanged palette popup.
+        if range_changed && !editing_range {
+            self.set_range_inputs((f64::from(range.0), f64::from(range.1)), window, cx);
+        }
+        self.sync_range_slider(window, cx);
+    }
+
+    /// Accept renderer feedback without emitting a new command or changing its revision.
+    /// Frames from a replaced dataset or an earlier user command are ignored.
+    pub fn apply_playback_frame(&mut self, frame: PlaybackFrame, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dataset) = self.playback_dataset() else { return };
+        if dataset.bands.first().copied() != Some(frame.dataset_id()) || self.playback.revision != frame.revision() {
+            return;
+        }
+        let position = frame.position();
+        if !position.is_finite() || !(0.0..dataset.bands.len() as f64).contains(&position) {
+            return;
+        }
+        let slider_position = (position + 1.0).min(dataset.bands.len() as f64) as f32;
+        let selected = Some(SelectionId::Raster(dataset.bands[position.floor() as usize]));
+        let changed_band = self.selected != selected;
+        let previous_style = self.active().cloned();
+        self.playback.position = position;
+        self.playback.buffering = frame.is_buffering();
+        if changed_band {
+            self.selected = selected;
+            self.sync_band_controls(window, cx);
+            self.sync_playback_color_controls(previous_style.as_deref(), window, cx);
+            self.watch_tile_errors(cx);
+        }
+        // The final-to-first blend has no tick beyond the last band. Retain its
+        // fraction in playback state, but keep the slider inside its domain.
+        // SliderState::set_value is an owner sync, not a SliderEvent::Change.
+        self.band_slider.update(cx, |slider, cx| slider.set_value(slider_position, window, cx));
+        cx.notify();
+    }
+
+    fn render_playback_controls(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
+        let dataset = self.playback_dataset()?;
+        let count = dataset.bands.len();
+        let status = if self.playback.buffering {
+            "Buffering"
+        } else if self.playback.playing {
+            "Playing"
+        } else {
+            "Paused"
+        };
+        Some(
+            div()
+                .id("raster-playback-controls")
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Button::new("first-raster-band")
+                                .small()
+                                .ghost()
+                                .icon(IconName::SkipBack)
+                                .accessibility_label("First band")
+                                .tooltip("First band")
+                                .disabled(self.playback.position == 0.0)
+                                .on_click(cx.listener(|this, _, window, cx| this.select_band(1, window, cx))),
+                        )
+                        .child(
+                            Button::new("toggle-raster-playback")
+                                .small()
+                                .icon(if self.playback.playing { IconName::Pause } else { IconName::Play })
+                                .accessibility_label(if self.playback.playing { "Pause" } else { "Play" })
+                                .tooltip(if self.playback.playing { "Pause playback" } else { "Play bands" })
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_playback(cx))),
+                        )
+                        .child(
+                            Button::new("last-raster-band")
+                                .small()
+                                .ghost()
+                                .icon(IconName::SkipForward)
+                                .accessibility_label("Last band")
+                                .tooltip("Last band")
+                                .disabled(self.playback.position == (count - 1) as f64)
+                                .on_click(cx.listener(move |this, _, window, cx| this.select_band(count, window, cx))),
+                        )
+                        .child(
+                            div()
+                                .id("raster-playback-status")
+                                .role(gpui_kit::Role::Status)
+                                .test_support()
+                                .aria_label(status)
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(status),
+                        ),
+                )
+                .child(self.render_playback_options(cx)),
+        )
+    }
+
+    fn render_playback_options(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        div().flex().flex_col().gap_2().child(
+            div().flex().items_center().gap_3().child(field_label("Speed (bands/sec)", cx)).child(
+                div().id("raster-playback-speed").test_support().flex_1().min_w_0().child(
+                    ButtonGroup::new("raster-playback-speed-presets")
+                        .small()
+                        .w_full()
+                        .children(PLAYBACK_SPEEDS.into_iter().map(|speed| {
+                            Button::new(("raster-playback-speed", usize::from(speed)))
+                                .label(speed.to_string())
+                                .accessibility_label(format!("{speed} bands per second"))
+                                .selected(self.playback.bands_per_second == f64::from(speed))
+                                .flex_1()
+                                .on_click(cx.listener(move |this, _, _, cx| this.set_playback_speed(speed, cx)))
+                        })),
+                ),
+            ),
+        )
+    }
+
     fn render_band_selector(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
         let dataset = self.active_dataset().filter(|dataset| dataset.bands.len() > 1)?;
         let count = dataset.bands.len();
@@ -1033,40 +1377,44 @@ impl RasterPanel {
                                 .child(band.to_string())
                         })),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .child(
-                            Button::new("previous-raster-band")
-                                .small()
-                                .ghost()
-                                .icon(IconName::ChevronLeft)
-                                .accessibility_label("Previous band")
-                                .disabled(band == 1)
-                                .on_click(cx.listener(move |this, _, window, cx| this.select_band(band - 1, window, cx))),
-                        )
-                        .child(
-                            div().id("raster-band-slider").test_support().flex_1().min_w_0().px_2().child(
-                                Slider::new(&self.band_slider)
-                                    .accessibility_label("Band")
-                                    .bg(cx.theme().foreground)
-                                    .text_color(cx.theme().background),
-                            ),
-                        )
-                        .child(
-                            Button::new("next-raster-band")
-                                .small()
-                                .ghost()
-                                .icon(IconName::ChevronRight)
-                                .accessibility_label("Next band")
-                                .disabled(band == count)
-                                .on_click(cx.listener(move |this, _, window, cx| this.select_band(band + 1, window, cx))),
-                        ),
-                )
-                .child(render_band_ticks(count, cx)),
+                .child(self.render_band_navigation(band, count, cx))
+                .child(render_band_ticks(count, cx))
+                .children(self.render_playback_controls(cx)),
         )
+    }
+
+    fn render_band_navigation(&self, band: usize, count: usize, cx: &Context<Self>) -> impl IntoElement + use<> {
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                Button::new("previous-raster-band")
+                    .small()
+                    .ghost()
+                    .icon(IconName::ChevronLeft)
+                    .accessibility_label("Previous band")
+                    .disabled(band == 1)
+                    .on_click(cx.listener(move |this, _, window, cx| this.select_band(band - 1, window, cx))),
+            )
+            .child(
+                div()
+                    .id("raster-band-slider")
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .px_2()
+                    .child(Slider::new(&self.band_slider).accessibility_label("Band")),
+            )
+            .child(
+                Button::new("next-raster-band")
+                    .small()
+                    .ghost()
+                    .icon(IconName::ChevronRight)
+                    .accessibility_label("Next band")
+                    .disabled(band == count)
+                    .on_click(cx.listener(move |this, _, window, cx| this.select_band(band + 1, window, cx))),
+            )
     }
 
     pub fn render_layer_selector(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement + use<> {
@@ -1234,7 +1582,7 @@ impl Render for RasterPanel {
 impl RasterPanel {
     fn render_legend(&self, cx: &App) -> impl IntoElement {
         let mut legend = div().id("raster-legend").test_support().flex().flex_col().gap_1();
-        if let Some(((min, max), palette)) = self.color_range().zip(self.color_palette()) {
+        if let Some(((min, max), _)) = self.color_range().zip(self.color_palette()) {
             legend = legend
                 .child(
                     div()
@@ -1244,20 +1592,13 @@ impl RasterPanel {
                         .text_color(cx.theme().muted_foreground)
                         .children((0..5).map(|ix| format_value(range_value((min, max), ix as f64 / 4.0)))),
                 )
-                .child(self.render_legend_swatches((min, max), palette, cx));
+                .child(self.render_legend_swatches(cx));
         }
         legend
     }
 
-    fn render_legend_swatches(&self, range: (f64, f64), palette: ColorMapPreset, cx: &App) -> impl IntoElement {
-        let colors = ProcessedColorMap::<256>::create_for_preset(palette, self.color_map_direction());
-        let swatches = (0..256).map(|ix| {
-            if let Some(source) = self.active() {
-                source.legend().color_for_value(range_value(range, ix as f64 / 255.0) as f32, None)
-            } else {
-                colors.get_color_by_value(ix as u8)
-            }
-        });
+    fn render_legend_swatches(&self, cx: &App) -> impl IntoElement {
+        let swatches = self.legend_colors.iter().copied();
         div()
             .flex()
             .w_full()
@@ -1311,7 +1652,7 @@ impl RasterPanel {
                 Checkbox::new("raster-clamp-colors")
                     .small()
                     .label("Clamp colors")
-                    .checked(source.clamp_colors())
+                    .checked(self.playback_style().clamp_colors_for(source))
                     .tooltip("Use endpoint colors outside the range; when off, render those values as nodata")
                     .on_change(cx.listener(|this, enabled, _, cx| this.set_clamp_colors(*enabled, cx)))
             }))
@@ -1319,7 +1660,7 @@ impl RasterPanel {
                 Checkbox::new("raster-unscaling")
                     .small()
                     .label("Descale values")
-                    .checked(source.unscaling_enabled())
+                    .checked(self.playback_style().unscaling_for(source))
                     .tooltip("Apply the raster’s scale and offset to pixel values")
                     .on_change(cx.listener(|this, enabled, window, cx| this.set_unscaling(*enabled, window, cx)))
             }))
@@ -1398,6 +1739,8 @@ fn load_path(path: PathBuf, index: usize, path_count: f64, progress: &async_chan
                         path: path.canonicalize().unwrap_or_else(|_| path.clone()),
                         bands: opened.iter().map(|source| source.metadata().id).collect(),
                         selected: first.metadata().id,
+                        playback: (opened.len() > 1 && first.metadata().source_format == tiler::LayerSourceType::CloudOptimizedGeoTiff)
+                            .then(|| PlaybackRequest::new(opened.clone(), 0.0, 0, false, 3.0, true)),
                     });
                     loaded.selected = Some(SelectionId::Raster(first.metadata().id));
                 }
@@ -1548,6 +1891,10 @@ fn format_value(value: f64) -> String {
         format!("{value:.3}").trim_end_matches('0').trim_end_matches('.').to_owned()
     }
 }
+
+#[cfg(test)]
+#[path = "raster_panel_playback_tests.rs"]
+mod playback_tests;
 
 #[cfg(test)]
 #[path = "raster_panel_progress_tests.rs"]
@@ -1919,6 +2266,7 @@ mod tests {
         cx.new(|cx: &mut Context<Vec<RasterEvent>>| {
             cx.subscribe(panel, |events, _, event, _| {
                 events.push(RasterEvent {
+                    playback: event.playback(),
                     source: event.source(),
                     vector_source: event.vector_source(),
                     opacity: event.opacity(),

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use geo::{AnyDenseArray, Coordinate, GeoReference, Tile, crs};
+use geo::{AnyDenseArray, Coordinate, GeoReference, RasterScale, Tile, crs};
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::{
     AppContext, Context, InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, Task, TestSupportExt, Window, div,
@@ -137,8 +137,7 @@ impl PixelValueCache {
         // Keep cached samples raw; nodata must be rejected before applying even a zero scale.
         let value = match tile.value(request.coordinate) {
             PixelValue::Data(raw) => {
-                let scale = request.source.scale();
-                let physical = raw * scale.scale + scale.offset;
+                let physical = raw * request.scale.scale + request.scale.offset;
                 if physical.is_finite() {
                     PixelValue::Data(physical)
                 } else {
@@ -175,6 +174,7 @@ struct SampleRequest {
     source: Arc<RasterSource>,
     coordinate: Coordinate,
     dpi: u8,
+    scale: RasterScale,
 }
 
 impl SampleRequest {
@@ -227,10 +227,15 @@ impl PixelInfo {
     }
 
     pub fn show(&mut self, coordinate: Coordinate, source: Option<Arc<RasterSource>>, dpi: u8, cx: &mut Context<Self>) {
+        let scale = source.as_ref().map_or_else(RasterScale::default, |source| source.scale());
+        self.show_with_scale(coordinate, source, dpi, scale, cx);
+    }
+
+    /// Samples a raw band using the effective display conversion without rebuilding its source.
+    pub fn show_with_scale(&mut self, coordinate: Coordinate, source: Option<Arc<RasterSource>>, dpi: u8, scale: RasterScale, cx: &mut Context<Self>) {
         let position = (coordinate, source.as_ref().map(|source| source.metadata().id), dpi);
         // Display identity includes units; raw tile identity deliberately does not.
-        let same_units = self.current.as_ref().map(|request| request.source.unscaling_enabled())
-            == source.as_ref().filter(|source| source.is_numeric()).map(|source| source.unscaling_enabled());
+        let same_units = self.current.as_ref().map(|request| request.scale) == source.as_ref().filter(|source| source.is_numeric()).map(|_| scale);
         if self.position == Some(position) && same_units {
             return;
         }
@@ -241,7 +246,12 @@ impl PixelInfo {
             None => PixelValue::CoordinatesOnly,
             Some(source) if source.metadata().band_nr.is_none() => PixelValue::Unavailable,
             Some(source) => {
-                let request = SampleRequest { source, coordinate, dpi };
+                let request = SampleRequest {
+                    source,
+                    coordinate,
+                    dpi,
+                    scale,
+                };
                 let value = self
                     .cache
                     .lookup(&request)
@@ -381,6 +391,7 @@ mod tests {
                 source: source.clone(),
                 coordinate,
                 dpi,
+                scale: source.scale(),
             };
             if self.lookup(&request).is_none() {
                 self.insert(CachedTile::load(source, request.key()));
@@ -482,6 +493,7 @@ mod tests {
                     source: source.clone(),
                     coordinate,
                     dpi,
+                    scale: source.scale(),
                 };
                 let key = request.key();
                 let tile = cache.tiles.iter().find(|tile| tile.key == key).unwrap();
@@ -523,7 +535,12 @@ mod tests {
         drop(dataset);
         let source = RasterSource::open(&path).unwrap().remove(0);
         let coordinate = Coordinate::latlon(-0.15625, 0.15625);
-        let request = SampleRequest { source, coordinate, dpi: 1 };
+        let request = SampleRequest {
+            scale: source.scale(),
+            source,
+            coordinate,
+            dpi: 1,
+        };
         let mut tile = CachedTile::load(&request.source, request.key());
         // The fixture is Float32; inject a finite Float64 sample that overflows only after conversion.
         let metadata = *tile.data.as_ref().unwrap().as_ref().unwrap().metadata();
@@ -683,13 +700,58 @@ mod tests {
         for (snapshot, expected) in [(source, physical), (raw, 74.0), (source, physical)] {
             info.show(coordinate, Some(snapshot.clone()), 1, cx);
             assert_eq!(info.value, PixelValue::Data(expected));
-            assert_eq!(info.current.as_ref().unwrap().source.unscaling_enabled(), snapshot.unscaling_enabled());
+            assert_eq!(info.current.as_ref().unwrap().scale, snapshot.scale());
             assert!(info.task.is_none(), "Cached toggles must not start a new read");
             assert_eq!((info.cache.tiles.len(), info.cache.bytes), (retained_tiles, retained_bytes));
             let key = info.current.as_ref().unwrap().key();
             let tile = info.cache.tiles.iter().find(|tile| tile.key == key).unwrap();
             assert_eq!(tile.value(coordinate), PixelValue::Data(74.0));
         }
+    }
+
+    #[gpui_kit::test]
+    fn explicit_scale_changes_refresh_the_same_raw_source_and_cache_without_rereading(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raster.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
+        let source = RasterSource::open(&path).unwrap().remove(0);
+        let coordinate = Coordinate::latlon(-0.15625, 0.15625);
+        let info = cx.new(|_| PixelInfo::new());
+        let scale = RasterScale { scale: -0.5, offset: 7.0 };
+        cx.update(|cx| {
+            info.update(cx, |info, cx| {
+                info.show(coordinate, Some(source.clone()), 1, cx);
+                assert!(info.task.is_some());
+                info.show_with_scale(coordinate, Some(source.clone()), 1, scale, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| info.read(cx).value), PixelValue::Data(-30.0));
+        std::fs::remove_file(&path).unwrap();
+        cx.update(|cx| {
+            info.update(cx, |info, cx| {
+                let retained = (info.cache.tiles.len(), info.cache.bytes);
+                let key = info.current.as_ref().unwrap().key();
+                for update in 0..64 {
+                    let scale = RasterScale {
+                        scale: f64::from(update) * 0.5,
+                        offset: -11.0,
+                    };
+                    info.show_with_scale(coordinate, Some(source.clone()), 1, scale, cx);
+                    assert_eq!(info.value, PixelValue::Data(74.0 * scale.scale + scale.offset));
+                    assert_eq!(info.current.as_ref().unwrap().key(), key);
+                    assert!(Arc::ptr_eq(&info.current.as_ref().unwrap().source, &source));
+                    assert!(info.task.is_none());
+                    assert_eq!((info.cache.tiles.len(), info.cache.bytes), retained);
+                    assert_eq!(
+                        info.cache.tiles.iter().find(|tile| tile.key == key).unwrap().value(coordinate),
+                        PixelValue::Data(74.0)
+                    );
+                }
+                info.show(coordinate, Some(source.clone()), 1, cx);
+                assert_eq!(info.value, PixelValue::Data(74.0), "Standalone show must restore the source's own scale");
+            });
+        });
     }
 
     #[gpui_kit::test]

@@ -205,7 +205,12 @@ impl RasterSource {
         self.range
     }
     pub fn data_range(&self) -> (f32, f32) {
-        scaled_range(&self.metadata, self.scale())
+        self.data_range_with_scale(self.scale())
+    }
+
+    /// Derives display bounds from retained statistics without rebuilding a style.
+    pub fn data_range_with_scale(&self, scale: RasterScale) -> (f32, f32) {
+        scaled_range(&self.metadata, scale)
     }
     pub fn palette(&self) -> ColorMapPreset {
         self.palette
@@ -246,6 +251,31 @@ impl RasterSource {
             return Ok(None);
         }
         NumericTile::decode(&raw.data).map(Some)
+    }
+
+    /// Reads a contiguous 1-based, half-open COG band window in bounded batches.
+    /// Empty coverage retains its band slot; numeric values remain raw.
+    /// Cooperatively cancels obsolete windows between I/O and decode work.
+    pub fn numeric_band_tiles_cancellable(&self, tile: Tile, bands: std::ops::Range<usize>, cancelled: impl Fn() -> bool) -> Result<Vec<Option<NumericTile>>> {
+        let request = TileRequest {
+            tile,
+            dpi_ratio: 1,
+            tile_size: self.metadata.tile_size.unwrap_or(TILE_SIZE),
+            tile_format: TileFormat::RasterTile,
+        };
+        DynamicTileProvider::get_multiband_tile_for_layer_cancellable(&self.metadata, &request, bands, &cancelled)?
+            .into_iter()
+            .map(|data| {
+                ensure!(!cancelled(), "Multiband tile request cancelled");
+                if data.is_empty() {
+                    return Ok(None);
+                }
+                let width = data.columns().0 as u32;
+                let height = data.rows().0 as u32;
+                let values = data.iter_opt().map(|value| value.filter(|v| v.is_finite()).unwrap_or(f32::NAN)).collect();
+                Ok(Some(NumericTile { width, height, values }))
+            })
+            .collect()
     }
 
     pub fn palette_rgba(&self) -> Vec<u8> {
@@ -338,13 +368,7 @@ fn raster_metadata(path: &Path, options: &TileProviderOptions) -> Result<RasterM
             source_files: Some(directory),
         });
     }
-    let mut metadata = provider_metadata(path, options)?;
-    if metadata.iter().any(|meta| meta.source_format == LayerSourceType::CloudOptimizedGeoTiff) && dataset?.raster_count() > 1 {
-        metadata = WarpingTileProvider::new(path, options)?.layers();
-        for meta in &mut metadata {
-            meta.source_format = LayerSourceType::GeoTiff;
-        }
-    }
+    let metadata = provider_metadata(path, options)?;
     Ok(RasterMetadata {
         layers: metadata,
         source_files: None,

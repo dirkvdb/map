@@ -40,6 +40,7 @@ fn deliver_frame(view: &Entity<MapView>, source: u64, settled: bool, image: anyh
     view.update(cx, |view, cx| {
         view.apply_frame(
             MapFrame {
+                playback: None,
                 viewport: view.viewport.unwrap(),
                 basemap: basemap_style(cx),
                 tile_boundaries: view.tile_boundaries,
