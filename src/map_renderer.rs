@@ -1855,6 +1855,74 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only synthetic offline raster data"]
+    fn global_raster_registration_matches_fitted_camera_at_low_zoom() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("global-latitudes.tif");
+        write_global_latitude_fixture(&path)?;
+        let source = RasterSource::open(&path)?
+            .remove(0)
+            .restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
+        let viewport = Viewport {
+            width: NonZeroU32::new(1200).unwrap(),
+            height: NonZeroU32::new(760).unwrap(),
+            scale: 1.0,
+        };
+        let camera = MapCamera::fit_bounds(source.metadata().bounds, 1200.0, 760.0);
+        let request = MapRequest { viewport, camera };
+        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
+        let image = map.render_raster(request, Some(source.clone()), 1.0)?;
+        assert_eq!(image.dimensions(), (1200, 760));
+        assert_global_latitude_registration(&image, camera, &source);
+
+        // Recreate the old 85%-height world without changing production camera code.
+        let mut unconstrained = camera;
+        unconstrained.zoom_at(0.85_f64.log2(), (0.0, 0.0));
+        let coordinate = unconstrained.coordinate_at((-39.5, 212.5));
+        assert!(coordinate.latitude < -74.0, "The old camera must predict southern data: {coordinate:?}");
+        let old_image = map.render_raster(
+            MapRequest {
+                camera: unconstrained,
+                ..request
+            },
+            Some(source),
+            1.0,
+        )?;
+        assert_eq!(
+            *old_image.get_pixel(560, 592),
+            image::Rgba([32, 32, 32, 255]),
+            "Native HeightOnly zoom puts this old-camera southern-data probe over nodata"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; uses only synthetic offline raster data"]
+    fn global_raster_registration_matches_viewport_constrained_polar_pan() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("global-latitudes.tif");
+        write_global_latitude_fixture(&path)?;
+        let source = RasterSource::open(&path)?
+            .remove(0)
+            .restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0))?;
+        let viewport = Viewport {
+            width: NonZeroU32::new(1200).unwrap(),
+            height: NonZeroU32::new(760).unwrap(),
+            scale: 1.0,
+        };
+        let mut camera = MapCamera::fit_bounds(source.metadata().bounds, 1200.0, 760.0);
+        camera.zoom_at(1.0, (0.0, 0.0));
+        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
+        for dy in [-10_000.0, 10_000.0] {
+            camera.pan(0.0, dy);
+            camera.constrain_to_viewport(760.0);
+            let image = map.render_raster(MapRequest { viewport, camera }, Some(source.clone()), 1.0)?;
+            assert_global_latitude_registration(&image, camera, &source);
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires a graphics device and MAP_TEST_NETCDF pointing to the Abu Dhabi WBGT example"]
     fn local_wbgt_netcdf_places_the_coast_north_and_desert_south() -> Result<()> {
         let path = std::path::PathBuf::from(std::env::var("MAP_TEST_NETCDF")?);
@@ -2140,6 +2208,51 @@ mod tests {
     fn render_gray_raster(map: &mut NativeMap, request: MapRequest, source: &RasterSource, range: (f32, f32)) -> Result<RgbaImage> {
         let source = source.restyled(inf::colormap::ColorMapPreset::Gray, range)?;
         map.render_raster(request, Some(source), 1.0)
+    }
+
+    fn write_global_latitude_fixture(path: &std::path::Path) -> Result<()> {
+        let mut dataset = gdal::DriverManager::get_driver_by_name("GTiff")?.create_with_band_type::<f32, _>(path, 720, 360, 1)?;
+        dataset.set_geo_transform(&[-180.0, 0.5, 0.0, 90.0, 0.0, -0.5])?;
+        dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(4326)?)?;
+        let mut band = dataset.rasterband(1)?;
+        band.set_no_data_value(Some(-9999.0))?;
+        let mut values = vec![-9999.0_f32; 720 * 360];
+        values[..720 * 36].fill(128.0);
+        values[720 * 324..].fill(192.0);
+        band.write((0, 0), (720, 360), &mut gdal::raster::Buffer::new((720, 360), values))?;
+        Ok(dataset.close()?)
+    }
+
+    fn assert_global_latitude_registration(image: &RgbaImage, camera: MapCamera, source: &RasterSource) {
+        let mut counts = [0; 2];
+        let probes = (24..image.height() - 24)
+            .step_by(19)
+            .flat_map(|y| (24..image.width() - 24).step_by(97).map(move |x| (x, y)));
+        for (x, y) in probes {
+            let offset = (
+                f64::from(x) + 0.5 - f64::from(image.width()) / 2.0,
+                f64::from(y) + 0.5 - f64::from(image.height()) / 2.0,
+            );
+            let coordinate = camera.coordinate_at(offset);
+            // Ignore warp resampling and native raster alignment near mask edges.
+            if (coordinate.latitude.abs() - 72.0).abs() < 2.0 {
+                continue;
+            }
+            let expected = if coordinate.latitude < -72.0 {
+                legend_pixel(source, 192.0)
+            } else if coordinate.latitude > 72.0 {
+                legend_pixel(source, 128.0)
+            } else {
+                image::Rgba([32, 32, 32, 255])
+            };
+            counts[usize::from(coordinate.latitude.abs() > 72.0)] += 1;
+            assert_eq!(
+                *image.get_pixel(x, y),
+                expected,
+                "Rendered global raster must agree with coordinate_at at pixel ({x}, {y}), {coordinate:?}, camera {camera:?}"
+            );
+        }
+        assert!(counts.into_iter().all(|count| count > 20), "Exercise both nodata and polar data: {counts:?}");
     }
 
     fn open_raster_fixture(path: &std::path::Path, epsg: u32, bands: usize) -> Result<Vec<Arc<RasterSource>>> {

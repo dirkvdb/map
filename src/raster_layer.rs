@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use geo::Tile;
-use inf::colormap::ColorMapPreset;
+use inf::colormap::{ColorMapDirection, ColorMapPreset};
 use maplibre_native::{WgpuCustomLayer, WgpuLayerParameters, texture_format_from_webgpu};
 
 use crate::raster_source::{NumericTile, RasterSource};
@@ -60,7 +60,7 @@ struct RasterPipeline {
     layout: wgpu::BindGroupLayout,
     palettes: [wgpu::Texture; 2],
     palette_views: [wgpu::TextureView; 2],
-    presets: [Option<ColorMapPreset>; 2],
+    presets: [Option<(ColorMapPreset, ColorMapDirection)>; 2],
     empty: TileTexture,
 }
 
@@ -363,9 +363,10 @@ impl RasterLayer {
         let Some(pipeline) = &mut self.pipeline else { return };
         let previous_source = self.previous.as_ref().map_or(source, |previous| &previous.source);
         for (ix, source) in [source, previous_source].into_iter().enumerate() {
-            if pipeline.presets[ix] != Some(source.palette()) {
+            let key = palette_key(source);
+            if pipeline.presets[ix] != Some(key) {
                 write_texture(&self.queue, &pipeline.palettes[ix], &source.palette_rgba(), 256, 1, 4);
-                pipeline.presets[ix] = Some(source.palette());
+                pipeline.presets[ix] = Some(key);
             }
         }
         pass.set_pipeline(&pipeline.pipeline);
@@ -594,6 +595,10 @@ impl RasterPipeline {
     }
 }
 
+fn palette_key(source: &RasterSource) -> (ColorMapPreset, ColorMapDirection) {
+    (source.palette(), source.color_map_direction())
+}
+
 fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wgpu::BindGroupLayout, fragment: &str) -> wgpu::RenderPipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Numeric raster layout"),
@@ -698,5 +703,42 @@ fn upload_tile(device: &wgpu::Device, queue: &wgpu::Queue, mut data: NumericTile
         values: values.create_view(&Default::default()),
         valid: mask.create_view(&Default::default()),
         bytes: data.values.len() * 5,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_keys_invalidate_current_and_outgoing_slots_independently_on_reversal() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("palette.tif");
+        crate::raster_source::test_support::write_byte_raster(&path)?;
+        let regular = RasterSource::open(&path)?.remove(0);
+        let reversed = regular.with_color_map_direction(ColorMapDirection::Reversed)?;
+        let cached = [Some(palette_key(&regular)); 2];
+        for (sources, expected) in [([&*reversed, &*regular], [true, false]), ([&*regular, &*reversed], [false, true])] {
+            let needs_upload: [bool; 2] = std::array::from_fn(|ix| cached[ix] != Some(palette_key(sources[ix])));
+            assert_eq!(needs_upload, expected);
+        }
+        let restored = reversed.with_color_map_direction(ColorMapDirection::Regular)?;
+        assert!(palette_key(&restored) == palette_key(&regular));
+        Ok(())
+    }
+
+    #[test]
+    fn palette_keys_reuse_range_only_snapshots_but_invalidate_palette_changes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("palette.tif");
+        crate::raster_source::test_support::write_byte_raster(&path)?;
+        let source = RasterSource::open(&path)?.remove(0).with_color_map_direction(ColorMapDirection::Reversed)?;
+        let range_only = source.restyled(source.palette(), (10.0, 100.0))?;
+        let recolored = range_only.restyled(ColorMapPreset::Gray, range_only.range())?;
+        assert_ne!(range_only.id(), source.id());
+        assert!(palette_key(&range_only) == palette_key(&source));
+        assert!(palette_key(&recolored) != palette_key(&source));
+        assert!(palette_key(&recolored) == (ColorMapPreset::Gray, ColorMapDirection::Reversed));
+        Ok(())
     }
 }

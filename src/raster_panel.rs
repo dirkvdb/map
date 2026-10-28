@@ -10,13 +10,13 @@ use gpui_kit::component::input::{InputEvent, InputState, NumberInput};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::searchable_list::SearchableVec;
-use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
+use gpui_kit::component::select::{Select, SelectDelegate, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IndexPath, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    AnyElement, App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
     PathPromptOptions, Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, WeakEntity,
     Window, div, rgba,
 };
@@ -53,6 +53,99 @@ const PALETTES: [(&str, ColorMapPreset); 24] = [
     ("YlGnBu", ColorMapPreset::YlGnBu),
     ("YlOrRd", ColorMapPreset::YlOrRd),
 ];
+
+#[derive(Clone)]
+struct PaletteChoice {
+    name: &'static str,
+    preset: ColorMapPreset,
+    direction: ColorMapDirection,
+}
+
+struct PaletteChoices(Vec<PaletteChoice>);
+
+fn palette_choices(direction: ColorMapDirection) -> PaletteChoices {
+    PaletteChoices(PALETTES.iter().map(|&(name, preset)| PaletteChoice { name, preset, direction }).collect())
+}
+
+impl SelectDelegate for PaletteChoices {
+    type Item = PaletteChoice;
+
+    fn items_count(&self, section: usize) -> usize {
+        self.0.items_count(section)
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&Self::Item> {
+        self.0.item(ix)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        Self::Item: SelectItem<Value = V>,
+        V: PartialEq,
+    {
+        self.0.position(value)
+    }
+
+    fn render_item(&self, _: IndexPath, item: &PaletteChoice, _: bool, _: &mut Window, cx: &mut App) -> Option<AnyElement> {
+        Some(item.render_preview(cx).into_any_element())
+    }
+}
+
+impl SelectItem for PaletteChoice {
+    type Value = &'static str;
+
+    fn title(&self) -> SharedString {
+        self.name.into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.name
+    }
+}
+
+impl PaletteChoice {
+    fn render_preview(&self, cx: &App) -> impl IntoElement {
+        let colors = ProcessedColorMap::<256>::create_for_preset(self.preset, self.direction);
+        div()
+            .id(SharedString::from(format!("palette-row-{}", self.name)))
+            .test_support()
+            .flex()
+            .items_center()
+            .w_full()
+            .min_w_0()
+            // Mirror the standard row's trailing checkmark lane on the leading side.
+            .pl_4()
+            .gap_1()
+            .child(
+                div()
+                    .id(SharedString::from(format!("palette-name-{}", self.name)))
+                    .test_support()
+                    .w_20()
+                    .flex_shrink_0()
+                    .truncate()
+                    .child(self.name),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("palette-preview-{}", self.name)))
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .h_6()
+                    .rounded(cx.theme().radius_tokens().sm)
+                    .overflow_hidden()
+                    .child(color_strip((0..=255).map(|ix| colors.get_color_by_value(ix)))),
+            )
+    }
+}
+
+fn color_strip(colors: impl IntoIterator<Item = inf::Color>) -> impl IntoElement {
+    div().flex().size_full().children(colors.into_iter().map(|color| {
+        // These colors encode data, not application chrome.
+        div().flex_1().h_full().bg(rgba(u32::from_be_bytes([color.r, color.g, color.b, color.a])))
+    }))
+}
+
 const LOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(60);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -172,7 +265,7 @@ pub struct RasterPanel {
     band_scroll: f32,
     palette_scroll: f32,
     bands: Entity<SelectState<Vec<BandChoice>>>,
-    palette: Entity<SelectState<Vec<&'static str>>>,
+    palette: Entity<SelectState<PaletteChoices>>,
     property: Entity<SelectState<SearchableVec<SharedString>>>,
     opacity: Entity<SliderState>,
     band_slider: Entity<SliderState>,
@@ -199,8 +292,8 @@ impl RasterPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let bands = cx.new(|cx| SelectState::new(Vec::<BandChoice>::new(), None, window, cx));
         let palette = cx.new(|cx| {
-            let items = PALETTES.iter().map(|(name, _)| *name).collect::<Vec<_>>();
-            let selected = items.iter().position(|name| *name == "Turbo").map(IndexPath::new);
+            let items = palette_choices(ColorMapDirection::Regular);
+            let selected = items.0.iter().position(|item| item.name == "Turbo").map(IndexPath::new);
             SelectState::new(items, selected, window, cx)
         });
         let property = cx.new(|cx| SelectState::new(SearchableVec::new(Vec::<SharedString>::new()), None, window, cx).searchable(true));
@@ -216,7 +309,7 @@ impl RasterPanel {
                 let SelectEvent::Confirm(id) = event;
                 this.select_layer(*id, window, cx);
             }),
-            cx.subscribe_in(&palette, window, |this, _, _: &SelectEvent<Vec<&'static str>>, window, cx| {
+            cx.subscribe_in(&palette, window, |this, _, _: &SelectEvent<PaletteChoices>, window, cx| {
                 this.apply_style(window, cx)
             }),
             cx.subscribe_in(&property, window, |this, _, event, window, cx| {
@@ -631,6 +724,49 @@ impl RasterPanel {
             .or_else(|| self.active_vector().filter(|source| source.property().is_some()).map(|source| source.palette()))
     }
 
+    fn color_map_direction(&self) -> ColorMapDirection {
+        self.active()
+            .map(|source| source.color_map_direction())
+            .or_else(|| self.active_vector().map(|source| source.color_map_direction()))
+            .unwrap_or_default()
+    }
+
+    fn set_color_map_reversed(&mut self, reversed: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let direction = if reversed { ColorMapDirection::Reversed } else { ColorMapDirection::Regular };
+        if self.color_range().is_none() || self.color_map_direction() == direction {
+            return;
+        }
+        let result = if let Some(source) = self.active() {
+            source.with_color_map_direction(direction).map(|source| self.replace_raster(source))
+        } else if let Some(source) = self.active_vector() {
+            source.with_color_map_direction(direction).map(|source| self.replace_vector(source))
+        } else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.sync_palette(window, cx);
+                self.watch_tile_errors(cx);
+                self.emit(false, cx);
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not reverse color map: {error}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn sync_palette(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let direction = self.color_map_direction();
+        let preset = self.color_palette().unwrap_or(ColorMapPreset::Turbo);
+        let palette = PALETTES.iter().find(|(_, value)| *value == preset).map_or("Turbo", |(name, _)| *name);
+        self.palette.update(cx, |state, cx| {
+            state.set_items(palette_choices(direction), window, cx);
+            state.set_selected_value(&palette, window, cx);
+        });
+    }
+
     fn apply_slider_range(&mut self, positions: (f32, f32), window: &mut Window, cx: &mut Context<Self>) {
         let Some(range) = slider_range(self.range_domain, positions, self.active().is_some()) else {
             self.sync_range_slider(window, cx);
@@ -677,10 +813,7 @@ impl RasterPanel {
         if let Some(range) = self.color_range() {
             self.set_range_inputs(range, window, cx);
         }
-        if let Some(preset) = self.color_palette() {
-            let palette = PALETTES.iter().find(|(_, value)| *value == preset).map_or("Turbo", |(name, _)| *name);
-            self.palette.update(cx, |state, cx| state.set_selected_value(&palette, window, cx));
-        }
+        self.sync_palette(window, cx);
         self.sync_range_slider(window, cx);
     }
 
@@ -1023,17 +1156,31 @@ impl RasterPanel {
     }
 
     fn render_palette(&self, cx: &Context<Self>) -> impl IntoElement {
-        div().flex().flex_col().gap_1().child(field_label("Color map", cx)).child(
-            div()
-                .id("raster-palette-scroll")
-                .on_scroll(cx.listener(Self::scroll_palette))
-                .on_hover(cx.listener(|this, hovered, _, _| {
-                    if !hovered {
-                        this.palette_scroll = 0.0;
-                    }
-                }))
-                .child(Select::new(&self.palette).id("raster-palette").accessibility_label("Color map")),
-        )
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div().flex().items_center().justify_between().gap_2().child(field_label("Color map", cx)).child(
+                    Checkbox::new("raster-palette-reverse")
+                        .small()
+                        .label("Reverse")
+                        .checked(self.color_map_direction() == ColorMapDirection::Reversed)
+                        .tooltip("Reverse the color map")
+                        .on_change(cx.listener(|this, reversed, window, cx| this.set_color_map_reversed(*reversed, window, cx))),
+                ),
+            )
+            .child(
+                div()
+                    .id("raster-palette-scroll")
+                    .on_scroll(cx.listener(Self::scroll_palette))
+                    .on_hover(cx.listener(|this, hovered, _, _| {
+                        if !hovered {
+                            this.palette_scroll = 0.0;
+                        }
+                    }))
+                    .child(Select::new(&self.palette).id("raster-palette").accessibility_label("Color map")),
+            )
     }
 }
 
@@ -1084,22 +1231,21 @@ impl RasterPanel {
     }
 
     fn render_legend_swatches(&self, range: (f64, f64), palette: ColorMapPreset, cx: &App) -> impl IntoElement {
-        let colors = ProcessedColorMap::<256>::create_for_preset(palette, ColorMapDirection::Regular);
+        let colors = ProcessedColorMap::<256>::create_for_preset(palette, self.color_map_direction());
         let swatches = (0..256).map(|ix| {
-            let color = if let Some(source) = self.active() {
+            if let Some(source) = self.active() {
                 source.legend().color_for_value(range_value(range, ix as f64 / 255.0) as f32, None)
             } else {
                 colors.get_color_by_value(ix as u8)
-            };
-            // These colors encode data, not application chrome.
-            div().flex_1().h_3().bg(rgba(u32::from_be_bytes([color.r, color.g, color.b, color.a])))
+            }
         });
         div()
             .flex()
             .w_full()
+            .h_3()
             .rounded(cx.theme().radius_tokens().sm)
             .overflow_hidden()
-            .children(swatches)
+            .child(color_strip(swatches))
     }
 
     fn render_value_range(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1461,6 +1607,254 @@ mod tests {
             }
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn palette_previews_preserve_pointer_selection_keyboard_navigation_and_focus(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[1]);
+        let (panel, handle) = open_test_panel(cx, 760.0);
+        load_test_paths(&panel, handle, paths, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("raster-palette").value(), Some("Turbo"));
+            window.click("raster-palette", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let preview = window.find("palette-preview-Terrain");
+            assert!(preview.visible());
+            assert!(preview.bounds().size.width > px(0.0));
+            assert!(preview.bounds().size.height > px(0.0));
+            window.click("palette-preview-Terrain", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(panel.read(cx).active().unwrap().palette(), ColorMapPreset::Terrain);
+            assert_eq!(window.find("raster-palette").value(), Some("Terrain"));
+            assert_eq!(window.find("raster-palette").focused(), Some(true));
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(panel.read(cx).active().unwrap().palette(), ColorMapPreset::Turbo);
+            assert_eq!(window.find("raster-palette").value(), Some("Turbo"));
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("palette-preview-Turbo").visible());
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("raster-palette").expanded(), Some(false));
+            assert_eq!(window.find("raster-palette").focused(), Some(true));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn palette_preview_columns_align_and_outer_margins_match_at_different_font_sizes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[1]);
+        let (panel, handle) = open_test_panel(cx, 900.0);
+        load_test_paths(&panel, handle, paths, cx);
+        for font_size in [16.0, 20.0] {
+            cx.update(|cx| gpui_kit::component::Theme::update(cx, |theme| theme.font_size = px(font_size)));
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.click("raster-palette", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert_palette_preview_alignment(window);
+                window.press("escape", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
+    fn assert_palette_preview_alignment(window: &Window) {
+        let control = window.find("raster-palette").bounds();
+        let reference = window.find("palette-preview-Spectral").bounds();
+        let name_left = window.find("palette-name-Spectral").bounds().left();
+        for name in ["RdYlBu", "RdYlGn", "Reds", "Spectral"] {
+            let preview = window.find(SharedString::from(format!("palette-preview-{name}")));
+            let label = window.find(SharedString::from(format!("palette-name-{name}")));
+            assert!(preview.visible(), "{name}: preview={:?}, control={control:?}", preview.bounds());
+            assert!(label.visible(), "{name}");
+            assert_eq!(preview.bounds().left(), reference.left());
+            assert_eq!(preview.bounds().right(), reference.right());
+            assert_eq!(label.bounds().left(), name_left);
+            let left_margin = label.bounds().left() - control.left();
+            let right_margin = control.right() - preview.bounds().right();
+            assert!(
+                (left_margin - right_margin).abs() <= px(1.0),
+                "{name}: left={left_margin:?}, right={right_margin:?}"
+            );
+        }
+    }
+
+    #[gpui_kit::test]
+    fn reverse_color_map_preserves_raster_ranges_and_per_band_state_through_the_ui(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[2]);
+        let (panel, handle) = open_test_panel(cx, 760.0);
+        load_test_paths(&panel, handle, paths, cx);
+        let events = record_events(&panel, cx);
+        let original = cx.update(|cx| panel.read(cx).active().unwrap().clone());
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("raster-palette-reverse").label(), Some("Reverse"));
+            assert_eq!(window.find("raster-palette-reverse").checked(), Some(false));
+            assert!(window.find("raster-palette-reverse").bounds().bottom() <= window.find("raster-palette").bounds().top());
+            window.click("raster-palette-reverse", cx);
+            let reversed = panel.read(cx).active().unwrap().clone();
+            assert!(reversed.color_map_direction() == ColorMapDirection::Reversed);
+            assert_eq!(reversed.metadata().id, original.metadata().id);
+            assert_ne!(reversed.id(), original.id());
+            assert_eq!(reversed.range(), original.range());
+            assert_eq!(reversed.palette(), original.palette());
+            assert_eq!(&reversed.palette_rgba()[..4], &original.palette_rgba()[1020..]);
+            assert_eq!(window.find("raster-palette-reverse").checked(), Some(true));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            toggle_reverse_checkbox_with_keyboard(window, cx);
+            assert_eq!(panel.read(cx).active().unwrap().palette_rgba(), original.palette_rgba());
+            window.press("space", cx);
+            window.click("next-raster-band", cx);
+            assert_eq!(window.find("raster-palette-reverse").checked(), Some(false));
+            assert!(panel.read(cx).color_map_direction() == ColorMapDirection::Regular);
+            window.click("previous-raster-band", cx);
+            assert_eq!(window.find("raster-palette-reverse").checked(), Some(true));
+            assert!(panel.read(cx).color_map_direction() == ColorMapDirection::Reversed);
+            window.scroll("raster-palette", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(panel.read(cx).color_map_direction() == ColorMapDirection::Reversed);
+            assert_eq!(window.find("raster-palette").value(), Some("YlGnBu"));
+            window.click("raster-palette", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("palette-preview-YlGnBu").visible());
+            window.press("escape", cx);
+            assert!(events.read(cx).iter().all(|event| !event.should_fit()));
+            assert!(
+                events
+                    .read(cx)
+                    .iter()
+                    .any(|event| { event.source().is_some_and(|source| source.color_map_direction() == ColorMapDirection::Reversed) })
+            );
+        })
+        .unwrap();
+    }
+
+    fn toggle_reverse_checkbox_with_keyboard(window: &mut Window, cx: &mut App) {
+        window.click("raster-min", cx);
+        for _ in 0..20 {
+            if window.find("raster-palette-reverse").focused() == Some(true) {
+                break;
+            }
+
+            window.press("tab", cx);
+        }
+        assert_eq!(window.find("raster-palette-reverse").focused(), Some(true));
+        window.press("space", cx);
+        assert_eq!(window.find("raster-palette-reverse").checked(), Some(false));
+    }
+
+    #[gpui_kit::test]
+    fn reverse_color_map_preserves_numeric_vector_properties_and_per_layer_state_through_the_ui(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = numeric_vector_paths(&dir);
+        let (panel, handle) = open_test_panel(cx, 900.0);
+        load_test_paths(&panel, handle, paths, cx);
+        let events = record_events(&panel, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let original = panel.read(cx).active_vector().unwrap().clone();
+            window.click("raster-palette-reverse", cx);
+            let reversed = panel.read(cx).active_vector().unwrap();
+            assert!(reversed.color_map_direction() == ColorMapDirection::Reversed);
+            assert_eq!(reversed.id(), original.id());
+            assert_ne!(reversed.style_id(), original.style_id());
+            assert_eq!(reversed.range(), original.range());
+            assert_eq!(reversed.property(), original.property());
+            assert_eq!(reversed.source_json(), original.source_json());
+            window.click("vector-property", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(panel.read(cx).active_vector().unwrap().property(), Some("b_fraction"));
+            assert_eq!(window.find("raster-palette-reverse").checked(), Some(true));
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            assert_eq!(window.find("raster-palette-reverse").checked(), Some(false));
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            assert!(window.try_find("raster-palette-reverse").is_none());
+            window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
+            assert_eq!(window.find("raster-palette-reverse").checked(), Some(false));
+            for _ in 0..3 {
+                window.scroll("raster-band", ScrollDelta::Lines(point(0.0, -1.0)), cx);
+            }
+            assert!(panel.read(cx).color_map_direction() == ColorMapDirection::Reversed);
+            assert_eq!(window.find("raster-palette-reverse").checked(), Some(true));
+            assert_eq!(panel.read(cx).active_vector().unwrap().property(), Some("b_fraction"));
+            toggle_reverse_checkbox_with_keyboard(window, cx);
+            assert!(panel.read(cx).color_map_direction() == ColorMapDirection::Regular);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(events.read(cx).iter().all(|event| !event.should_fit()));
+            assert!(events.read(cx).iter().any(|event| {
+                event
+                    .vector_source()
+                    .is_some_and(|source| source.color_map_direction() == ColorMapDirection::Reversed)
+            }));
+        });
     }
 
     struct PanelHarness(Entity<RasterPanel>);

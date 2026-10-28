@@ -390,10 +390,11 @@ impl MapView {
     }
 
     fn request_render(&mut self, cx: &mut Context<Self>) {
-        self.update_pixel_info(cx);
         let Some(viewport) = self.viewport else {
             return;
         };
+        self.camera.constrain_to_viewport(f64::from(viewport.height.get()));
+        self.update_pixel_info(cx);
         let request = MapRequest { viewport, camera: self.camera };
         let reduce_motion = cx.reduce_motion();
         let basemap = basemap_style(cx);
@@ -1947,6 +1948,36 @@ mod tests {
             check_property_keyboard_toggle(&view, layout.properties, camera, window, cx);
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn hover_and_render_requests_share_viewport_constraints_after_navigation_and_resize(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (view, handle) = open_test_map(size(px(1200.0), px(760.0)), cx);
+        for height in [760.0, 1000.0] {
+            cx.simulate_window_resize(handle.into(), size(px(1200.0), px(height)));
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                view.update(cx, |map, cx| {
+                    map.zoom(-100.0, (0.0, 0.0), cx);
+                    map.pan(0.0, 10_000.0, cx);
+                });
+                let bounds = window.find("map-surface").bounds();
+                let offset = (0.0, f64::from(f32::from(bounds.size.height)) / 4.0);
+                window.simulate_mouse_move(bounds.center() + point(px(0.0), bounds.size.height / 4.0), cx);
+                window.render_frame(cx);
+                let map = view.read(cx);
+                let viewport = map.viewport.unwrap();
+                let expected = MapCamera::fit_bounds([-180.0, -90.0, 180.0, 90.0], 1200.0, f64::from(viewport.height.get()));
+                assert_eq!(map.camera, expected, "Zooming out and panning must retain the effective native camera");
+                assert_eq!(map.requested.as_ref().unwrap().map.camera, expected);
+                let coordinate = expected.coordinate_at(offset);
+                let text = format!("Lat: {:.6}  Lon: {:.6}", coordinate.latitude, coordinate.longitude);
+                assert_eq!(window.find("pixel-info").label(), Some(text.as_str()));
+            })
+            .unwrap();
+        }
     }
 
     #[gpui_kit::test]

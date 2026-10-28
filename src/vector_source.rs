@@ -78,7 +78,7 @@ impl NumericProperty {
 /// GeoJSON, which can use substantial memory. Unreferenced spatial layers are
 /// rejected rather than guessed to be WGS84, except CSV lat/lon columns, which
 /// establish WGS84 coordinates when no CRS is declared. Empty layers use `[0; 4]`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VectorSource {
     id: u64,
     style_id: u64,
@@ -89,7 +89,31 @@ pub struct VectorSource {
     numeric_properties: Arc<[NumericProperty]>,
     property: Option<usize>,
     palette: ColorMapPreset,
+    color_map_direction: ColorMapDirection,
     range: Option<(f64, f64)>,
+}
+
+impl std::fmt::Debug for VectorSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // ColorMapDirection does not implement Debug in inf.
+        let direction = match self.color_map_direction {
+            ColorMapDirection::Regular => "Regular",
+            ColorMapDirection::Reversed => "Reversed",
+        };
+        f.debug_struct("VectorSource")
+            .field("id", &self.id)
+            .field("style_id", &self.style_id)
+            .field("name", &self.name)
+            .field("bounds", &self.bounds)
+            .field("data", &self.data)
+            .field("points_only", &self.points_only)
+            .field("numeric_properties", &self.numeric_properties)
+            .field("property", &self.property)
+            .field("palette", &self.palette)
+            .field("color_map_direction", &direction)
+            .field("range", &self.range)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +317,7 @@ impl VectorSource {
             property: range.map(|_| 0),
             numeric_properties: numeric_properties.into(),
             palette: ColorMapPreset::Turbo,
+            color_map_direction: ColorMapDirection::Regular,
             range,
         }
     }
@@ -318,6 +343,11 @@ impl VectorSource {
     /// The active palette; defaults to Terrain.
     pub fn palette(&self) -> ColorMapPreset {
         self.palette
+    }
+
+    /// The palette's sampling direction; defaults to regular.
+    pub fn color_map_direction(&self) -> ColorMapDirection {
+        self.color_map_direction
     }
 
     /// The editable coloring range for the selected attribute.
@@ -366,6 +396,17 @@ impl VectorSource {
         source.palette = palette;
         source.range = Some(range);
         if source.palette != self.palette || source.range != self.range {
+            source.style_id = NEXT_STYLE_ID.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Arc::new(source))
+    }
+
+    /// Reverses palette sampling while sharing loaded data and numeric metadata.
+    /// A no-op retains the style revision, including for uniformly colored layers.
+    pub fn with_color_map_direction(&self, direction: ColorMapDirection) -> Result<Arc<Self>> {
+        let mut source = self.clone();
+        source.color_map_direction = direction;
+        if source.color_map_direction != self.color_map_direction {
             source.style_id = NEXT_STYLE_ID.fetch_add(1, Ordering::Relaxed);
         }
         Ok(Arc::new(source))
@@ -463,7 +504,7 @@ impl VectorSource {
         } else {
             json!(["/", ["-", ["/", value, 2.0], min / 2.0], max / 2.0 - min / 2.0])
         };
-        let palette = ProcessedColorMap::<PALETTE_STOPS>::create_for_preset(self.palette, ColorMapDirection::Regular);
+        let palette = ProcessedColorMap::<PALETTE_STOPS>::create_for_preset(self.palette, self.color_map_direction);
         let mut interpolation = vec![json!("interpolate"), json!(["linear"]), normalized];
         for ix in 0..PALETTE_STOPS {
             let t = ix as f64 / (PALETTE_STOPS - 1) as f64;
@@ -1050,6 +1091,115 @@ mod tests {
         let path = directory.path().join("features.geojson");
         std::fs::write(&path, serde_json::to_vec(&data)?)?;
         VectorSource::open(&path)?.context("Expected a vector dataset")
+    }
+
+    fn color_direction_fixture() -> Result<Arc<VectorSource>> {
+        // open_geojson removes the backing directory before returning.
+        Ok(open_geojson(json!({"type": "FeatureCollection", "features": [
+            {"type": "Feature", "properties": {"a": 2, "b": -8}, "geometry": {"type": "Point", "coordinates": [4, 51]}},
+            {"type": "Feature", "properties": {"a": 6, "b": -2}, "geometry": {"type": "Point", "coordinates": [5, 52]}}
+        ]}))?
+        .remove(0))
+    }
+
+    #[test]
+    fn color_map_direction_reverses_vector_palette_samples_and_is_reversible() -> Result<()> {
+        let source = color_direction_fixture()?;
+        assert!(source.color_map_direction() == ColorMapDirection::Regular);
+        for preset in [ColorMapPreset::Turbo, ColorMapPreset::Gray, ColorMapPreset::Blues, ColorMapPreset::Terrain] {
+            let regular = source.restyled(preset, (-5.0, 15.0))?;
+            let reversed = regular.with_color_map_direction(ColorMapDirection::Reversed)?;
+            assert_reversed_vector_layers(&regular, &reversed)?;
+            let restored = reversed.with_color_map_direction(ColorMapDirection::Regular)?;
+            assert_eq!(restored.layers_json(0.375, "red"), regular.layers_json(0.375, "red"));
+            assert!(regular.color_map_direction() == ColorMapDirection::Regular);
+        }
+        Ok(())
+    }
+
+    fn assert_reversed_vector_layers(regular: &VectorSource, reversed: &VectorSource) -> Result<()> {
+        let original = regular.color_expression("red");
+        for layer in reversed.layers_json(0.375, "red") {
+            let kind = layer["type"].as_str().unwrap();
+            let expression = &layer["paint"][format!("{kind}-color")];
+            assert_eq!(expression[1], original[1]);
+            assert_eq!(expression[3], original[3]);
+            assert_eq!(expression[2][2], original[2][2], "Reversal must not change value normalization");
+            for ix in 0..PALETTE_STOPS {
+                assert_eq!(expression[2][3 + ix * 2], original[2][3 + ix * 2]);
+                assert_eq!(expression[2][4 + ix * 2], original[2][4 + (PALETTE_STOPS - 1 - ix) * 2]);
+            }
+            assert_eq!(layer["paint"][format!("{kind}-opacity")], 0.375);
+            maplibre_native::AnyLayer::from_json_value(&layer)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn color_map_direction_survives_vector_palette_range_and_property_snapshots_without_reads() -> Result<()> {
+        let source = color_direction_fixture()?;
+        let reversed = source.with_color_map_direction(ColorMapDirection::Reversed)?;
+        let restyled = reversed.restyled(ColorMapPreset::Blues, (-10.0, 10.0))?;
+        let selected = restyled.with_property("b")?;
+        for snapshot in [&reversed, &restyled, &selected] {
+            assert!(snapshot.color_map_direction() == ColorMapDirection::Reversed);
+            assert_shared_vector_snapshot(&source, snapshot);
+            assert_ne!(snapshot.style_id(), source.style_id());
+        }
+        assert_eq!(reversed.palette(), source.palette());
+        assert_eq!(reversed.property(), source.property());
+        assert_eq!(reversed.range(), source.range());
+        assert_eq!(selected.palette(), ColorMapPreset::Blues);
+        assert_eq!(selected.range(), Some((-8.0, -2.0)));
+        assert_ne!(selected.style_id(), restyled.style_id());
+        assert_ne!(restyled.style_id(), reversed.style_id());
+        Ok(())
+    }
+
+    fn assert_shared_vector_snapshot(source: &VectorSource, snapshot: &VectorSource) {
+        assert_eq!(snapshot.id(), source.id());
+        assert_eq!(snapshot.source_json(), source.source_json());
+        assert_eq!(snapshot.name(), source.name());
+        assert_eq!(snapshot.bounds(), source.bounds());
+        assert_eq!(snapshot.points_only(), source.points_only());
+        assert_eq!(snapshot.tile_url(), source.tile_url());
+        assert!(Arc::ptr_eq(&snapshot.numeric_properties, &source.numeric_properties));
+        assert_eq!(snapshot.geojson().map(str::as_ptr), source.geojson().map(str::as_ptr));
+    }
+
+    #[test]
+    fn color_map_direction_only_changes_vector_style_revision_on_actual_change() -> Result<()> {
+        let source = color_direction_fixture()?;
+        assert_eq!(source.with_color_map_direction(ColorMapDirection::Regular)?.style_id(), source.style_id());
+        let reversed = source.with_color_map_direction(ColorMapDirection::Reversed)?;
+        assert_ne!(reversed.style_id(), source.style_id());
+        assert_eq!(reversed.with_color_map_direction(ColorMapDirection::Reversed)?.style_id(), reversed.style_id());
+        assert_eq!(
+            reversed.restyled(reversed.palette(), reversed.range().unwrap())?.style_id(),
+            reversed.style_id()
+        );
+        assert_eq!(reversed.with_property("a")?.style_id(), reversed.style_id());
+        let restored = reversed.with_color_map_direction(ColorMapDirection::Regular)?;
+        assert_ne!(restored.style_id(), reversed.style_id());
+        assert_ne!(restored.style_id(), source.style_id());
+        assert_eq!(restored.id(), source.id());
+        Ok(())
+    }
+
+    #[test]
+    fn color_map_direction_preserves_native_vector_cache_identity_without_reload() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("vector.mbtiles");
+        write_mbtiles(&path)?;
+        let source = VectorSource::open(&path)?.context("Expected native vector layers")?.remove(0);
+        std::fs::remove_file(path)?;
+        let reversed = source.with_color_map_direction(ColorMapDirection::Reversed)?;
+        assert_shared_vector_snapshot(&source, &reversed);
+        assert_ne!(reversed.style_id(), source.style_id());
+        assert!(reversed.geojson().is_none());
+        assert_reversed_vector_layers(&source, &reversed)?;
+        assert_eq!(reversed.with_color_map_direction(ColorMapDirection::Reversed)?.style_id(), reversed.style_id());
+        Ok(())
     }
 
     #[test]

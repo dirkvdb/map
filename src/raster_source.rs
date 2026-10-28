@@ -28,6 +28,7 @@ pub struct RasterSource {
     unscaling_enabled: bool,
     legend: Legend,
     palette: ColorMapPreset,
+    color_map_direction: ColorMapDirection,
     range: (f32, f32),
     errors: async_channel::Sender<String>,
     error_receiver: async_channel::Receiver<String>,
@@ -56,18 +57,26 @@ impl RasterSource {
         validate_raster_scaling(&metadata)?;
         let unscaling_enabled = metadata.scale.is_some();
         let range = scaled_range(&metadata, metadata.scale.unwrap_or_default());
-        Self::styled(Arc::new(metadata), source_files, ColorMapPreset::Turbo, range, unscaling_enabled)
+        Self::styled(
+            Arc::new(metadata),
+            source_files,
+            ColorMapPreset::Turbo,
+            ColorMapDirection::Regular,
+            range,
+            unscaling_enabled,
+        )
     }
 
     fn styled(
         metadata: Arc<LayerMetadata>,
         source_files: Option<Arc<tempfile::TempDir>>,
         palette: ColorMapPreset,
+        color_map_direction: ColorMapDirection,
         range: (f32, f32),
         unscaling_enabled: bool,
     ) -> Result<Arc<Self>> {
         ensure!(valid_range(range), "Minimum must be less than maximum; both must be finite numbers.");
-        let legend = Legend::linear(&ColorMap::Preset(palette, ColorMapDirection::Regular), range.0..range.1, None)?;
+        let legend = Legend::linear(&ColorMap::Preset(palette, color_map_direction), range.0..range.1, None)?;
         let (errors, error_receiver) = async_channel::bounded(1);
         Ok(Arc::new(Self {
             id: NEXT_STYLE_ID.fetch_add(1, Ordering::Relaxed),
@@ -76,6 +85,7 @@ impl RasterSource {
             unscaling_enabled,
             legend,
             palette,
+            color_map_direction,
             range,
             errors,
             error_receiver,
@@ -83,7 +93,26 @@ impl RasterSource {
     }
 
     pub fn restyled(&self, palette: ColorMapPreset, range: (f32, f32)) -> Result<Arc<Self>> {
-        Self::styled(self.metadata.clone(), self.source_files.clone(), palette, range, self.unscaling_enabled)
+        Self::styled(
+            self.metadata.clone(),
+            self.source_files.clone(),
+            palette,
+            self.color_map_direction,
+            range,
+            self.unscaling_enabled,
+        )
+    }
+
+    /// Reverses palette sampling without reloading data or changing its cache identity.
+    pub fn with_color_map_direction(&self, direction: ColorMapDirection) -> Result<Arc<Self>> {
+        Self::styled(
+            self.metadata.clone(),
+            self.source_files.clone(),
+            self.palette,
+            direction,
+            self.range,
+            self.unscaling_enabled,
+        )
     }
 
     /// Whether GDAL declares scale or offset, including explicit identity values.
@@ -118,7 +147,14 @@ impl RasterSource {
         } else {
             self.converted_range(target)
         };
-        Self::styled(self.metadata.clone(), self.source_files.clone(), self.palette, range, enabled)
+        Self::styled(
+            self.metadata.clone(),
+            self.source_files.clone(),
+            self.palette,
+            self.color_map_direction,
+            range,
+            enabled,
+        )
     }
 
     fn converted_range(&self, target: RasterScale) -> (f32, f32) {
@@ -148,6 +184,10 @@ impl RasterSource {
     }
     pub fn palette(&self) -> ColorMapPreset {
         self.palette
+    }
+    /// The palette's sampling direction; defaults to regular.
+    pub fn color_map_direction(&self) -> ColorMapDirection {
+        self.color_map_direction
     }
     pub fn legend(&self) -> &Legend {
         &self.legend
@@ -186,7 +226,7 @@ impl RasterSource {
     pub fn palette_rgba(&self) -> Vec<u8> {
         // Sample the same processed palette as the legend, without involving
         // the display range (which might have tiny or very large values).
-        let palette = ProcessedColorMap::<256>::create_for_preset(self.palette, ColorMapDirection::Regular);
+        let palette = ProcessedColorMap::<256>::create_for_preset(self.palette, self.color_map_direction);
         (0..=255)
             .flat_map(|ix| {
                 let color = palette.get_color_by_value(ix);
@@ -998,8 +1038,11 @@ mod tests {
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[0].metadata().name, "time - WBGT [time=0]");
         assert_eq!(sources[1].metadata().name, "time - WBGT [time=1]");
-        let restyled = sources[1].restyled(ColorMapPreset::Gray, (0.0, 30.0))?;
+        let restyled = sources[1]
+            .with_color_map_direction(ColorMapDirection::Reversed)?
+            .restyled(ColorMapPreset::Gray, (0.0, 30.0))?;
         let toggled = restyled.with_unscaling(false)?;
+        assert!(toggled.color_map_direction() == ColorMapDirection::Reversed);
         assert!(Arc::ptr_eq(sources[1].source_files.as_ref().unwrap(), toggled.source_files.as_ref().unwrap()));
         let vrt_path = toggled.metadata().path.clone();
         drop(restyled);
@@ -1460,6 +1503,83 @@ mod tests {
         dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(3857)?)?;
         dataset.rasterband(1)?.fill(0.0, None)?;
         dataset.flush_cache()?;
+        Ok(())
+    }
+
+    #[test]
+    fn color_map_direction_reverses_palette_and_legend_samples_and_is_reversible() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = open_scaled_fixture(dir.path(), None, None)?;
+        assert!(source.color_map_direction() == ColorMapDirection::Regular);
+        for preset in [ColorMapPreset::Turbo, ColorMapPreset::Gray, ColorMapPreset::Blues, ColorMapPreset::Terrain] {
+            let regular = source.restyled(preset, (0.0, 255.0))?;
+            let reversed = regular.with_color_map_direction(ColorMapDirection::Reversed)?;
+            let original_palette = regular.palette_rgba();
+            let reversed_palette = reversed.palette_rgba();
+            assert_ne!(original_palette, reversed_palette);
+            for ix in 0..256 {
+                let expected = &original_palette[(255 - ix) * 4..(256 - ix) * 4];
+                assert_eq!(&reversed_palette[ix * 4..(ix + 1) * 4], expected, "preset={preset}, sample={ix}");
+                let color = reversed.legend().color_for_value(ix as f32, None);
+                assert_eq!([color.r, color.g, color.b, color.a], expected);
+            }
+            let restored = reversed.with_color_map_direction(ColorMapDirection::Regular)?;
+            assert_eq!(restored.palette_rgba(), original_palette);
+            assert_eq!(restored.legend().color_for_value(0.0, None), regular.legend().color_for_value(0.0, None));
+            assert_eq!(restored.legend().color_for_value(255.0, None), regular.legend().color_for_value(255.0, None));
+            assert!(regular.color_map_direction() == ColorMapDirection::Regular);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn color_map_direction_survives_palette_range_and_unit_snapshots_without_reads() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = open_scaled_fixture(dir.path(), Some(-2.0), Some(10.0))?;
+        std::fs::remove_file(&source.metadata().path)?;
+        let reversed = source.with_color_map_direction(ColorMapDirection::Reversed)?;
+        let restyled = reversed.restyled(ColorMapPreset::Blues, (-70.0, -30.0))?;
+        let raw = restyled.with_unscaling(false)?;
+        let physical = raw.with_unscaling(true)?;
+        for snapshot in [&reversed, &restyled, &raw, &physical] {
+            assert!(snapshot.color_map_direction() == ColorMapDirection::Reversed);
+            assert_shared_raster_snapshot(&source, snapshot);
+        }
+        assert_ne!(reversed.id(), restyled.id());
+        assert_ne!(restyled.id(), raw.id());
+        assert_ne!(raw.id(), physical.id());
+        assert_eq!(reversed.palette(), source.palette());
+        assert_eq!(reversed.range(), source.range());
+        assert_eq!(reversed.scale(), source.scale());
+        assert_eq!(raw.range(), (20.0, 40.0));
+        assert_eq!(physical.range(), restyled.range());
+        assert_eq!(physical.palette(), ColorMapPreset::Blues);
+        assert_eq!(physical.palette_rgba(), restyled.palette_rgba());
+        assert_eq!(raw.palette_rgba(), restyled.palette_rgba());
+        assert_eq!(raw.legend().total_value_range(), 20.0..=40.0);
+        Ok(())
+    }
+
+    fn assert_shared_raster_snapshot(source: &RasterSource, snapshot: &RasterSource) {
+        assert!(Arc::ptr_eq(&source.metadata, &snapshot.metadata));
+        assert_eq!(snapshot.metadata().id, source.metadata().id);
+        assert_eq!(snapshot.source_json(2), source.source_json(2));
+        assert_ne!(snapshot.id(), source.id());
+    }
+
+    #[test]
+    fn color_map_direction_preserves_raw_numeric_tiles() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = open_scaled_fixture(dir.path(), Some(-2.0), Some(10.0))?;
+        let reversed = source.with_color_map_direction(ColorMapDirection::Reversed)?;
+        assert_shared_raster_snapshot(&source, &reversed);
+        let tile = Tile { z: 3, x: 3, y: 3 };
+        let before = source.numeric_tile(tile, 1)?.context("Missing original tile")?;
+        let after = reversed.numeric_tile(tile, 1)?.context("Missing reversed tile")?;
+        assert_eq!((before.width, before.height), (after.width, after.height));
+        assert!(before.values.iter().zip(&after.values).all(|(a, b)| a.to_bits() == b.to_bits()));
+        assert_eq!(reversed.data_range(), source.data_range());
+        assert_eq!(reversed.unscaling_enabled(), source.unscaling_enabled());
         Ok(())
     }
 

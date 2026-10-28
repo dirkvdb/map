@@ -71,11 +71,22 @@ impl MapCamera {
         let bottom = project_y(south);
         let zoom_x = (width.max(1.0) * 0.85 / (512.0 * (right - left).max(1e-12))).log2();
         let zoom_y = (height.max(1.0) * 0.85 / (512.0 * (bottom - top).max(1e-12))).log2();
-        Self {
+        let mut camera = Self {
             x: ((left + right) / 2.0).rem_euclid(1.0),
             y: (top + bottom) / 2.0,
             zoom: zoom_x.min(zoom_y).clamp(MIN_ZOOM, MAX_ZOOM),
-        }
+        };
+        camera.constrain_to_viewport(height);
+        camera
+    }
+
+    /// Match MapLibre's default HeightOnly constraint before unprojecting hover
+    /// positions; otherwise native rendering silently uses a different camera.
+    pub fn constrain_to_viewport(&mut self, height: f64) {
+        let height = height.max(1.0);
+        self.zoom = self.zoom.max((height / 512.0).log2());
+        let half_height = (height / self.world_size() / 2.0).min(0.5);
+        self.y = self.y.clamp(half_height, 1.0 - half_height);
     }
 
     pub fn update(self) -> CameraUpdate {
@@ -316,6 +327,47 @@ mod tests {
             assert!((x - camera.x).abs() * camera.world_size() < 400.0);
             assert!((y - camera.y).abs() * camera.world_size() < 300.0);
         }
+    }
+
+    #[test]
+    fn global_fit_uses_the_native_minimum_zoom_for_the_viewport_height() {
+        for height in [400.0, 760.0, 1200.0] {
+            let camera = MapCamera::fit_bounds([-180.0, -90.0, 180.0, 90.0], 1200.0, height);
+            assert!((camera.world_size() - height.max(512.0)).abs() < 1e-9);
+            assert!((camera.y - 0.5).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn viewport_constraints_clamp_polar_panning_without_wrapping_latitude() {
+        let mut camera = MapCamera { x: 0.2, y: 0.5, zoom: 2.0 };
+        for (dy, expected_y) in [(10_000.0, 0.185546875), (-10_000.0, 0.814453125)] {
+            camera.pan(0.0, dy);
+            camera.constrain_to_viewport(760.0);
+            assert_eq!(
+                camera,
+                MapCamera {
+                    x: 0.2,
+                    y: expected_y,
+                    zoom: 2.0
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn viewport_constraints_follow_zoom_and_resize_and_are_idempotent() {
+        let mut camera = MapCamera::default();
+        camera.zoom_at(-100.0, (170.0, 100.0));
+        camera.constrain_to_viewport(760.0);
+        let constrained = camera;
+        camera.constrain_to_viewport(760.0);
+        assert_eq!(camera, constrained);
+        camera.constrain_to_viewport(1200.0);
+        assert!((camera.world_size() - 1200.0).abs() < 1e-9);
+        assert_eq!(camera.y, 0.5);
+        camera.constrain_to_viewport(400.0);
+        assert!((camera.world_size() - 1200.0).abs() < 1e-9, "Shrinking the viewport must not zoom out");
     }
 
     #[test]
