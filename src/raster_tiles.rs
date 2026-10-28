@@ -1,5 +1,9 @@
 //! Numeric tile jobs and flat Web Mercator tile coverage, independent of style.
 
+#[cfg(test)]
+#[path = "raster_zoom_test_support.rs"]
+pub(crate) mod test_support;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

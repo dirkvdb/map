@@ -11,6 +11,8 @@ use crate::raster_source::{NumericTile, RasterSource};
 
 pub(super) const MAX_JOBS: usize = 4;
 pub(super) const MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
+// Reserve a second grid for the displayed frame while its replacement loads.
+pub(super) const MAX_GRID_BYTES: usize = MAX_CACHE_BYTES / 2;
 pub(super) const MAX_CACHE_ENTRIES: usize = 256;
 pub(super) const MAX_VISIBLE_TILES: usize = 64;
 

@@ -21,6 +21,10 @@ const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CACHE_TILES: usize = 256;
 const BAND_FADE: Duration = Duration::from_millis(180);
 
+#[cfg(test)]
+#[path = "raster_layer_zoom_tests.rs"]
+mod zoom_tests;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct DrawUniform {
@@ -95,6 +99,7 @@ pub struct RasterLayer {
     coverage: HashSet<Tile>,
     cache: HashMap<Tile, CachedTile>,
     draws: HashMap<VisibleTile, DrawTile>,
+    displayed: Vec<VisibleTile>,
     pipeline: Option<RasterPipeline>,
     frame: u64,
     cache_bytes: usize,
@@ -125,6 +130,7 @@ impl RasterLayer {
             coverage: HashSet::new(),
             cache: HashMap::new(),
             draws: HashMap::new(),
+            displayed: Vec::new(),
             pipeline: None,
             frame: 0,
             cache_bytes: 0,
@@ -181,6 +187,7 @@ impl RasterLayer {
         self.coverage.clear();
         self.cache.clear();
         self.draws.clear();
+        self.displayed.clear();
         self.cache_bytes = 0;
         self.waiting = false;
     }
@@ -329,6 +336,10 @@ impl RasterLayer {
                 transition_tiles(parameters, &source, &previous.source)
             }
         });
+        // Swap zoom grids as a unit: drawing parents and children together
+        // would double opacity and let old data show through new nodata.
+        let ready = !self.waiting || self.previous.is_some();
+        let visible = retained_zoom_tiles(&mut self.displayed, visible, ready);
         self.draw_visible_tiles(pass, parameters, &source, &visible, blend);
         self.draw_debug_tiles(pass);
         self.evict();
@@ -534,11 +545,22 @@ impl WgpuCustomLayer for RasterLayerHost {
         let mut layer = self.0.borrow_mut();
         layer.pipeline = None;
         layer.draws.clear();
+        layer.displayed.clear();
         layer.cache.clear();
         layer.cache_bytes = 0;
         layer.previous = None;
         layer.fade_started = None;
         layer.queued = None;
+    }
+}
+
+fn retained_zoom_tiles(displayed: &mut Vec<VisibleTile>, target: Vec<VisibleTile>, ready: bool) -> Vec<VisibleTile> {
+    let same_zoom = displayed.first().map(|tile| tile.z) == target.first().map(|tile| tile.z);
+    if displayed.is_empty() || target.is_empty() || same_zoom || ready {
+        displayed.clone_from(&target);
+        target
+    } else {
+        displayed.clone()
     }
 }
 

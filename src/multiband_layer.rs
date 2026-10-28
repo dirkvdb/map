@@ -9,6 +9,9 @@
 mod clock;
 #[path = "multiband_tiles.rs"]
 mod tiles;
+#[cfg(test)]
+#[path = "multiband_layer_zoom_tests.rs"]
+mod zoom_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -23,7 +26,7 @@ use crate::raster_playback::{PlaybackFrame, PlaybackRequest, PlaybackStyle};
 use crate::raster_source::RasterSource;
 use crate::raster_tiles::{VisibleTile, tile_matrix, visible_tiles};
 use clock::{DEFAULT_WINDOW, Endpoints, PlaybackClock, endpoints, next_window, window_range, window_start};
-use tiles::{CachedWindow, MAX_CACHE_BYTES, MAX_CACHE_ENTRIES, MAX_JOBS, MAX_VISIBLE_TILES, WindowKey, WindowTexture, WindowWorkers};
+use tiles::{CachedWindow, MAX_CACHE_ENTRIES, MAX_GRID_BYTES, MAX_JOBS, MAX_VISIBLE_TILES, WindowKey, WindowTexture, WindowWorkers};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -43,6 +46,14 @@ struct DrawTile {
     sampled: [Option<WindowKey>; 2],
     uniform: wgpu::Buffer,
     bindings: wgpu::BindGroup,
+}
+
+struct RetainedFrame {
+    // Bind groups keep the old raw textures alive even when an adaptive window
+    // resize clears the cache. Only one displayed grid is ever retained.
+    draws: HashMap<VisibleTile, DrawTile>,
+    frame: Endpoints,
+    window_size: usize,
 }
 
 struct MultibandPipeline {
@@ -72,6 +83,7 @@ pub struct MultibandLayer {
     cache: HashMap<WindowKey, CachedWindow>,
     cache_bytes: usize,
     draws: HashMap<VisibleTile, DrawTile>,
+    retained: Option<RetainedFrame>,
     pipeline: Option<MultibandPipeline>,
     window_size: usize,
     max_window_size: usize,
@@ -107,6 +119,7 @@ impl MultibandLayer {
             cache: HashMap::new(),
             cache_bytes: 0,
             draws: HashMap::new(),
+            retained: None,
             pipeline: None,
             window_size: max_window_size,
             max_window_size,
@@ -150,6 +163,7 @@ impl MultibandLayer {
             self.tile_size = request.bands().first().and_then(|source| source.metadata().tile_size).unwrap_or(256);
         }
         if command_changed {
+            self.retained = None;
             self.cancel_jobs();
             self.clock.seek(request.position(), request.bands().len(), Instant::now());
         }
@@ -233,6 +247,9 @@ impl MultibandLayer {
         self.frame = self.frame.wrapping_add(1);
         let visible = self.update_coverage(visible_tiles(parameters, source), now);
         let current_ready = self.frame_ready(self.clock.position());
+        if current_ready || visible.is_empty() {
+            self.retained = None;
+        }
         if !current_ready {
             self.clock.freeze(now);
         }
@@ -243,7 +260,11 @@ impl MultibandLayer {
         self.schedule_windows(&request, &visible);
         self.prepare_pipeline(parameters);
         let frame = self.endpoints(self.clock.position());
-        self.draw_frame(pass, parameters, &request, &visible, frame);
+        if self.retained.is_some() {
+            self.draw_retained_frame(pass, parameters, &request);
+        } else {
+            self.draw_frame(pass, parameters, &request, &visible, frame);
+        }
         self.make_room(0);
     }
 
@@ -265,7 +286,7 @@ impl MultibandLayer {
             "Unsupported multiband tile size {size}"
         );
         ensure!(
-            size as u64 * size as u64 * 15 <= MAX_CACHE_BYTES as u64,
+            size as u64 * size as u64 * 15 <= MAX_GRID_BYTES as u64,
             "Multiband tile size exceeds cache budget"
         );
         Ok(())
@@ -277,6 +298,7 @@ impl MultibandLayer {
         self.cache_bytes = 0;
         self.coverage.clear();
         self.draws.clear();
+        self.retained = None;
         self.window_size = self.max_window_size;
     }
 
@@ -289,11 +311,19 @@ impl MultibandLayer {
     fn update_coverage(&mut self, mut visible: Vec<VisibleTile>, now: Instant) -> Vec<VisibleTile> {
         let bytes_per_band = self.tile_size as usize * self.tile_size as usize * 5;
         // Reserve a third window for an accepted frame crossing into its prefetch.
-        let tile_limit = (MAX_CACHE_BYTES / (3 * bytes_per_band)).clamp(1, MAX_VISIBLE_TILES);
+        let tile_limit = (MAX_GRID_BYTES / (3 * bytes_per_band)).clamp(1, MAX_VISIBLE_TILES);
         coarsen_coverage(&mut visible, tile_limit);
         let coverage: HashSet<_> = visible.iter().map(|tile| tile.canonical()).collect();
         let size = adaptive_window_size(self.window_size, self.max_window_size, bytes_per_band, coverage.len());
         let resized = size != self.window_size;
+        let changed_zoom = self.coverage.iter().next().map(|tile| tile.z) != visible.first().map(|tile| tile.z);
+        if (changed_zoom || resized) && self.retained.is_none() && self.draws.values().any(|draw| draw.sampled.iter().any(Option::is_some)) {
+            self.retained = Some(RetainedFrame {
+                draws: std::mem::take(&mut self.draws),
+                frame: self.endpoints(self.clock.position()),
+                window_size: self.window_size,
+            });
+        }
         if resized {
             self.window_size = size;
             self.cache.clear();
@@ -395,7 +425,7 @@ impl MultibandLayer {
     }
 
     fn make_room(&mut self, incoming: usize) {
-        while self.cache_bytes + incoming > MAX_CACHE_BYTES || self.cache.len() >= MAX_CACHE_ENTRIES {
+        while self.cache_bytes + incoming > MAX_GRID_BYTES || self.cache.len() >= MAX_CACHE_ENTRIES {
             let victim = self
                 .cache
                 .iter()
@@ -415,8 +445,37 @@ impl MultibandLayer {
         let formats = (parameters.color_format, parameters.depth_format, parameters.depth_test);
         if self.pipeline.as_ref().is_none_or(|pipeline| pipeline.formats != formats) {
             self.draws.clear();
+            self.retained = None;
             self.pipeline = Some(MultibandPipeline::new(&self.device, formats));
         }
+    }
+
+    fn draw_retained_frame(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters, request: &PlaybackRequest) {
+        let Some(retained) = &self.retained else { return };
+        let Some(source) = request.bands().get(retained.frame.current) else { return };
+        let Some(next) = request.bands().get(retained.frame.next) else { return };
+        let Some(pipeline) = &mut self.pipeline else { return };
+        pipeline.update_palette(
+            &self.queue,
+            (request.style().palette_for(source), request.style().color_map_direction_for(source)),
+        );
+        pass.set_pipeline(&pipeline.pipeline);
+        for (&tile, draw) in &retained.draws {
+            let data = draw_uniform(
+                parameters,
+                tile,
+                [source, next],
+                retained.frame,
+                retained.window_size,
+                self.opacity,
+                request.style(),
+            );
+            paint_draw(&self.queue, pass, draw, data, self.debug_status());
+        }
+    }
+
+    fn debug_status(&self) -> u32 {
+        if self.debug { 1 + u32::from(self.clock.is_buffering()) } else { 0 }
     }
 
     fn draw_frame(
@@ -429,6 +488,7 @@ impl MultibandLayer {
     ) {
         let Some(source) = request.bands().get(frame.current) else { return };
         let Some(next) = request.bands().get(frame.next) else { return };
+        let debug_status = self.debug_status();
         let Some(pipeline) = &mut self.pipeline else { return };
         pipeline.update_palette(
             &self.queue,
@@ -446,20 +506,24 @@ impl MultibandLayer {
             if draw.sampled != sampled {
                 *draw = pipeline.draw_tile(&self.device, sampled, textures);
             }
-            let mut data = draw_uniform(parameters, tile, [source, next], frame, self.window_size, self.opacity, request.style());
-            for (layer, sampled) in data.layers[..2].iter_mut().zip(sampled) {
-                *layer = sampled.map_or(0, |_| *layer);
-            }
-            data.layers[3] = if self.debug { 1 + u32::from(self.clock.is_buffering()) } else { 0 };
-            self.queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&data));
+            let data = draw_uniform(parameters, tile, [source, next], frame, self.window_size, self.opacity, request.style());
+            paint_draw(&self.queue, pass, draw, data, debug_status);
             #[cfg(test)]
             {
                 self.uniform_writes += 1;
             }
-            pass.set_bind_group(0, &draw.bindings, &[]);
-            pass.draw(0..6, 0..1);
         }
     }
+}
+
+fn paint_draw(queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'_>, draw: &DrawTile, mut data: DrawUniform, debug_status: u32) {
+    for (layer, sampled) in data.layers[..2].iter_mut().zip(draw.sampled) {
+        *layer = sampled.map_or(0, |_| *layer);
+    }
+    data.layers[3] = debug_status;
+    queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&data));
+    pass.set_bind_group(0, &draw.bindings, &[]);
+    pass.draw(0..6, 0..1);
 }
 
 fn validate_bands(request: &PlaybackRequest) -> Result<()> {
@@ -487,7 +551,7 @@ fn validate_bands(request: &PlaybackRequest) -> Result<()> {
 }
 
 fn adaptive_window_size(current: usize, maximum: usize, bytes_per_band: usize, tile_count: usize) -> usize {
-    let capacity = (MAX_CACHE_BYTES / (3 * bytes_per_band * tile_count.max(1))).max(1);
+    let capacity = (MAX_GRID_BYTES / (3 * bytes_per_band * tile_count.max(1))).max(1);
     // Shrink immediately for safety. Only grow after capacity doubles, roughly
     // halving coverage, so small viewport fluctuations do not invalidate caches.
     // Compare the unbounded capacity: a near-maximum window can still recover.
@@ -802,27 +866,27 @@ mod tests {
     fn adaptive_windows_recover_to_configured_maximum_after_coverage_reductions() {
         let bytes = 256 * 256 * 5;
         let mut size = DEFAULT_WINDOW;
-        for (tiles, expected) in [(64, 4), (48, 4), (32, 8), (24, 8), (16, 17), (13, 17), (8, 20)] {
+        for (tiles, expected) in [(64, 2), (48, 2), (32, 4), (24, 4), (16, 8), (13, 8), (8, 17), (4, 20)] {
             size = adaptive_window_size(size, DEFAULT_WINDOW, bytes, tiles);
             assert_eq!(size, expected, "Coverage {tiles}");
-            assert!(3 * bytes * tiles * size <= MAX_CACHE_BYTES);
+            assert!(3 * bytes * tiles * size <= MAX_GRID_BYTES);
         }
     }
 
     #[test]
     fn adaptive_windows_do_not_oscillate_on_small_coverage_fluctuations() {
         let bytes = 256 * 256 * 5;
-        let mut size = 4;
+        let mut size = 2;
         for tiles in [64, 60, 56, 48, 56, 64] {
             size = adaptive_window_size(size, DEFAULT_WINDOW, bytes, tiles);
-            assert_eq!(size, 4);
+            assert_eq!(size, 2);
         }
     }
 
     #[test]
     fn adaptive_window_recovery_respects_device_ceiling_and_empty_coverage() {
         let bytes = 256 * 256 * 5;
-        assert_eq!(adaptive_window_size(4, 6, bytes, 32), 6);
+        assert_eq!(adaptive_window_size(2, 6, bytes, 16), 6);
         assert_eq!(adaptive_window_size(4, 6, bytes, 0), 6);
         assert_eq!(adaptive_window_size(1, 1, bytes, 0), 1);
     }
@@ -841,7 +905,7 @@ mod tests {
             .collect();
         let now = Instant::now();
         layer.update_coverage(visible.clone(), now);
-        assert_eq!(layer.window_size, 4);
+        assert_eq!(layer.window_size, 2);
         let key = WindowKey {
             tile: visible[0].canonical(),
             start: 0,
@@ -850,11 +914,11 @@ mod tests {
         layer.pending.insert(key);
         let generation = layer.generation;
         layer.update_coverage(visible[..32].to_vec(), now);
-        assert_eq!(layer.window_size, 8);
+        assert_eq!(layer.window_size, 4);
         assert!(layer.cache.is_empty() && layer.pending.is_empty());
         assert!(layer.generation > generation);
         assert!(layer.clock.is_buffering());
-        layer.update_coverage(visible[..8].to_vec(), now);
+        layer.update_coverage(visible[..4].to_vec(), now);
         assert_eq!(layer.window_size, layer.max_window_size);
         Ok(())
     }
