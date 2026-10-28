@@ -155,7 +155,11 @@ fn progress_status_shares_narrow_header_space_without_hiding_actions(cx: &mut Te
                 status.bounds().right() <= debug.left(),
                 "Progress cannot overlap header actions at font size {font_size}"
             );
-            assert!(debug.right() <= settings.left() && settings.right() <= title.right());
+            assert!(
+                debug.right() <= settings.left() && settings.right() <= title.right(),
+                "Header actions must fit at font size {font_size}: title={title:?}, band={band:?}, status={:?}, debug={debug:?}, settings={settings:?}",
+                status.bounds()
+            );
             let controls = window.find("window-controls").bounds();
             if controls.size.width > px(0.0) {
                 assert!(settings.right() <= controls.left() && controls.right() <= title.right());

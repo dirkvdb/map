@@ -1456,8 +1456,9 @@ impl RasterPanel {
         // Match small Select padding, its rem-based caret + gap, and physical borders.
         let chrome_width = gpui_kit::component::Size::Small.input_px() * 2.0 + rem * 1.125 + gpui_kit::px(2.0);
         let viewport_width = window.viewport_size().width;
-        // Keep a drag region and room for Open, trailing actions, and window controls.
-        let max_width = (viewport_width * 0.5).min((viewport_width - rem * 14.0).max(gpui_kit::Pixels::ZERO));
+        // Reserve the background selector's 24% width cap, a drag region,
+        // Open, trailing actions, and native window controls.
+        let max_width = (viewport_width * 0.5).min((viewport_width * 0.76 - rem * 14.0).max(gpui_kit::Pixels::ZERO));
 
         div()
             .id("raster-band-scroll")
@@ -1726,6 +1727,9 @@ fn load_paths(paths: Vec<PathBuf>, progress: async_channel::Sender<LoadProgress>
     for (index, path) in paths.into_iter().enumerate() {
         load_path(path, index, path_count, &progress, &mut loaded);
     }
+    for error in &loaded.errors {
+        log::error!("Dataset loading failed: {error}");
+    }
     loaded
 }
 
@@ -1778,7 +1782,7 @@ fn load_path(path: PathBuf, index: usize, path_count: f64, progress: &async_chan
     log::info!(target: "map::vector_load", "path={path:?} stage=path-loaded elapsed={:?}", opened.elapsed());
 }
 
-fn scroll_index(event: &ScrollEvent, scroll: &mut f32, ix: usize, count: usize, cx: &mut App) -> usize {
+pub(crate) fn scroll_index(event: &ScrollEvent, scroll: &mut f32, ix: usize, count: usize, cx: &mut App) -> usize {
     let delta = match event.delta {
         ScrollDelta::Lines(delta) => delta.y,
         // Accumulate precise device pixels so small trackpad events don't

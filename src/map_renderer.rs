@@ -12,27 +12,13 @@ use maplibre_native::{
     WgpuCustomLayer, WgpuLayerParameters,
 };
 
+pub use crate::background::BasemapStyle;
 use crate::map_camera::MapCamera;
 use crate::map_readback::GpuReadback;
 use crate::raster_layer::{RasterLayer, RasterLayerHost};
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest};
 use crate::raster_source::{RasterSource, RasterTiles};
 use crate::vector_source::VectorSource;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BasemapStyle {
-    Light,
-    Dark,
-}
-
-impl BasemapStyle {
-    pub fn style_url(self) -> &'static str {
-        match self {
-            Self::Light => "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
-            Self::Dark => "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
-        }
-    }
-}
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct Viewport {
@@ -622,14 +608,18 @@ impl NativeMap {
     }
 
     fn load_style(&mut self, basemap: BasemapStyle, json: Option<&str>) -> Result<()> {
+        log::debug!("Loading background map style: {basemap:?}");
         self.idle.set(false);
         let run_loop = RunLoopHandle::current();
-        let style = match json {
+        let generated = basemap.style_json();
+        let style = match json.or(generated.as_deref()) {
             Some(json) => self.renderer.load_style_from_json_str(json),
-            None => self.renderer.load_style_from_url(&basemap.style_url().parse()?),
+            None => self
+                .renderer
+                .load_style_from_url(&basemap.style_url().context("Missing background style URL")?.parse()?),
         };
         wait_until_ready(&run_loop, Instant::now() + Duration::from_secs(30), || style.is_ready())?;
-        style.finish().context("Could not load the vector map style")?;
+        style.finish().context("Could not load the background map style")?;
         self.basemap = basemap;
         // Loading a style removes its sources and layers, not the native camera.
         // Reset only attachment bookkeeping so overlays are reinstalled without
@@ -993,10 +983,74 @@ mod tests {
         assert_eq!(
             [BasemapStyle::Light.style_url(), BasemapStyle::Dark.style_url()],
             [
-                "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
-                "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+                Some("https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"),
+                Some("https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"),
             ]
         );
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; local tile data and styles, no network"]
+    fn tile_background_switches_preserve_vector_overlay_and_camera() -> Result<()> {
+        use gpui_kit::component::select::SelectItem;
+
+        let directory = tempfile::tempdir()?;
+        let basemap = crate::background::choices()
+            .iter()
+            .filter_map(|choice| *choice.value())
+            .find(|style| matches!(style, BasemapStyle::Tiles(_)))
+            .unwrap();
+        let (_tiles, style) = local_tile_background_fixture(directory.path(), basemap)?;
+        let viewport = Viewport {
+            width: NonZeroU32::new(256).unwrap(),
+            height: NonZeroU32::new(256).unwrap(),
+            scale: 1.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::default(),
+        };
+        let mut map = NativeMap::with_style(viewport, Some(DARK_STYLE))?;
+        map.render(request)?;
+        let camera_updates = map.camera_updates;
+        map.load_style(basemap, Some(&style))?;
+        let background = map.render(request)?;
+        assert_eq!(background.get_pixel(128, 128).0, [0, 255, 0, 255]);
+        let vector = open_mixed_vector_fixture(directory.path())?;
+        let rendered = map.render_vector(request, Some(vector.clone()), 1.0, "#ff00ff")?;
+        assert_ne!(rendered.as_raw(), background.as_raw());
+        assert_tile_background_roundtrip(&mut map, request, vector.id(), basemap, &style, &rendered)?;
+        assert_eq!(map.camera_updates, camera_updates);
+        Ok(())
+    }
+
+    fn local_tile_background_fixture(directory: &std::path::Path, basemap: BasemapStyle) -> Result<(Arc<RasterSource>, String)> {
+        let path = directory.join("background.mbtiles");
+        write_color_mbtiles_fixture(&path)?;
+        let tiles = RasterSource::open(&path)?.remove(0);
+        RasterTiles::init()?.register(&tiles)?;
+        let mut style: serde_json::Value = serde_json::from_str(&basemap.style_json().unwrap())?;
+        style["sources"]["background-tiles"] = tiles.source_json(1);
+        Ok((tiles, style.to_string()))
+    }
+
+    fn assert_tile_background_roundtrip(
+        map: &mut NativeMap,
+        request: MapRequest,
+        vector_id: u64,
+        basemap: BasemapStyle,
+        style: &str,
+        rendered: &RgbaImage,
+    ) -> Result<()> {
+        map.set_basemap(BasemapStyle::Empty)?;
+        let empty = map.render(request)?;
+        assert_ne!(empty.as_raw(), rendered.as_raw());
+        assert_eq!(map.vector.as_ref().map(|source| source.id()), Some(vector_id));
+        map.load_style(basemap, Some(style))?;
+        assert_eq!(map.render(request)?.as_raw(), rendered.as_raw());
+        map.load_style(BasemapStyle::Dark, Some(DARK_STYLE))?;
+        assert_eq!(map.vector.as_ref().map(|source| source.id()), Some(vector_id));
+        Ok(())
     }
 
     #[test]
@@ -2333,6 +2387,24 @@ mod tests {
             ensure!(Instant::now() < deadline, "Map worker did not shut down");
             std::thread::sleep(Duration::from_millis(5));
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device and internet access to OpenFreeMap"]
+    fn openstreetmap_vector_background_renders_geographic_content() -> Result<()> {
+        let viewport = Viewport {
+            width: NonZeroU32::new(800).unwrap(),
+            height: NonZeroU32::new(600).unwrap(),
+            scale: 1.0,
+        };
+        let mut map = NativeMap::with_basemap(viewport, BasemapStyle::OpenStreetMap)?;
+        let camera = MapCamera::fit_bounds([4.30, 50.80, 4.45, 50.90], 800.0, 600.0);
+        let image = map.render(MapRequest { viewport, camera })?;
+        assert_eq!(image.dimensions(), (800, 600));
+        let colors: std::collections::HashSet<_> = image.pixels().map(|pixel| pixel.0).collect();
+        assert!(colors.len() > 100, "Expected OSM streets and labels, got {} colors", colors.len());
+        assert!(image.pixels().all(|pixel| pixel[3] == 255));
         Ok(())
     }
 

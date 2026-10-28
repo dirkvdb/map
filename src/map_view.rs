@@ -6,13 +6,15 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::{ActiveTheme, Disableable, Selectable, Sizable, Theme, TitleBar, alert::Alert};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::{ActiveTheme, Disableable, IndexPath, Selectable, Sizable, Theme, TitleBar, alert::Alert};
 use gpui_kit::{
     Anchor, App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, Entity, ExternalPaths, FocusHandle, HoverListenerMode, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta,
     ScrollEvent, SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, TestSupportExt, Window, canvas, div, img, rems,
 };
 
+use crate::background::BackgroundChoice;
 use crate::feature_info::FeatureInfo;
 use crate::map_camera::MapCamera;
 use crate::map_renderer::{BasemapStyle, MapFrame, MapRenderer, MapRequest, MapSource, Viewport};
@@ -162,6 +164,9 @@ pub struct MapView {
     requested: Option<RenderKey>,
     tile_boundaries: bool,
     raster_panel: Entity<RasterPanel>,
+    background: Entity<SelectState<Vec<BackgroundChoice>>>,
+    background_scroll: f32,
+    _background_subscription: Subscription,
     pixel_info: Entity<PixelInfo>,
     feature_info: Entity<FeatureInfo>,
     vector_hover: Option<VectorHover>,
@@ -198,6 +203,8 @@ impl MapView {
         let task = renderer.as_ref().map(|renderer| Self::watch_frames(renderer, cx));
         let feature_task = renderer.as_ref().map(|renderer| Self::watch_feature_results(renderer, cx));
         let raster_panel = cx.new(|cx| RasterPanel::new(window, cx));
+        let background = cx.new(|cx| SelectState::new(crate::background::choices(), Some(IndexPath::default()), window, cx));
+        let background_subscription = cx.subscribe(&background, |view, _, _: &SelectEvent<Vec<BackgroundChoice>>, cx| view.request_render(cx));
 
         let raster_observation = cx.observe(&raster_panel, |_, _, cx| cx.notify());
         let theme_observation = cx.observe_global::<Theme>(|view, cx| view.request_render(cx));
@@ -217,6 +224,9 @@ impl MapView {
             requested: None,
             tile_boundaries: false,
             raster_panel,
+            background,
+            background_scroll: 0.0,
+            _background_subscription: background_subscription,
             pixel_info: cx.new(|_| PixelInfo::new()),
             feature_info: cx.new(|_| FeatureInfo::new()),
             vector_hover: None,
@@ -377,7 +387,7 @@ impl MapView {
                 self.error = None;
             }
             Err(error) => {
-                log::error!("Map rendering failed: {error:#}");
+                log::error!("Map rendering failed (background {:?}): {error:#}", frame.basemap);
                 self.error = Some(format!("Couldn’t load the map. {error}").into());
                 if let Some(source) = frame.vector_layer_id {
                     self.raster_panel.update(cx, |panel, cx| panel.complete_vector_render(source, cx));
@@ -392,7 +402,7 @@ impl MapView {
         // even if another range/palette update arrived while it was rendering;
         // requiring an exact style revision starves the display during dragging.
         self.viewport == Some(frame.viewport)
-            && frame.basemap == basemap_style(cx)
+            && frame.basemap == self.selected_basemap(cx)
             && frame.tile_boundaries == self.tile_boundaries
             && self.raster.as_ref().map(|source| source.metadata().id) == frame.raster_layer_id
             && self.playback.as_ref().map(PlaybackRequest::revision) == frame.playback.map(PlaybackFrame::revision)
@@ -426,7 +436,7 @@ impl MapView {
         self.update_pixel_info(cx);
         let request = MapRequest { viewport, camera: self.camera };
         let reduce_motion = cx.reduce_motion();
-        let basemap = basemap_style(cx);
+        let basemap = self.selected_basemap(cx);
         let primary = cx.theme().primary;
         let vector_color = format!("hsla({}, {}%, {}%, {})", primary.h * 360.0, primary.s * 100.0, primary.l * 100.0, primary.a);
         let key = RenderKey {
@@ -459,6 +469,7 @@ impl MapView {
             })
             .or_else(|| self.vector.clone().map(|source| MapSource::Vector(source, vector_color)));
         if let Err(error) = renderer.render_layer(request, source, self.opacity, reduce_motion, basemap, self.tile_boundaries) {
+            log::error!("Could not queue map rendering (background {basemap:?}): {error:#}");
             self.error = Some(format!("Couldn’t load the map. {error}").into());
             if let Some(source) = self.vector.as_ref().map(|source| source.id()) {
                 self.raster_panel.update(cx, |panel, cx| panel.complete_vector_render(source, cx));
@@ -475,6 +486,26 @@ impl MapView {
         self.renderer = Some(renderer);
         self.requested = None;
         self.request_render(cx);
+    }
+
+    fn selected_basemap(&self, cx: &App) -> BasemapStyle {
+        self.background
+            .read(cx)
+            .selected_value()
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| basemap_style(cx))
+    }
+
+    fn scroll_background(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.background.read(cx).selected_index(cx) else { return };
+        let count = crate::background::choices().len();
+        let next = crate::raster_panel::scroll_index(event, &mut self.background_scroll, ix.row, count, cx);
+        if next != ix.row {
+            self.background
+                .update(cx, |state, cx| state.set_selected_index(Some(IndexPath::default().row(next)), window, cx));
+            self.request_render(cx);
+        }
     }
 
     fn toggle_tile_boundaries(&mut self, cx: &mut Context<Self>) {
@@ -790,6 +821,8 @@ impl MapView {
     fn render_title_sources(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
+            .flex_1()
+            .min_w_0()
             .items_center()
             .gap_2()
             .child(
@@ -819,11 +852,34 @@ impl MapView {
             }))
     }
 
-    fn render_title_actions(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_title_actions(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("map-title-actions")
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .flex()
             .items_center()
+            .gap_2()
+            .flex_shrink_0()
             .pr_2()
+            .child(
+                div()
+                    .id("background-layer-scroll")
+                    .w((window.viewport_size().width * 0.24).min(window.rem_size() * 16.0))
+                    .flex_shrink_0()
+                    .on_scroll(cx.listener(Self::scroll_background))
+                    .on_hover(cx.listener(|view, hovered, _, _| {
+                        if !hovered {
+                            view.background_scroll = 0.0;
+                        }
+                    }))
+                    .child(
+                        Select::new(&self.background)
+                            .id("background-layer")
+                            .small()
+                            .accessibility_label("Background")
+                            .menu_width((window.viewport_size().width - window.rem_size() * 2.0).min(window.rem_size() * 30.0)),
+                    ),
+            )
             .child(
                 Button::new("toggle-tile-boundaries")
                     .small()
@@ -847,9 +903,18 @@ impl MapView {
     }
 
     fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        TitleBar::new()
-            .child(self.render_title_sources(window, cx))
-            .child(self.render_title_actions(cx))
+        TitleBar::new().child(
+            div()
+                .flex()
+                .items_center()
+                .flex_1()
+                .min_w_0()
+                // Let the shared row shrink within TitleBar's native controls,
+                // rather than sizing its non-shrinking content lane intrinsically.
+                .w_0()
+                .child(self.render_title_sources(window, cx))
+                .child(self.render_title_actions(window, cx)),
+        )
     }
 
     fn render_map_content(&self, surface: impl IntoElement, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1705,6 +1770,168 @@ mod tests {
             assert_ne!(view.read(cx).camera, before);
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn background_selector_keyboard_switches_and_restores_default_without_changing_the_dataset(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::appearance::setup_test(None, cx);
+            init(cx).unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("background-selection.tif");
+        crate::raster_source::test_support::write_raster(&path, 4326, 1).unwrap();
+        let (view, handle) = open_test_map(size(px(1200.), px(760.)), cx);
+        view.update(cx, |view, cx| view.open_paths(vec![path], cx));
+        cx.run_until_parked();
+        let (camera, raster_id) = cx.update(|cx| {
+            let map = view.read(cx);
+            assert_eq!(map.selected_basemap(cx), basemap_style(cx));
+            (map.camera, map.raster.as_ref().unwrap().id())
+        });
+        for (steps, name) in [(1, "None"), (1, "OpenStreetMap"), (5, "Esri"), (-7, "Default")] {
+            choose_background(steps, handle.into(), cx);
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let map = view.read(cx);
+                let selected = map.selected_basemap(cx);
+                match name {
+                    "None" => assert_eq!(selected, BasemapStyle::Empty),
+                    "OpenStreetMap" => assert_eq!(selected, BasemapStyle::OpenStreetMap),
+                    "Esri" => assert!(matches!(selected, BasemapStyle::Tiles(_))),
+                    _ => assert_eq!(selected, basemap_style(cx)),
+                }
+                assert_eq!(map.requested.as_ref().unwrap().basemap, selected);
+                assert_eq!(map.camera, camera);
+                assert_eq!(map.raster.as_ref().unwrap().id(), raster_id);
+                assert_eq!(window.find("background-layer").label(), Some("Background"));
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn selected_tile_background_survives_theme_changes_and_rejects_obsolete_vector_basemaps(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::appearance::setup_test(None, cx);
+        });
+        let (view, handle) = open_test_map(size(px(1200.), px(760.)), cx);
+        choose_background(7, handle.into(), cx);
+        let selected = cx.update(|cx| view.read(cx).selected_basemap(cx));
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            cx.update(|cx| Theme::change(mode, None, cx));
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                view.update(cx, |map, cx| {
+                    let camera = map.camera;
+                    check_basemap_frame_identity(map, selected, camera, window, cx);
+                });
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn background_scroll_matches_dataset_wheel_and_trackpad_selection_without_moving_the_camera(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::appearance::setup_test(None, cx);
+        });
+        let (view, handle) = open_test_map(size(px(1200.), px(760.)), cx);
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let camera = view.read(cx).camera;
+            for (delta, name) in [
+                (ScrollDelta::Lines(point(0.0, 3.0)), "Default"),
+                (ScrollDelta::Lines(point(0.0, -3.0)), "None"),
+                (ScrollDelta::Lines(point(0.0, -6.0)), "OpenStreetMap"),
+                (ScrollDelta::Lines(point(0.0, 6.0)), "None"),
+                (ScrollDelta::Pixels(point(px(0.0), px(240.0))), "Default"),
+                (ScrollDelta::Pixels(point(px(0.0), px(-240.0))), "None"),
+            ] {
+                window.scroll("background-layer", delta, cx);
+                assert_eq!(window.find("background-layer").value(), Some(name));
+                assert_eq!(view.read(cx).camera, camera);
+                assert_eq!(view.read(cx).requested.as_ref().unwrap().basemap, view.read(cx).selected_basemap(cx));
+            }
+            for _ in 0..3 {
+                window.scroll("background-layer", ScrollDelta::Pixels(point(px(0.0), px(-10.0))), cx);
+                assert_eq!(window.find("background-layer").value(), Some("None"));
+            }
+            window.scroll("background-layer", ScrollDelta::Pixels(point(px(0.0), px(-10.0))), cx);
+            assert_eq!(window.find("background-layer").value(), Some("OpenStreetMap"));
+            assert_eq!(view.read(cx).camera, camera);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn background_scroll_stops_at_the_last_choice_and_clears_trackpad_remainder_on_leave(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::appearance::setup_test(None, cx);
+        });
+        let (_, handle) = open_test_map(size(px(1200.), px(760.)), cx);
+        choose_background(26, handle.into(), cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.scroll("background-layer", ScrollDelta::Lines(point(0.0, -6.0)), cx);
+            assert_eq!(window.find("background-layer").value(), Some("CartoWeb topo"));
+            window.scroll("background-layer", ScrollDelta::Lines(point(0.0, 6.0)), cx);
+            assert_eq!(window.find("background-layer").value(), Some("Gewestplan"));
+            window.scroll("background-layer", ScrollDelta::Pixels(point(px(0.0), px(10.0))), cx);
+            window.hover("map-surface", cx);
+            window.scroll("background-layer", ScrollDelta::Pixels(point(px(0.0), px(30.0))), cx);
+            assert_eq!(window.find("background-layer").value(), Some("Gewestplan"));
+            window.scroll("background-layer", ScrollDelta::Pixels(point(px(0.0), px(10.0))), cx);
+            assert_eq!(window.find("background-layer").value(), Some("GRB basemap gray"));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn background_dropdown_escape_keeps_selection_and_restores_focus(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::appearance::setup_test(None, cx);
+        });
+        let (view, handle) = open_test_map(size(px(800.), px(600.)), cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("background-layer", cx);
+            window.press("down", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.press("escape", cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).selected_basemap(cx), basemap_style(cx));
+            assert_eq!(window.find("background-layer").focused(), Some(true));
+            assert_eq!(window.find("background-layer").value(), Some("Default"));
+        })
+        .unwrap();
+    }
+
+    fn choose_background(steps: i32, handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
+        let direction = if steps < 0 { "up" } else { "down" };
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("background-layer", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            for _ in 0..steps.unsigned_abs() {
+                window.press(direction, cx);
+            }
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
     }
 
     #[gpui_kit::test]
@@ -4043,9 +4270,11 @@ mod tests {
             let band = window.find("raster-band").bounds();
             let open = window.find("open-raster").bounds();
             let debug = window.find("toggle-tile-boundaries").bounds();
+            let background = window.find("background-layer").bounds();
             let settings = window.find("open-settings").bounds();
             assert!(band.size.width < wide_capped_width && band.size.width <= title_bar.size.width * 0.5);
-            assert!(open.right() <= band.left() && band.right() < debug.left());
+            assert!(open.right() <= band.left() && band.right() < background.left());
+            assert!(background.right() <= debug.left());
             assert!(debug.right() <= settings.left() && settings.right() <= title_bar.right());
             let controls = window.find("window-controls").bounds();
             if controls.size.width > px(0.) {
