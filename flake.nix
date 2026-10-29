@@ -2,7 +2,10 @@
   description = "Geospatial data viewer";
 
   inputs = {
-    self.submodules = true;
+    infra-rs = {
+      url = "https://github.com/VITObelgium/infra-rs/archive/refs/heads/main.tar.gz";
+      flake = false;
+    };
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     pkgs-mod = {
       url = "github:VITO-RMA/nix-pkgs/main";
@@ -23,6 +26,7 @@
     {
       nixpkgs,
       pkgs-mod,
+      infra-rs,
       maplibre-native,
       flake-utils,
       rust-overlay,
@@ -65,7 +69,12 @@
         packages.default = rustPlatform.buildRustPackage {
           pname = "map";
           version = (fromTOML (builtins.readFile ./Cargo.toml)).package.version;
-          src = ./.;
+          src = pkgs.runCommand "map-source" { } ''
+            cp -R ${./.} "$out"
+            chmod u+w "$out"
+            rm -rf "$out/infra-rs"
+            cp -R ${infra-rs} "$out/infra-rs"
+          '';
 
           cargoLock.lockFile = ./Cargo.lock;
 

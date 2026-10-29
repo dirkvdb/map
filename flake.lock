@@ -18,6 +18,19 @@
         "type": "github"
       }
     },
+    "infra-rs": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1793289533,
+        "narHash": "sha256-xJBTjrMB6aQ0llZxPHLb7HSxYoHm/eS+XEPyFbI8pMg=",
+        "type": "tarball",
+        "url": "https://github.com/VITObelgium/infra-rs/archive/refs/heads/main.tar.gz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://github.com/VITObelgium/infra-rs/archive/refs/heads/main.tar.gz"
+      }
+    },
     "maplibre-native": {
       "flake": false,
       "locked": {
@@ -79,6 +92,7 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
+        "infra-rs": "infra-rs",
         "maplibre-native": "maplibre-native",
         "nixpkgs": "nixpkgs",
         "pkgs-mod": "pkgs-mod",
