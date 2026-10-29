@@ -440,6 +440,35 @@ fn style_events_preserve_navigation_but_a_seek_cancels_it(cx: &mut TestAppContex
 }
 
 #[gpui_kit::test]
+fn playback_band_refreshes_keep_the_hover_value_visible_until_sampling_finishes(cx: &mut TestAppContext) {
+    let harness = Harness::new(cx, 1);
+    harness.click("toggle-raster-playback", cx);
+    let command = harness.command(cx);
+    cx.update_window(harness.window, |_, window, cx| window.hover("map-surface", cx)).unwrap();
+    cx.run_until_parked();
+    let first = hover_value(&harness, cx);
+    for (position, expected) in [(1.25, 78.0), (3.25, 196.0), (0.25, first)] {
+        // Looping can reuse the first band's cached tile immediately.
+        let immediate = if position < 1.0 { first } else { hover_value(&harness, cx) };
+        let frame = harness.frame(Some(feedback(&command, position, false)), cx);
+        cx.update_window(harness.window, |_, window, cx| {
+            harness.view.update(cx, |view, cx| view.apply_frame(frame, window, cx));
+            window.render_frame(cx);
+            let text = window.find("pixel-info").label().unwrap().to_owned();
+            assert_eq!(
+                text.split_whitespace().nth(4).and_then(|value| value.parse::<f64>().ok()),
+                Some(immediate),
+                "Band refreshes must not flash a coordinates-only readout: {text}"
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let value = hover_value(&harness, cx);
+        assert!((value - expected).abs() <= 2.0, "Expected the new band's scaled value {expected}, got {value}");
+    }
+}
+
+#[gpui_kit::test]
 fn hover_uses_shared_unscaling_and_the_accepted_band_without_restyling_sources(cx: &mut TestAppContext) {
     let harness = Harness::new(cx, 1);
     let original = harness.command(cx);

@@ -190,6 +190,18 @@ impl SampleRequest {
     fn is_on_raster(&self) -> bool {
         self.source.metadata().bounds().contains_coordinate(&self.coordinate)
     }
+
+    fn can_retain_value(&self, source: &RasterSource, dpi: u8, scale: RasterScale) -> bool {
+        if self.dpi != dpi || self.source.metadata().path != source.metadata().path {
+            return false;
+        }
+        if self.source.metadata().id == source.metadata().id {
+            self.scale == scale
+        } else {
+            // Band-specific coefficients can change while the display units stay the same.
+            self.source.unscaling_enabled() == source.unscaling_enabled()
+        }
+    }
 }
 
 /// Owns cursor state and one tile read at a time. Current-position cache misses
@@ -239,7 +251,11 @@ impl PixelInfo {
         if self.position == Some(position) && same_units {
             return;
         }
-        let keep_previous = same_units && self.position.is_some_and(|(_, layer, previous_dpi)| layer == position.1 && previous_dpi == dpi);
+        let keep_previous = self
+            .current
+            .as_ref()
+            .zip(source.as_ref())
+            .is_some_and(|(previous, source)| previous.can_retain_value(source, dpi, scale));
         self.position = Some(position);
         self.current = None;
         self.value = match source {
@@ -637,11 +653,43 @@ mod tests {
             info.update(cx, |info, cx| {
                 assert_eq!(info.value, PixelValue::Data(75.0));
                 info.show(Coordinate::latlon(-0.15625, 0.46875), Some(sources[1].clone()), 1, cx);
-                assert_eq!(info.value, PixelValue::Loading, "Do not carry a stale value into a different band");
+                assert_eq!(
+                    info.value,
+                    PixelValue::Data(75.0),
+                    "Keep the previous value while another band in the same dataset loads"
+                );
             })
         });
         cx.run_until_parked();
         assert_eq!(cx.update(|cx| info.read(cx).value), PixelValue::Data(85.0));
+    }
+
+    #[gpui_kit::test]
+    fn uncached_dataset_changes_do_not_keep_the_previous_value(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.tif");
+        let second = dir.path().join("second.tif");
+        crate::raster_source::test_support::write_raster(&first, 4326, 1).unwrap();
+        crate::raster_source::test_support::write_raster(&second, 4326, 1).unwrap();
+        let first = RasterSource::open(&first).unwrap().remove(0);
+        let second = RasterSource::open(&second).unwrap().remove(0);
+        let coordinate = Coordinate::latlon(-0.15625, 0.15625);
+        let info = cx.new(|_| PixelInfo::new());
+        cx.update(|cx| info.update(cx, |info, cx| info.show(coordinate, Some(first), 1, cx)));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            info.update(cx, |info, cx| {
+                assert_eq!(info.value, PixelValue::Data(74.0));
+                info.show(coordinate, Some(second), 1, cx);
+                assert_eq!(
+                    info.value,
+                    PixelValue::Loading,
+                    "A different dataset must not inherit the previous dataset's value"
+                );
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| info.read(cx).value), PixelValue::Data(74.0));
     }
 
     #[gpui_kit::test]
