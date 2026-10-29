@@ -4,7 +4,9 @@ mod appearance;
 mod background;
 mod bundled_themes;
 mod config;
+mod dataset_properties;
 mod feature_info;
+mod log_output;
 mod map_camera;
 mod map_readback;
 mod map_renderer;
@@ -63,7 +65,10 @@ fn main() {
 
 fn logging_builder() -> env_logger::Builder {
     let mut builder = env_logger::Builder::new();
-    builder.format_timestamp_millis().target(env_logger::Target::Stderr);
+    builder
+        .format_timestamp_millis()
+        .write_style(env_logger::WriteStyle::Never)
+        .target(env_logger::Target::Pipe(Box::new(log_output::LogWriter)));
     builder
 }
 

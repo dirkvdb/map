@@ -111,7 +111,8 @@ impl FeatureQueryResult {
 }
 
 pub struct MapRenderer {
-    sender: mpsc::Sender<RenderRequest>,
+    sender: Option<mpsc::Sender<RenderRequest>>,
+    worker: Option<std::thread::JoinHandle<()>>,
     frames: async_channel::Receiver<MapFrame>,
     queries: async_channel::Sender<Option<FeatureQuery>>,
     pending_query: async_channel::Receiver<Option<FeatureQuery>>,
@@ -142,9 +143,9 @@ impl MapRenderer {
         let (feature_sender, feature_results) = async_channel::bounded(1);
         let pending_result = feature_results.clone();
         // The !Send renderer and its run loop remain on this dedicated thread.
-        // Dropping the view closes the channel; the worker finishes its bounded
-        // in-flight request, drops all native resources, and exits.
-        std::thread::Builder::new()
+        // Drop closes the channel and joins this thread before process teardown
+        // can destroy MapLibre's global thread-local storage keys.
+        let worker = std::thread::Builder::new()
             .name("map-renderer".into())
             .spawn(move || {
                 run_renderer(
@@ -159,7 +160,8 @@ impl MapRenderer {
             })
             .context("Could not start the map rendering thread")?;
         Ok(Self {
-            sender,
+            sender: Some(sender),
+            worker: Some(worker),
             frames,
             queries,
             pending_query,
@@ -183,6 +185,8 @@ impl MapRenderer {
             None => (None, None, None, String::new()),
         };
         self.sender
+            .as_ref()
+            .context("Map rendering thread stopped")?
             .send(RenderRequest {
                 map,
                 raster,
@@ -242,6 +246,17 @@ impl MapRenderer {
         if let Err(async_channel::TrySendError::Full(query)) = self.queries.try_send(query) {
             let _ = self.pending_query.try_recv();
             let _ = self.queries.try_send(query);
+        }
+    }
+}
+
+impl Drop for MapRenderer {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            log::error!("Map rendering thread panicked during shutdown");
         }
     }
 }
@@ -1239,13 +1254,24 @@ mod tests {
     }
 
     #[test]
+    fn dropping_renderer_joins_the_idle_worker_and_closes_its_output_channels() {
+        let renderer = MapRenderer::new().unwrap();
+        let frames = renderer.frames();
+        let features = renderer.feature_results();
+        drop(renderer);
+        assert!(frames.is_closed(), "The worker must exit before drop returns");
+        assert!(features.is_closed(), "No native callbacks may outlive the renderer");
+    }
+
+    #[test]
     fn hover_requests_keep_only_the_newest_cursor_and_can_be_cancelled() {
         let (sender, _requests) = mpsc::channel();
         let (_frames, frames) = async_channel::bounded(1);
         let (queries, pending_query) = async_channel::bounded(1);
         let (_results, feature_results) = async_channel::bounded(1);
         let renderer = MapRenderer {
-            sender,
+            sender: Some(sender),
+            worker: None,
             frames,
             queries,
             pending_query,

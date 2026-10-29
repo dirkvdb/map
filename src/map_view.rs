@@ -34,17 +34,21 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn workspace_key_bindings(cx: &App) -> anyhow::Result<[gpui_kit::KeyBinding; 8]> {
-    Ok([
-        key_binding("?", crate::shortcuts::ShowShortcuts, Some("RasterWorkspace"), cx)?,
-        key_binding("secondary-,", crate::settings::OpenSettings, Some("RasterWorkspace"), cx)?,
-        key_binding("secondary-\\", crate::appearance::CycleAppearance, Some("RasterWorkspace"), cx)?,
-        key_binding("secondary-o", OpenDataset, Some("RasterWorkspace"), cx)?,
-        key_binding("secondary-alt-o", crate::recent_files_picker::OpenRecentFiles, Some("RasterWorkspace"), cx)?,
-        key_binding("secondary-0", FitRaster, Some("RasterWorkspace"), cx)?,
-        key_binding("secondary-l", ToggleRasterControls, Some("RasterWorkspace"), cx)?,
-        key_binding("secondary-shift-d", ToggleTileBoundaries, Some("RasterWorkspace"), cx)?,
-    ])
+fn workspace_key_bindings(cx: &App) -> anyhow::Result<Vec<gpui_kit::KeyBinding>> {
+    [
+        key_binding("?", crate::shortcuts::ShowShortcuts, Some("RasterWorkspace"), cx),
+        key_binding("alt-enter", crate::dataset_properties::OpenDatasetProperties, Some("RasterWorkspace"), cx),
+        key_binding("secondary-,", crate::settings::OpenSettings, Some("RasterWorkspace"), cx),
+        key_binding("secondary-\\", crate::appearance::CycleAppearance, Some("RasterWorkspace"), cx),
+        key_binding("secondary-o", OpenDataset, Some("RasterWorkspace"), cx),
+        key_binding("secondary-alt-o", crate::recent_files_picker::OpenRecentFiles, Some("RasterWorkspace"), cx),
+        key_binding("secondary-0", FitRaster, Some("RasterWorkspace"), cx),
+        key_binding("secondary-l", ToggleRasterControls, Some("RasterWorkspace"), cx),
+        key_binding("secondary-shift-l", crate::log_output::ToggleLogs, Some("RasterWorkspace"), cx),
+        key_binding("secondary-shift-d", ToggleTileBoundaries, Some("RasterWorkspace"), cx),
+    ]
+    .into_iter()
+    .collect()
 }
 
 fn navigation_key_bindings(cx: &App) -> anyhow::Result<[gpui_kit::KeyBinding; 7]> {
@@ -164,6 +168,7 @@ pub struct MapView {
     requested: Option<RenderKey>,
     tile_boundaries: bool,
     raster_panel: Entity<RasterPanel>,
+    log_output: Option<Entity<crate::log_output::LogOutput>>,
     background: Entity<SelectState<Vec<BackgroundChoice>>>,
     background_scroll: f32,
     _background_subscription: Subscription,
@@ -209,6 +214,11 @@ impl MapView {
         let raster_observation = cx.observe(&raster_panel, |_, _, cx| cx.notify());
         let theme_observation = cx.observe_global::<Theme>(|view, cx| view.request_render(cx));
         let raster_subscription = cx.subscribe(&raster_panel, |view, _, event, cx| view.apply_raster_event(event, cx));
+        cx.on_app_quit(|view, _| {
+            view.renderer.take();
+            async {}
+        })
+        .detach();
         cx.on_release_in(window, |view, window, cx| {
             if let Some(image) = view.image.take() {
                 cx.drop_image(image, Some(window));
@@ -224,6 +234,7 @@ impl MapView {
             requested: None,
             tile_boundaries: false,
             raster_panel,
+            log_output: None,
             background,
             background_scroll: 0.0,
             _background_subscription: background_subscription,
@@ -852,6 +863,16 @@ impl MapView {
             }))
     }
 
+    fn toggle_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.log_output = if self.log_output.is_some() {
+            None
+        } else {
+            Some(cx.new(|cx| crate::log_output::LogOutput::new(window, cx)))
+        };
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
     fn render_title_actions(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("map-title-actions")
@@ -954,6 +975,16 @@ impl MapView {
             }))
             .children(self.tile_boundaries.then(|| gpui_fps::fps_monitor(window, cx).anchor(Anchor::TopLeft)))
             .children(self.raster_panel.read(cx).render_load_progress())
+            .children(self.log_output.as_ref().map(|output| {
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h_48()
+                    .max_h(gpui_kit::relative(0.4))
+                    .child(output.clone())
+            }))
     }
 }
 
@@ -975,6 +1006,12 @@ impl Render for MapView {
                 crate::settings::open(window, cx);
             }))
             .on_action(|_: &crate::appearance::CycleAppearance, window, cx| crate::appearance::cycle_mode(window, cx))
+            .on_action(cx.listener(|view, _: &crate::dataset_properties::OpenDatasetProperties, window, cx| {
+                view.coast = None;
+                view.drag = None;
+                let properties = view.raster_panel.read(cx).properties();
+                properties.open(window, cx);
+            }))
             .on_action(cx.listener(|view, _: &OpenDataset, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx))))
             .on_action(cx.listener(|view, _: &crate::recent_files_picker::OpenRecentFiles, window, cx| {
                 view.coast = None;
@@ -985,6 +1022,7 @@ impl Render for MapView {
             .on_action(cx.listener(|view, _: &ClearRasters, window, cx| view.raster_panel.update(cx, |panel, cx| panel.clear(window, cx))))
             .on_action(cx.listener(|view, _: &ToggleRasterControls, window, cx| view.raster_panel.update(cx, |panel, cx| panel.toggle_controls(window, cx))))
             .on_action(cx.listener(|view, _: &ToggleTileBoundaries, _, cx| view.toggle_tile_boundaries(cx)))
+            .on_action(cx.listener(|view, _: &crate::log_output::ToggleLogs, window, cx| view.toggle_logs(window, cx)))
             .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
                 log::info!(target: "map::vector_load", "stage=file-drop paths={:?}", paths.0);
                 view.open_paths(paths.0.to_vec(), cx);
@@ -1022,6 +1060,105 @@ mod tests {
     use crate::appearance::{Appearance, AppearanceMode};
     use gpui_kit::ElementId;
     use gpui_kit::component::{ThemeMode, ThemeRegistry};
+
+    #[gpui_kit::test]
+    fn app_quit_stops_the_renderer_even_when_the_map_entity_is_retained(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (view, _window) = open_test_map(size(px(800.), px(600.)), cx);
+        let renderer = MapRenderer::new().unwrap();
+        let frames = renderer.frames();
+        cx.update(|cx| view.update(cx, |view, _| view.renderer = Some(renderer)));
+        cx.quit();
+        cx.update(|cx| assert!(view.read(cx).renderer.is_none()));
+        assert!(frames.is_closed(), "App shutdown must join the native renderer before returning");
+    }
+
+    #[gpui_kit::test]
+    fn properties_open_with_alt_enter_and_escape_restores_map_focus(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx).unwrap();
+            cx.set_reduce_motion(true);
+        });
+        let (view, handle) = open_test_map(size(px(800.), px(600.)), cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("dataset-properties").is_none());
+            window.press("alt-enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("dataset-properties").visible());
+            assert!(!view.read(cx).focus.is_focused(window));
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("dataset-properties").is_none());
+            assert!(view.read(cx).focus.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn logs_start_hidden_without_a_toolbar_button_and_toggle_from_the_keyboard(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx).unwrap();
+        });
+        let (view, handle) = open_test_map(size(px(800.), px(600.)), cx);
+        let mut map_geometry = None;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(view.read(cx).log_output.is_none());
+            assert!(window.try_find("log-panel").is_none());
+            assert!(window.try_find("toggle-logs").is_none());
+            let map = view.read(cx);
+            map_geometry = Some((map.bounds, map.viewport, map.camera));
+            window.press("secondary-shift-l", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("log-panel").visible());
+            let map = view.read(cx);
+            assert!(
+                (map.bounds, map.viewport, map.camera) == map_geometry.unwrap(),
+                "Opening logs must preserve map geometry"
+            );
+            let panel = window.find("log-panel").bounds();
+            assert_eq!(panel.bottom(), window.find("map-surface").bounds().bottom());
+            assert!(panel.top() > map.bounds.unwrap().top());
+            window.click("close-logs", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(view.read(cx).log_output.is_none());
+            let map = view.read(cx);
+            assert!(
+                (map.bounds, map.viewport, map.camera) == map_geometry.unwrap(),
+                "Closing logs must preserve map geometry"
+            );
+            window.press("secondary-shift-l", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("log-panel").visible());
+            window.press("secondary-shift-l", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert!(view.read(cx).log_output.is_none()));
+    }
 
     #[gpui_kit::test]
     fn appearance_shortcut_cycles_persists_and_replaces_the_mode_indicator(cx: &mut TestAppContext) {

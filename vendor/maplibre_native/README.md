@@ -76,6 +76,11 @@ The following platform and rendering-API combinations are supported and tested i
 
 ### Dependencies
 
+Non-amalgamated source builds link external SQLite (discovered through
+`pkg-config` on Linux/Windows) rather than `mbgl-vendor-sqlite`, so applications
+using GDAL or another SQLite consumer share one implementation. Install the
+SQLite development package alongside the other native dependencies.
+
 This command will install the required dependencies on Linux or macOS for the `vulkan` backend.
 You may also use it with the `opengl` or `glx` parameter on Linux.
 It is OK to run this command multiple times for each backend.

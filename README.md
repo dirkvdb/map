@@ -4,6 +4,7 @@ A GPUI desktop geospatial viewer with a MapLibre Native vector basemap.
 
 - Run: `devenv shell -- cargo run` (requires Nix and devenv).
 - Open raster or vector files as command-line arguments, with the file picker, or by dropping them onto the map; press `?` for keyboard shortcuts.
+- Press `Alt+Enter` for the selected dataset’s properties: retained source, spatial, raster-band, and numeric-attribute metadata. `Esc` closes the dialog and returns focus; inspecting properties does not rescan the dataset.
 - Press `Ctrl+Alt+O` (`Cmd+Alt+O` on macOS) to search and reopen recent files. The 50 most recently opened files are stored, newest first, as JSON in `$XDG_STATE_HOME/map/recent-files.json` (default `~/.local/state/map/recent-files.json`). Only successfully opened files enter history; reopening a file moves it to the top.
 - Raster scale/offset metadata is applied in the shader (`physical = stored × scale + offset`), while numeric tile caches retain raw values. For layers declaring scale or offset metadata, the value-range pane shows an **Descale values** checkbox (on by default). Its per-layer setting switches rendering, hover values, and ranges between physical and raw units without reloading tiles; nodata remains excluded. This includes NetCDF `scale_factor`/`add_offset` and GeoTIFF band scaling.
 - Zooming keeps the displayed raster tiles visible until the replacement zoom grid has finished loading, in both directions. The grids swap without overlapping, preserving opacity and nodata. Multiband COGs retain the accepted animation frame while buffering; their existing 256-MiB GPU cache budget is split between the loading grid and retained coverage.
@@ -48,6 +49,8 @@ Knots scans application source under `src/`, including test modules and platform
 The development shell supplies `uv`/`uvx`. Its first Knots invocation may download the pinned tool; analysis runs locally without uploading source and adds no Rust runtime dependency. For a machine-readable, report-only snapshot, run `devenv shell -- knots -r src/ --format json --completion-report .devenv/knots-completion.json > .devenv/knots-metrics.json`. This exports metrics and scan completeness; always run `just complexity` separately for the configured threshold gate.
 
 ## Console logging
+
+Press `Ctrl+Shift+L` (`Cmd+Shift+L` on macOS) to show or hide the application log panel. It overlays the bottom of the map without resizing or shifting it. It starts hidden, retains the latest 128 KiB of this session's output even while closed, and updates while open. The readonly output can be scrolled, selected, and copied. The panel uses the same filters as console logging, including `RUST_LOG`.
 
 The application uses `log` with `env_logger` and writes timestamped warnings and errors to standard error by default, limited to `map`, `geo`, `inf`, and `tiler`. All other crates, including MapLibre Native, GPUI, and wgpu, are silent by default. Dataset-open failures include the file path and error chain; rendering failures include the selected background.
 

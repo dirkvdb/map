@@ -20,66 +20,82 @@ pub(crate) fn open(window: &mut Window, cx: &mut App) {
                 .flex()
                 .flex_col()
                 .gap_4()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(section_heading("Workspace", cx))
-                        .child(shortcut(
-                            "shortcut-open",
-                            "Open dataset…",
-                            &crate::raster_panel::OpenDataset,
-                            "RasterWorkspace",
-                            window,
-                        ))
-                        .child(shortcut(
-                            "shortcut-recent-files",
-                            "Open recent file…",
-                            &crate::recent_files_picker::OpenRecentFiles,
-                            "RasterWorkspace",
-                            window,
-                        ))
-                        .child(shortcut(
-                            "shortcut-fit",
-                            "Fit raster",
-                            &crate::raster_panel::FitRaster,
-                            "RasterWorkspace",
-                            window,
-                        ))
-                        .child(shortcut(
-                            "shortcut-controls",
-                            "Show or hide controls",
-                            &crate::raster_panel::ToggleRasterControls,
-                            "RasterWorkspace",
-                            window,
-                        ))
-                        .child(shortcut(
-                            "shortcut-settings",
-                            "Settings…",
-                            &crate::settings::OpenSettings,
-                            "RasterWorkspace",
-                            window,
-                        ))
-                        .child(shortcut(
-                            "shortcut-appearance",
-                            "Cycle appearance mode",
-                            &crate::appearance::CycleAppearance,
-                            "RasterWorkspace",
-                            window,
-                        ))
-                        .child(shortcut(
-                            "shortcut-tile-boundaries",
-                            "Toggle debug mode",
-                            &crate::map_view::ToggleTileBoundaries,
-                            "RasterWorkspace",
-                            window,
-                        ))
-                        .child(shortcut("shortcut-help", "Keyboard shortcuts", &ShowShortcuts, "RasterWorkspace", window)),
-                )
+                .child(workspace_shortcuts(window, cx))
                 .child(map_navigation_shortcuts(window, cx)),
         )
     });
+}
+
+fn workspace_shortcuts(window: &Window, cx: &App) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(section_heading("Workspace", cx))
+        .child(shortcut(
+            "shortcut-open",
+            "Open dataset…",
+            &crate::raster_panel::OpenDataset,
+            "RasterWorkspace",
+            window,
+        ))
+        .child(shortcut(
+            "shortcut-recent-files",
+            "Open recent file…",
+            &crate::recent_files_picker::OpenRecentFiles,
+            "RasterWorkspace",
+            window,
+        ))
+        .child(shortcut(
+            "shortcut-properties",
+            "Dataset properties…",
+            &crate::dataset_properties::OpenDatasetProperties,
+            "RasterWorkspace",
+            window,
+        ))
+        .child(shortcut(
+            "shortcut-fit",
+            "Fit raster",
+            &crate::raster_panel::FitRaster,
+            "RasterWorkspace",
+            window,
+        ))
+        .child(shortcut(
+            "shortcut-controls",
+            "Show or hide controls",
+            &crate::raster_panel::ToggleRasterControls,
+            "RasterWorkspace",
+            window,
+        ))
+        .child(shortcut(
+            "shortcut-settings",
+            "Settings…",
+            &crate::settings::OpenSettings,
+            "RasterWorkspace",
+            window,
+        ))
+        .child(shortcut(
+            "shortcut-appearance",
+            "Cycle appearance mode",
+            &crate::appearance::CycleAppearance,
+            "RasterWorkspace",
+            window,
+        ))
+        .child(shortcut(
+            "shortcut-tile-boundaries",
+            "Toggle debug mode",
+            &crate::map_view::ToggleTileBoundaries,
+            "RasterWorkspace",
+            window,
+        ))
+        .child(shortcut("shortcut-help", "Keyboard shortcuts", &ShowShortcuts, "RasterWorkspace", window))
+        .child(shortcut(
+            "shortcut-logs",
+            "Show or hide logs",
+            &crate::log_output::ToggleLogs,
+            "RasterWorkspace",
+            window,
+        ))
 }
 
 fn map_navigation_shortcuts(window: &Window, cx: &App) -> impl IntoElement {

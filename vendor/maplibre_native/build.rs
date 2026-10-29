@@ -785,6 +785,17 @@ fn static_packages(target_os: &str) -> Vec<&'static str> {
     packages
 }
 
+fn link_external_sqlite(amalgam_lib: bool, is_apple: bool, static_deps: bool) {
+    // Amalgams own their SQLite; Apple and static dependency linking already
+    // select the external library. Other source builds must share GDAL's SQLite
+    // rather than exporting a second implementation from mbgl-vendor-sqlite.
+    if !amalgam_lib && !is_apple && !static_deps {
+        pkg_config::Config::new()
+            .probe("sqlite3")
+            .expect("Source builds require sqlite3 through pkg-config");
+    }
+}
+
 fn static_archive(package: &str, library: &pkg_config::Library, name: &str) -> PathBuf {
     let filename = format!("lib{name}.a");
     library
@@ -1029,7 +1040,6 @@ fn build_mln() {
         println!("cargo:rustc-link-lib={native_link_kind}fastpfor-lib");
         if !is_apple {
             println!("cargo:rustc-link-lib={native_link_kind}mbgl-vendor-nunicode");
-            println!("cargo:rustc-link-lib={native_link_kind}mbgl-vendor-sqlite");
         }
         println!("cargo:rustc-link-lib={native_link_kind}mbgl-vendor-icu");
         // Vulkan translates GLSL to SPIR-V at runtime via glslang; OpenGL/Metal don't.
@@ -1066,6 +1076,7 @@ fn build_mln() {
             println!("cargo:rustc-link-lib=sqlite3");
         }
     }
+    link_external_sqlite(amalgam_lib, is_apple, static_deps);
     match backend {
         GraphicsApi::Vulkan if is_apple => {
             println!("cargo:rustc-link-lib=framework=CoreText");

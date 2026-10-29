@@ -423,6 +423,20 @@ impl RasterPanel {
         self.vectors.iter().find(|source| Some(SelectionId::Vector(source.id())) == self.selected)
     }
 
+    pub(crate) fn properties(&self) -> crate::dataset_properties::DatasetProperties {
+        use crate::dataset_properties::DatasetProperties;
+        if let Some(source) = self.active() {
+            let dataset = self.active_dataset();
+            let path = dataset.map_or(source.metadata().path.as_path(), |dataset| dataset.path.as_path());
+            let band_count = dataset.map_or(1, |dataset| dataset.bands.len());
+            DatasetProperties::raster(source, path, band_count)
+        } else if let Some(source) = self.active_vector() {
+            DatasetProperties::vector(source)
+        } else {
+            DatasetProperties::default()
+        }
+    }
+
     fn choices(&self) -> Vec<BandChoice> {
         self.raster_datasets
             .iter()
