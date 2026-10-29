@@ -1391,7 +1391,7 @@ impl RasterPanel {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .when(label.chars().count() > 32, |title| title.text_sm())
                                     .when(label.chars().count() > 64, |title| title.text_xs())
-                                    .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).max_w_96().build(window, cx))
+                                    .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
                                     .truncate()
                                     .child(label),
                             ),
