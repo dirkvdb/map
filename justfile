@@ -38,8 +38,7 @@ exe:
 # Regenerate bundle icons before every package build so they match the source.
 [macos]
 generate-package-icons:
-    sips -z 512 512 data/icon.png --out dist/icon_512x512.png
-    sips -z 1024 1024 data/icon.png --out dist/icon_512x512@2x.png
+    /usr/bin/sips --js scripts/macos_icons.js data/icon-iOS-Default-1024@1x.png --out dist
 
 [linux]
 generate-package-icons:

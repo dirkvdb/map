@@ -172,8 +172,8 @@ def build_dmg(env, root):
         print(shlex.join(command), flush=True)
         subprocess.run(command, env=env, cwd=root, check=True)
 
-    for size, name in ((512, "icon_512x512.png"), (1024, "icon_512x512@2x.png")):
-        run("/usr/bin/sips", "-z", str(size), str(size), "data/icon.png", "--out", f"dist/{name}")
+    run("/usr/bin/sips", "--js", "scripts/macos_icons.js",
+        "data/icon-iOS-Default-1024@1x.png", "--out", "dist")
     run("cargo", "build", "--release", "--locked", "--bin", "map")
     release = Path(env["CARGO_TARGET_DIR"]) / "release"
     check_dependencies(str(release / "map"))

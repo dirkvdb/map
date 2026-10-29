@@ -612,6 +612,26 @@ class CaptureTests(unittest.TestCase):
         self.assertNotIn("stdout detail", str(error.exception))
 
 
+@unittest.skipUnless(platform.system() == "Darwin", "requires macOS sips")
+class NativeIconTests(unittest.TestCase):
+    def test_default_export_generates_rgba8_icons_at_both_sizes(self):
+        with tempfile.TemporaryDirectory(prefix="map icons ") as temporary:
+            subprocess.run([
+                "/usr/bin/sips", "--js", str(packaging.PROJECT_ROOT / "scripts/macos_icons.js"),
+                str(packaging.PROJECT_ROOT / "data/icon-iOS-Default-1024@1x.png"),
+                "--out", temporary,
+            ], check=True, capture_output=True, text=True)
+            for size, name in ((512, "icon_512x512.png"), (1024, "icon_512x512@2x.png")):
+                with self.subTest(size=size):
+                    header = (Path(temporary) / name).read_bytes()[:29]
+                    self.assertEqual(header[:8], b"\x89PNG\r\n\x1a\n")
+                    self.assertEqual(header[12:16], b"IHDR")
+                    self.assertEqual(int.from_bytes(header[16:20], "big"), size)
+                    self.assertEqual(int.from_bytes(header[20:24], "big"), size)
+                    # PNG bit depth 8 and color type 6 (RGBA, preserving alpha).
+                    self.assertEqual(header[24:26], b"\x08\x06")
+
+
 class BuildDmgTests(unittest.TestCase):
     def test_checks_artifacts_before_bundling_signing_and_disk_image_creation(self):
         with tempfile.TemporaryDirectory(prefix="map-package-") as temporary:
@@ -633,6 +653,10 @@ class BuildDmgTests(unittest.TestCase):
                         with contextlib.redirect_stdout(io.StringIO()):
                             packaging.build_dmg(env, root)
 
+            self.assertEqual(events[0], (
+                "run", ["/usr/bin/sips", "--js", "scripts/macos_icons.js",
+                        "data/icon-iOS-Default-1024@1x.png", "--out", "dist"],
+            ))
             binary_check.assert_called_once_with(str(release / "map"))
             app_check.assert_called_once_with(release / "bundle/osx/Map.app")
             build = next(index for index, (kind, value) in enumerate(events) if kind == "run" and value[:2] == ["cargo", "build"])
