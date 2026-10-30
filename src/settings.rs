@@ -17,6 +17,7 @@ use crate::appearance::{self, Appearance, AppearanceMode};
 gpui_kit::actions!(settings, [OpenSettings]);
 
 pub(crate) fn open(window: &mut Window, cx: &mut App) {
+    appearance::reload_custom_themes(cx);
     window.open_dialog(cx, |dialog, window, cx| {
         let margin = cx.theme().spacing_tokens().lg;
         let height = rems(42.)

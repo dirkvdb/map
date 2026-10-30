@@ -25,6 +25,11 @@ impl ConfigPaths {
         Ok(Self::new(project.config_dir().join("config.json"), state_dir()?.join("config.json")))
     }
 
+    /// User theme files live beside the main configuration, not the state override.
+    pub(crate) fn themes_dir(&self) -> PathBuf {
+        self.config.with_file_name("themes")
+    }
+
     fn read_path(&self) -> anyhow::Result<&Path> {
         if exists(&self.state)? { Ok(&self.state) } else { Ok(&self.config) }
     }

@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{fs, path::Path, rc::Rc};
 
 use anyhow::{Context as _, bail};
 use gpui_kit::component::{
@@ -73,9 +73,51 @@ impl Appearance {
 }
 
 pub(crate) fn init(cx: &mut App) {
-    register_bundled(cx);
     let paths = ConfigPaths::discover().map_err(|error| log::warn!("Could not locate settings: {error:#}")).ok();
+    register_themes(paths.as_ref(), cx);
     cx.set_global(load(paths, cx));
+}
+
+// Custom themes must be registered before preferences load, or a saved
+// custom selection would be replaced by the default.
+fn register_themes(paths: Option<&ConfigPaths>, cx: &mut App) {
+    register_bundled(cx);
+    if let Some(paths) = paths {
+        load_custom(&paths.themes_dir(), cx);
+    }
+}
+
+/// Registers theme files added since startup. Already registered names keep
+/// their current definition, so the live palette is never swapped underneath.
+pub(crate) fn reload_custom_themes(cx: &mut App) {
+    if let Some(directory) = cx.global::<Appearance>().paths.as_ref().map(ConfigPaths::themes_dir) {
+        load_custom(&directory, cx);
+    }
+}
+
+fn load_custom(directory: &Path, cx: &mut App) {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            log::warn!("Could not read custom themes in {}: {error}", directory.display());
+            return;
+        }
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file() && path.extension().is_some_and(|extension| extension == "json"))
+        .collect();
+    files.sort();
+    for file in files {
+        // One malformed file must not prevent the other custom themes from loading.
+        let result = fs::read_to_string(&file)
+            .context("Could not read the file")
+            .and_then(|content| ThemeRegistry::global_mut(cx).load_themes_from_str(&content));
+        if let Err(error) = result {
+            log::warn!("Skipping custom theme {}: {error:#}", file.display());
+        }
+    }
 }
 
 fn register_bundled(cx: &mut App) {
@@ -231,8 +273,9 @@ fn save(cx: &App) -> anyhow::Result<()> {
 
 #[cfg(test)]
 pub(crate) fn setup_test(path: Option<std::path::PathBuf>, cx: &mut App) {
-    register_bundled(cx);
-    cx.set_global(load(path.map(|path| ConfigPaths::new(path.clone(), path)), cx));
+    let paths = path.map(|path| ConfigPaths::new(path.clone(), path));
+    register_themes(paths.as_ref(), cx);
+    cx.set_global(load(paths, cx));
 }
 
 #[cfg(test)]
@@ -375,6 +418,77 @@ mod tests {
             }
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn custom_themes_load_before_saved_preferences(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let themes = directory.path().join("themes");
+        fs::create_dir(&themes).unwrap();
+        fs::write(
+            themes.join("custom.json"),
+            r##"{"name":"Custom","themes":[
+                {"name":"Custom Light","mode":"light","colors":{}},
+                {"name":"Custom Dark","mode":"dark","colors":{"background":"#123456"}}
+            ]}"##,
+        )
+        .unwrap();
+        let path = directory.path().join("config.json");
+        fs::write(&path, r#"{"mode":"dark","light_theme":"Custom Light","dark_theme":"Custom Dark"}"#).unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            setup_test(Some(path), cx);
+            assert_eq!(Appearance::selected_theme(ThemeMode::Light, cx), "Custom Light");
+            assert_eq!(Appearance::selected_theme(ThemeMode::Dark, cx), "Custom Dark");
+        });
+        let handle = cx.add_window(|_, _| Empty);
+        cx.update_window(handle.into(), |_, window, cx| {
+            apply(window, cx);
+            assert_eq!(Theme::global(cx).theme_name().as_str(), "Custom Dark");
+            assert_eq!(Theme::global(cx).background, Theme::global(cx).tokens.background.color);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn custom_theme_scan_skips_invalid_entries_and_keeps_bundled_names(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let themes = directory.path().join("themes");
+        let theme = |name: &str| format!(r#"{{"name":"{name}","themes":[{{"name":"{name}","mode":"dark","colors":{{}}}}]}}"#);
+        fs::create_dir_all(themes.join("nested.json")).unwrap();
+        fs::write(themes.join("nested.json/inner.json"), theme("Nested")).unwrap();
+        fs::write(themes.join("ignored.txt"), theme("Text")).unwrap();
+        fs::write(themes.join("broken.json"), "{invalid").unwrap();
+        fs::write(themes.join("valid.json"), theme("Valid")).unwrap();
+        fs::write(themes.join("shadow.json"), theme(DEFAULT_LIGHT_THEME)).unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            setup_test(Some(directory.path().join("config.json")), cx);
+            let registry = ThemeRegistry::global(cx).themes();
+            assert!(registry.contains_key("Valid"));
+            assert!(!registry.contains_key("Nested"));
+            assert!(!registry.contains_key("Text"));
+            assert_eq!(registry[DEFAULT_LIGHT_THEME].mode, ThemeMode::Light);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn reloading_registers_theme_files_added_after_startup(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            setup_test(Some(directory.path().join("config.json")), cx);
+            assert!(!ThemeRegistry::global(cx).themes().contains_key("Later Dark"));
+            let themes = directory.path().join("themes");
+            fs::create_dir(&themes).unwrap();
+            fs::write(
+                themes.join("later.json"),
+                r#"{"name":"Later","themes":[{"name":"Later Dark","mode":"dark","colors":{}}]}"#,
+            )
+            .unwrap();
+            reload_custom_themes(cx);
+            assert!(ThemeRegistry::global(cx).themes().contains_key("Later Dark"));
+        });
     }
 
     #[gpui_kit::test]
