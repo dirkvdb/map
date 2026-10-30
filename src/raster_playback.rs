@@ -1,4 +1,4 @@
-//! Commands and renderer feedback for temporal COG playback.
+//! Commands and renderer feedback for temporal multiband raster playback.
 
 use std::sync::Arc;
 
@@ -89,6 +89,28 @@ impl PlaybackStyle {
     }
 }
 
+/// Playback reads one contiguous, 1-based band range of a single numeric raster file.
+/// Native COGs and GDAL sources (GeoTIFF, VRT, single-variable NetCDF, …) qualify.
+pub fn validate_bands(bands: &[Arc<RasterSource>]) -> Result<()> {
+    let Some(first) = bands.first() else { return Ok(()) };
+    let metadata = first.metadata();
+    let start = metadata.band_nr;
+    ensure!(start.is_some_and(|band| band > 0), "Multiband playback requires numeric raster bands");
+    for (index, source) in bands.iter().enumerate() {
+        let band = source.metadata();
+        ensure!(band.path == metadata.path, "Playback bands must belong to the same dataset path");
+        ensure!(
+            band.band_nr == start.and_then(|start| start.checked_add(index)),
+            "Playback bands must be contiguous and in dataset band order"
+        );
+        ensure!(
+            band.tile_size.unwrap_or(256) == metadata.tile_size.unwrap_or(256),
+            "Playback bands must have the same tile size"
+        );
+    }
+    Ok(())
+}
+
 /// Immutable UI command. The renderer owns time advancement and buffering.
 #[derive(Clone)]
 pub struct PlaybackRequest {
@@ -112,6 +134,11 @@ impl PlaybackRequest {
             interpolation,
             style: PlaybackStyle::default(),
         }
+    }
+
+    /// The paused initial command for a dataset with several playable bands.
+    pub fn for_dataset(bands: &[Arc<RasterSource>]) -> Option<Self> {
+        (bands.len() > 1 && validate_bands(bands).is_ok()).then(|| Self::new(bands.to_vec(), 0.0, 0, false, 3.0, true))
     }
 
     pub fn style(&self) -> PlaybackStyle {

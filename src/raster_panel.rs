@@ -226,7 +226,7 @@ pub struct RasterEvent {
 }
 
 impl RasterEvent {
-    /// Playback configuration for eligible COGs, including paused selections.
+    /// Playback configuration for eligible multiband rasters, including paused selections.
     pub fn playback(&self) -> Option<PlaybackRequest> {
         self.playback.clone()
     }
@@ -1781,8 +1781,7 @@ fn load_path(path: PathBuf, index: usize, path_count: f64, progress: &async_chan
                         path: path.canonicalize().unwrap_or_else(|_| path.clone()),
                         bands: opened.iter().map(|source| source.metadata().id).collect(),
                         selected: first.metadata().id,
-                        playback: (opened.len() > 1 && first.metadata().source_format == tiler::LayerSourceType::CloudOptimizedGeoTiff)
-                            .then(|| PlaybackRequest::new(opened.clone(), 0.0, 0, false, 3.0, true)),
+                        playback: PlaybackRequest::for_dataset(&opened),
                     });
                     loaded.selected = Some(SelectionId::Raster(first.metadata().id));
                 }
@@ -2139,7 +2138,7 @@ mod tests {
     fn reverse_color_map_preserves_raster_ranges_and_per_band_state_through_the_ui(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
-        let paths = raster_test_paths(&dir, &[2]);
+        let paths = vec![per_band_style_test_path(&dir, 2)];
         let (panel, handle) = open_test_panel(cx, 760.0);
         load_test_paths(&panel, handle, paths, cx);
         let events = record_events(&panel, cx);
@@ -2321,6 +2320,14 @@ mod tests {
         })
     }
 
+    /// 1-based position of the selected band within its file, independent of
+    /// how the format numbers bands (multi-variable NetCDF grids are all band 1).
+    fn selected_band(panel: &RasterPanel) -> Option<usize> {
+        let dataset = panel.active_dataset()?;
+        let position = dataset.bands.iter().position(|&id| panel.selected == Some(SelectionId::Raster(id)))?;
+        Some(position + 1)
+    }
+
     fn raster_test_paths(directory: &tempfile::TempDir, band_counts: &[usize]) -> Vec<PathBuf> {
         band_counts
             .iter()
@@ -2331,6 +2338,14 @@ mod tests {
                 path
             })
             .collect()
+    }
+
+    /// Multiband rasters from one file play back with a dataset-wide style.
+    /// Multi-variable NetCDF files keep independent per-band styles.
+    fn per_band_style_test_path(directory: &tempfile::TempDir, bands: usize) -> PathBuf {
+        let path = directory.path().join("variables.nc");
+        crate::raster_source::test_support::write_multivariable_netcdf(&path, 4326, bands).unwrap();
+        path
     }
 
     fn load_test_paths(panel: &Entity<RasterPanel>, handle: PanelWindow, paths: Vec<PathBuf>, cx: &mut TestAppContext) {
@@ -2361,7 +2376,7 @@ mod tests {
     fn assert_band_selection(panel: &Entity<RasterPanel>, band: usize, file: Option<SelectionId>, cx: &App) {
         let panel = panel.read(cx);
         let source = panel.active().unwrap();
-        assert_eq!(source.metadata().band_nr, Some(band));
+        assert_eq!(selected_band(panel), Some(band));
         assert_eq!(panel.selected, Some(SelectionId::Raster(source.metadata().id)));
         assert_eq!(
             panel.bands.read(cx).selected_value().copied(),
@@ -2563,7 +2578,7 @@ mod tests {
     fn band_slider_preserves_independent_palette_and_range_styles(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
-        let paths = raster_test_paths(&dir, &[3]);
+        let paths = vec![per_band_style_test_path(&dir, 3)];
         let (panel, handle) = open_test_panel(cx, 760.0);
         load_test_paths(&panel, handle, paths, cx);
         let first = style_active_band(&panel, handle, 1, (25.0, 45.0), cx);
@@ -2572,7 +2587,7 @@ mod tests {
         click_band_slider(&panel, handle, 0.5, 2, cx);
         cx.update(|cx| {
             let source = panel.read(cx).active().unwrap();
-            assert_eq!(source.metadata().band_nr, Some(2));
+            assert_eq!(selected_band(panel.read(cx)), Some(2));
             assert_eq!(source.palette(), ColorMapPreset::Turbo);
             assert_eq!(source.range(), source.data_range());
             assert_ne!(source.metadata().id, first.metadata().id);
@@ -3033,7 +3048,7 @@ mod tests {
     fn clamp_colors_checkbox_updates_style_and_retains_per_band_state_through_the_ui(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
-        let paths = raster_test_paths(&dir, &[2]);
+        let paths = vec![per_band_style_test_path(&dir, 2)];
         let (panel, handle) = open_test_panel(cx, 900.0);
         load_test_paths(&panel, handle, paths, cx);
         let events = record_events(&panel, cx);
@@ -3351,8 +3366,7 @@ mod tests {
     fn prompt_cancel_and_open_then_range_validation_and_clear_work_through_the_ui(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("raster.tif");
-        crate::raster_source::test_support::write_raster(&path, 4326, 2).unwrap();
+        let path = per_band_style_test_path(&dir, 2);
         let (panel, handle) = open_test_panel(cx, 760.0);
         verify_picker_cancel_and_open(&panel, handle, path, cx);
         let original_band = cx.update(|cx| panel.read(cx).selected);
@@ -3400,11 +3414,7 @@ mod tests {
         cx.update(|cx| {
             let panel = panel.read(cx);
             assert_eq!(panel.selected, Some(SelectionId::Raster(panel.sources[0].metadata().id)));
-            assert_eq!(
-                panel.active().unwrap().metadata().band_nr,
-                Some(1),
-                "Opening a multiband raster must select its first band"
-            );
+            assert_eq!(selected_band(panel), Some(1), "Opening a multiband raster must select its first band");
         });
     }
 

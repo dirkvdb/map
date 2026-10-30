@@ -178,6 +178,24 @@ fn open_projected_shapefile_reprojects_and_preserves_utf8_and_typed_attributes()
 }
 
 #[test]
+fn gridded_netcdf_with_a_time_axis_is_left_to_the_raster_reader() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("time.nc");
+    crate::raster_source::test_support::write_netcdf(&path, true, false)?;
+    // GDAL's vector mode would otherwise expose the 1D time variable as points.
+    let vector = Dataset::open_ex(
+        &path,
+        gdal::DatasetOptions {
+            open_flags: gdal::GdalOpenFlags::GDAL_OF_VECTOR,
+            ..Default::default()
+        },
+    )?;
+    assert!(vector.layer_count() > 0);
+    assert!(VectorSource::open(&path)?.is_none());
+    Ok(())
+}
+
+#[test]
 fn open_shapefile_directory_preserves_every_layer_with_its_own_projection() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("shapefiles");

@@ -290,7 +290,9 @@ impl MapView {
             self.coast = None;
             self.drag = None;
         }
-        self.fit_pending = event.should_fit() || (selection_changed && self.source_is_offscreen());
+        // Playback band selection keeps the anchor band and issues a new command
+        // revision instead, so it brings offscreen datasets into view the same way.
+        self.fit_pending = event.should_fit() || ((selection_changed || playback_changed) && self.source_is_offscreen());
         self.fit_raster();
         self.request_render(cx);
     }
@@ -1318,7 +1320,7 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
-            assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().band_nr, Some(2));
+            assert_eq!(shown_band(view.read(cx)), Some(2));
             assert_eq!(view.read(cx).camera, panned, "Overlapping bands must preserve the user's pan and zoom");
             window.scroll("raster-band", ScrollDelta::Lines(point(0.0, 1.0)), cx);
         })
@@ -1328,11 +1330,7 @@ mod tests {
             let map = view.read(cx);
             let source = map.raster.as_ref().unwrap();
             assert_eq!(source.metadata().bounds[0], -10.0);
-            assert_eq!(
-                source.metadata().band_nr,
-                Some(1),
-                "Title scrolling must select the other file, not another band"
-            );
+            assert_eq!(shown_band(map), Some(1), "Title scrolling must select the other file, not another band");
             let viewport = map.viewport.unwrap();
             let fitted = MapCamera::fit_bounds(source.metadata().bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get()));
             assert_eq!(map.camera, fitted, "An offscreen dataset must be centered and fitted after selection");
@@ -1360,7 +1358,7 @@ mod tests {
             let viewport = map.viewport.unwrap();
             let bounds = map.raster.as_ref().unwrap().metadata().bounds;
             assert_eq!(bounds[0], -10.0);
-            assert_eq!(map.raster.as_ref().unwrap().metadata().band_nr, Some(2));
+            assert_eq!(shown_band(map), Some(2));
             assert_eq!(
                 map.camera,
                 MapCamera::fit_bounds(bounds, f64::from(viewport.width.get()), f64::from(viewport.height.get())),
@@ -2160,7 +2158,7 @@ mod tests {
                 let navigated = view.read(cx).camera;
                 assert_ne!(navigated, fitted);
                 let band = view.read(cx).raster.as_ref().unwrap().metadata().id;
-                assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().band_nr, Some(1));
+                assert_eq!(shown_band(view.read(cx)), Some(1));
                 window.click("next-raster-band", cx);
                 (fitted, navigated, band)
             })
@@ -2168,8 +2166,7 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert_ne!(view.read(cx).raster.as_ref().unwrap().metadata().id, original_band);
-            assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().band_nr, Some(2));
+            assert_eq!(shown_band(view.read(cx)), Some(2));
             assert_eq!(view.read(cx).camera, navigated, "Changing bands must preserve pan and zoom");
             window.click("previous-raster-band", cx);
         })
@@ -2178,6 +2175,7 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert_eq!(view.read(cx).raster.as_ref().unwrap().metadata().id, original_band);
+            assert_eq!(shown_band(view.read(cx)), Some(1));
             assert_eq!(view.read(cx).camera, navigated, "Band navigation must not zoom the map");
             window.press("secondary-0", cx);
         })
@@ -2658,6 +2656,16 @@ mod tests {
         }
     }
 
+    /// 1-based band shown on the map: the playback position for multiband
+    /// datasets (whose renderer stays anchored on band 1), otherwise the
+    /// static source's band number.
+    fn shown_band(map: &MapView) -> Option<usize> {
+        match &map.playback {
+            Some(playback) => Some(playback.position() as usize + 1),
+            None => map.raster.as_ref()?.metadata().band_nr,
+        }
+    }
+
     fn check_band_card_scroll(window: &mut Window, cx: &mut App) {
         let layers = window.find("raster-layers-card").bounds();
         let card = window.find("raster-band-controls").bounds();
@@ -2699,7 +2707,7 @@ mod tests {
             cx.run_until_parked();
             cx.update(|cx| {
                 let map = view.read(cx);
-                assert_eq!(map.raster.as_ref().unwrap().metadata().band_nr, Some(band), "{id} must remain clickable");
+                assert_eq!(shown_band(map), Some(band), "{id} must remain clickable");
                 assert_eq!(map.camera, camera, "{id} must not pan or zoom the map underneath");
                 assert!(map.drag.is_none());
                 assert!(map.coast.is_none());
@@ -2847,8 +2855,9 @@ mod tests {
     fn range_drag_displays_in_flight_frames_before_the_pointer_stops(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("raster.tif");
-        crate::raster_source::test_support::write_raster(&path, 4326, 2).unwrap();
+        // Playback datasets restyle in place; per-band frames need static bands.
+        let path = dir.path().join("variables.nc");
+        crate::raster_source::test_support::write_multivariable_netcdf(&path, 4326, 2).unwrap();
         let mut view = None;
         let handle = cx.open_window(size(px(900.0), px(760.0)), |window, cx| {
             let map = cx.new(|cx| {

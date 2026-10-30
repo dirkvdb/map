@@ -3,7 +3,7 @@
 //! Register only `mod multiband_layer;`: the clock and worker modules are private
 //! children. The host supplies playback commands and calls `poll_tiles` from its
 //! existing repaint pump. All positions/window keys are zero-based; source reads
-//! use the actual one-based, half-open COG band numbers from the request metadata.
+//! use the actual one-based, half-open dataset band numbers from the request metadata.
 
 #[path = "multiband_clock.rs"]
 mod clock;
@@ -22,7 +22,7 @@ use geo::Tile;
 use inf::colormap::{ColorMapDirection, ColorMapPreset, ProcessedColorMap};
 use maplibre_native::{WgpuLayerParameters, texture_format_from_webgpu};
 
-use crate::raster_playback::{PlaybackFrame, PlaybackRequest, PlaybackStyle};
+use crate::raster_playback::{PlaybackFrame, PlaybackRequest, PlaybackStyle, validate_bands};
 use crate::raster_source::RasterSource;
 use crate::raster_tiles::{VisibleTile, tile_matrix, visible_tiles};
 use clock::{DEFAULT_WINDOW, Endpoints, PlaybackClock, endpoints, next_window, window_range, window_start};
@@ -278,7 +278,7 @@ impl MultibandLayer {
         {
             self.validations += 1;
         }
-        validate_bands(request)?;
+        validate_bands(request.bands())?;
         let Some(first) = request.bands().first() else { return Ok(()) };
         let size = first.metadata().tile_size.unwrap_or(256);
         ensure!(
@@ -524,30 +524,6 @@ fn paint_draw(queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'_>, draw: &DrawT
     queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&data));
     pass.set_bind_group(0, &draw.bindings, &[]);
     pass.draw(0..6, 0..1);
-}
-
-fn validate_bands(request: &PlaybackRequest) -> Result<()> {
-    let Some(first) = request.bands().first() else { return Ok(()) };
-    let metadata = first.metadata();
-    let start = metadata.band_nr;
-    ensure!(start.is_some_and(|band| band > 0), "Multiband playback requires numeric COG bands");
-    for (index, source) in request.bands().iter().enumerate() {
-        let band = source.metadata();
-        ensure!(
-            band.source_format == tiler::LayerSourceType::CloudOptimizedGeoTiff,
-            "Multiband playback requires COG sources"
-        );
-        ensure!(band.path == metadata.path, "Playback bands must belong to the same COG dataset path");
-        ensure!(
-            band.band_nr == start.and_then(|start| start.checked_add(index)),
-            "Playback bands must be contiguous and in COG band order"
-        );
-        ensure!(
-            band.tile_size.unwrap_or(256) == metadata.tile_size.unwrap_or(256),
-            "Playback bands must have the same tile size"
-        );
-    }
-    Ok(())
 }
 
 fn adaptive_window_size(current: usize, maximum: usize, bytes_per_band: usize, tile_count: usize) -> usize {
@@ -924,18 +900,18 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_non_cog_sources_and_mixed_dataset_paths() -> Result<()> {
+    fn validation_accepts_gdal_multiband_sources_but_rejects_mixed_paths_and_order() -> Result<()> {
         let (directory, bands) = tiles::cog_fixture(3)?;
         let (_other_directory, other) = tiles::cog_fixture(3)?;
-        assert!(validate_bands(&request(&bands, 0.0, 1)).is_ok());
+        assert!(validate_bands(&bands).is_ok());
         let plain = RasterSource::open(&directory.path().join("input.tif"))?;
-        let error = validate_bands(&request(&plain, 0.0, 1)).unwrap_err();
-        assert!(error.to_string().contains("requires COG"));
+        assert_ne!(plain[0].metadata().source_format, tiler::LayerSourceType::CloudOptimizedGeoTiff);
+        assert!(validate_bands(&plain).is_ok());
         let mixed = vec![bands[0].clone(), other[1].clone(), bands[2].clone()];
-        let error = validate_bands(&request(&mixed, 0.0, 1)).unwrap_err();
-        assert!(error.to_string().contains("same COG dataset path"));
+        let error = validate_bands(&mixed).unwrap_err();
+        assert!(error.to_string().contains("same dataset path"));
         let reordered = vec![bands[0].clone(), bands[2].clone(), bands[1].clone()];
-        assert!(validate_bands(&request(&reordered, 0.0, 1)).is_err());
+        assert!(validate_bands(&reordered).is_err());
         Ok(())
     }
 

@@ -239,24 +239,18 @@ impl RasterSource {
     /// NaN represents nodata. Scale and offset remain metadata for the shader;
     /// cached numeric values are never unscaled, normalized, or clipped.
     pub fn numeric_tile(&self, tile: Tile, dpi: u8) -> Result<Option<NumericTile>> {
-        let metadata = &self.metadata;
-        let request = TileRequest {
-            tile,
-            dpi_ratio: dpi,
-            tile_size: metadata.tile_size.unwrap_or(TILE_SIZE),
-            tile_format: TileFormat::RasterTile,
-        };
-        let raw = read_numeric_tile(metadata, &request)?;
-        if raw.data.is_empty() {
-            return Ok(None);
-        }
-        NumericTile::decode(&raw.data).map(Some)
+        read_decoded_tile(&self.metadata, tile, dpi)
     }
 
-    /// Reads a contiguous 1-based, half-open COG band window in bounded batches.
-    /// Empty coverage retains its band slot; numeric values remain raw.
-    /// Cooperatively cancels obsolete windows between I/O and decode work.
+    /// Reads a contiguous 1-based, half-open band window of this source's file.
+    /// Native COGs read band ranges in bounded batches; other GDAL sources read
+    /// each band through the single-band tile path. Empty coverage retains its
+    /// band slot; numeric values remain raw. Cooperatively cancels obsolete
+    /// windows between I/O and decode work.
     pub fn numeric_band_tiles_cancellable(&self, tile: Tile, bands: std::ops::Range<usize>, cancelled: impl Fn() -> bool) -> Result<Vec<Option<NumericTile>>> {
+        if self.metadata.source_format != LayerSourceType::CloudOptimizedGeoTiff {
+            return self.numeric_band_tiles_per_band(tile, bands, cancelled);
+        }
         let request = TileRequest {
             tile,
             dpi_ratio: 1,
@@ -274,6 +268,20 @@ impl RasterSource {
                 let height = data.rows().0 as u32;
                 let values = data.iter_opt().map(|value| value.filter(|v| v.is_finite()).unwrap_or(f32::NAN)).collect();
                 Ok(Some(NumericTile { width, height, values }))
+            })
+            .collect()
+    }
+
+    /// Band metadata only differs in its band number, so every band is read like
+    /// the static renderer reads it, matching paused frames to selected bands.
+    fn numeric_band_tiles_per_band(&self, tile: Tile, bands: std::ops::Range<usize>, cancelled: impl Fn() -> bool) -> Result<Vec<Option<NumericTile>>> {
+        ensure!(bands.start > 0 && !bands.is_empty(), "Invalid 1-based band range: {bands:?}");
+        let mut metadata = (*self.metadata).clone();
+        bands
+            .map(|band| {
+                ensure!(!cancelled(), "Multiband tile request cancelled");
+                metadata.band_nr = Some(band);
+                read_decoded_tile(&metadata, tile, 1)
             })
             .collect()
     }
@@ -435,6 +443,20 @@ fn validate_raster_scaling(metadata: &LayerMetadata) -> Result<()> {
         "Raster scale and offset must be finite and representable by the renderer"
     );
     Ok(())
+}
+
+fn read_decoded_tile(metadata: &LayerMetadata, tile: Tile, dpi: u8) -> Result<Option<NumericTile>> {
+    let request = TileRequest {
+        tile,
+        dpi_ratio: dpi,
+        tile_size: metadata.tile_size.unwrap_or(TILE_SIZE),
+        tile_format: TileFormat::RasterTile,
+    };
+    let raw = read_numeric_tile(metadata, &request)?;
+    if raw.data.is_empty() {
+        return Ok(None);
+    }
+    NumericTile::decode(&raw.data).map(Some)
 }
 
 fn read_numeric_tile(metadata: &LayerMetadata, request: &TileRequest) -> tiler::Result<tiler::TileData> {
@@ -1897,15 +1919,20 @@ pub(crate) mod test_support {
     }
 
     pub fn write_raster(path: &Path, epsg: u32, bands: usize) -> Result<()> {
-        let mut dataset = gdal::DriverManager::get_driver_by_name("GTiff")?.create_with_band_type::<f32, _>(path, 64, 64, bands)?;
+        let mut dataset = create_test_raster("GTiff", path, epsg, bands)?;
+        dataset.flush_cache()?;
+        Ok(())
+    }
+
+    fn create_test_raster(driver: &str, path: &Path, epsg: u32, bands: usize) -> Result<gdal::Dataset> {
+        let mut dataset = gdal::DriverManager::get_driver_by_name(driver)?.create_with_band_type::<f32, _>(path, 64, 64, bands)?;
         let extent = if epsg == 4326 { 10.0 } else { 1_000_000.0 };
         dataset.set_geo_transform(&[-extent, extent / 32.0, 0.0, extent, 0.0, -extent / 32.0])?;
         dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(epsg)?)?;
         for band_nr in 1..=bands {
             write_raster_band(&dataset, band_nr)?;
         }
-        dataset.flush_cache()?;
-        Ok(())
+        Ok(dataset)
     }
 
     fn write_raster_band(dataset: &gdal::Dataset, band_nr: usize) -> Result<()> {
@@ -1915,6 +1942,18 @@ pub(crate) mod test_support {
             .map(|ix| if ix % 64 < 8 { -9999.0 } else { (ix % 64 + ix / 64 + band_nr * 10) as f32 })
             .collect();
         band.write((0, 0), (64, 64), &mut gdal::raster::Buffer::new((64, 64), values))?;
+        Ok(())
+    }
+
+    /// Writes `write_raster` data as one NetCDF variable per band. Its bands
+    /// span several grid paths, so the panel keeps per-band static rendering
+    /// instead of offering playback.
+    pub fn write_multivariable_netcdf(path: &Path, epsg: u32, bands: usize) -> Result<()> {
+        let dataset = create_test_raster("MEM", Path::new(""), epsg, bands)?;
+        let options = gdal::raster::RasterCreationOptions::from_iter(["FORMAT=NC", "WRITE_BOTTOMUP=NO"]);
+        dataset
+            .create_copy(&gdal::DriverManager::get_driver_by_name("netCDF")?, path, &options)?
+            .close()?;
         Ok(())
     }
 }

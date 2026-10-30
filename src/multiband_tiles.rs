@@ -269,6 +269,18 @@ mod tests {
         }
     }
 
+    fn assert_matches_single_band_tiles(data: Vec<Option<NumericTile>>, sources: &[Arc<RasterSource>], tile: Tile) -> Result<()> {
+        ensure!(data.len() == sources.len(), "Batch returned {} tiles for {} bands", data.len(), sources.len());
+        for (batch, source) in data.into_iter().zip(sources) {
+            let batch = batch.context("Missing batch tile")?;
+            let single = source.numeric_tile(tile, 1)?.context("Missing single tile")?;
+            assert_eq!((batch.width, batch.height), (single.width, single.height));
+            assert!(batch.values.iter().any(|value| value.is_finite()));
+            assert!(batch.values.iter().zip(&single.values).all(|(a, b)| a == b || (a.is_nan() && b.is_nan())));
+        }
+        Ok(())
+    }
+
     #[test]
     fn workers_load_actual_batch_slots_in_requested_band_order() -> Result<()> {
         let (_directory, sources) = cog_fixture(23)?;
@@ -281,16 +293,7 @@ mod tests {
         assert!(workers.request(0, key, source.clone(), 21..24));
         let result = wait_for_result(&workers)?;
         assert_eq!((result.generation, result.key), (0, key));
-        let data = result.data?;
-        assert_eq!(data.len(), 3);
-        for (index, tile) in data.into_iter().enumerate() {
-            let tile = tile.context("Missing batch tile")?;
-            let single = sources[20 + index].numeric_tile(key.tile, 1)?.context("Missing single tile")?;
-            assert_eq!((tile.width, tile.height), (single.width, single.height));
-            assert!(tile.values.iter().any(|value| value.is_finite()));
-            assert!(tile.values.iter().zip(&single.values).all(|(a, b)| a == b || (a.is_nan() && b.is_nan())));
-        }
-        Ok(())
+        assert_matches_single_band_tiles(result.data?, &sources[20..23], key.tile)
     }
 
     #[test]
@@ -321,6 +324,35 @@ mod tests {
         assert!(workers.request(0, key, sources[0].clone(), 99..100));
         let result = wait_for_result(&workers)?;
         assert!(result.data.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn workers_read_gdal_multiband_windows_like_single_band_tiles() -> Result<()> {
+        let (directory, _cog) = cog_fixture(3)?;
+        let netcdf = directory.path().join("time.nc");
+        crate::raster_source::test_support::write_netcdf(&netcdf, true, false)?;
+        let workers = WindowWorkers::new()?;
+        let key = WindowKey {
+            tile: Tile { z: 3, x: 3, y: 3 },
+            start: 0,
+        };
+        for sources in [RasterSource::open(&directory.path().join("input.tif"))?, RasterSource::open(&netcdf)?] {
+            assert_ne!(sources[0].metadata().source_format, tiler::LayerSourceType::CloudOptimizedGeoTiff);
+            assert!(workers.request(0, key, sources[0].clone(), 1..sources.len() + 1));
+            assert_matches_single_band_tiles(wait_for_result(&workers)?.data?, &sources, key.tile)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gdal_multiband_reads_reject_invalid_ranges_and_honor_cancellation() -> Result<()> {
+        let (directory, _cog) = cog_fixture(3)?;
+        let sources = RasterSource::open(&directory.path().join("input.tif"))?;
+        let tile = Tile { z: 3, x: 3, y: 3 };
+        assert!(sources[0].numeric_band_tiles_cancellable(tile, 0..2, || false).is_err());
+        assert!(sources[0].numeric_band_tiles_cancellable(tile, 99..100, || false).is_err());
+        assert!(sources[0].numeric_band_tiles_cancellable(tile, 1..4, || true).is_err());
         Ok(())
     }
 

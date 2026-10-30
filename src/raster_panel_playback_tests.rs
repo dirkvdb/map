@@ -193,9 +193,11 @@ fn aligned_playback_fixture_opens_as_native_cog_with_all_band_descriptions() {
 }
 
 #[gpui_kit::test]
-fn playback_controls_are_available_only_for_multiband_cogs(cx: &mut TestAppContext) {
+fn playback_controls_are_available_for_every_multiband_raster(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let cogs = cog_paths(&dir, &[1, 5]);
+    let single = dir.path().join("single.tif");
+    crate::raster_source::test_support::write_raster(&single, 4326, 1).unwrap();
     let plain = dir.path().join("plain.tif");
     crate::raster_source::test_support::write_raster(&plain, 4326, 5).unwrap();
     let netcdf = dir.path().join("time.nc");
@@ -208,24 +210,25 @@ fn playback_controls_are_available_only_for_multiband_cogs(cx: &mut TestAppConte
     .unwrap();
     let (panel, handle) = open_panel(cx);
     assert_playback_visibility(&panel, handle, false, cx);
-    for path in [plain, netcdf, vector, cogs[0].clone()] {
+    for path in [single, vector, cogs[0].clone()] {
         load(&panel, handle, vec![path], cx);
         assert_playback_visibility(&panel, handle, false, cx);
     }
-    load(&panel, handle, vec![cogs[1].clone()], cx);
-    assert_playback_visibility(&panel, handle, true, cx);
-    let initial = request(&panel, cx);
-    assert!(!initial.is_playing());
-    assert_eq!(initial.position(), 0.0);
-    assert_eq!(initial.bands_per_second(), 3.0);
-    assert!(initial.interpolation());
-    assert_eq!(initial.bands().len(), 5);
-    assert!(
-        initial
-            .bands()
-            .iter()
-            .all(|source| source.metadata().source_format == tiler::LayerSourceType::CloudOptimizedGeoTiff)
-    );
+    for (path, format, count) in [
+        (plain, tiler::LayerSourceType::GeoTiff, 5),
+        (netcdf, tiler::LayerSourceType::Netcdf, 2),
+        (cogs[1].clone(), tiler::LayerSourceType::CloudOptimizedGeoTiff, 5),
+    ] {
+        load(&panel, handle, vec![path], cx);
+        assert_playback_visibility(&panel, handle, true, cx);
+        let initial = request(&panel, cx);
+        assert!(!initial.is_playing());
+        assert_eq!(initial.position(), 0.0);
+        assert_eq!(initial.bands_per_second(), 3.0);
+        assert!(initial.interpolation());
+        assert_eq!(initial.bands().len(), count);
+        assert!(initial.bands().iter().all(|source| source.metadata().source_format == format));
+    }
 }
 
 #[gpui_kit::test]

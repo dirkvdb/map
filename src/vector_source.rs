@@ -181,12 +181,10 @@ impl VectorSource {
             return Ok(None);
         };
         log::info!(target: "map::vector_load", "path={path:?} stage=gdal-open elapsed={:?}", opened.elapsed());
-        // Container drivers such as GeoPackage can open in vector mode even
-        // when the file only contains rasters. Preserve the raster fallback.
-        if dataset.layer_count() == 0 {
+        let driver = dataset.driver().short_name();
+        if belongs_to_raster_reader(&dataset, &driver, path) {
             return Ok(None);
         }
-        let driver = dataset.driver().short_name();
         let is_csv = driver == VectorFileFormat::Csv.gdal_driver_name();
         let dataset = if is_csv { open_csv_dataset(path)? } else { dataset };
         if [VectorFileFormat::PMTiles.gdal_driver_name(), VectorFileFormat::MBTiles.gdal_driver_name()].contains(&driver.as_str()) {
@@ -610,6 +608,26 @@ fn schema_numeric_properties(defn: &gdal::vector::Defn) -> Vec<NumericProperty> 
 
 fn bounds_array(bounds: geo::LatLonBounds) -> [f64; 4] {
     [bounds.west(), bounds.south(), bounds.east(), bounds.north()]
+}
+
+/// GDAL's netCDF driver exposes 1D variables, such as a grid's time axis, as
+/// point layers. Files with raster grids belong to the raster reader instead.
+/// Container drivers such as GeoPackage can open in vector mode even when the
+/// file only contains rasters, and GDAL's netCDF vector mode exposes 1-D
+/// coordinate variables (e.g. `time`) as point layers next to gridded data.
+/// Both cases must fall through to the raster reader.
+fn belongs_to_raster_reader(dataset: &Dataset, driver: &str, path: &Path) -> bool {
+    dataset.layer_count() == 0 || (driver == "netCDF" && contains_raster_grids(path))
+}
+
+fn contains_raster_grids(path: &Path) -> bool {
+    use gdal::Metadata as _;
+    let options = gdal::DatasetOptions {
+        open_flags: gdal::GdalOpenFlags::GDAL_OF_RASTER | gdal::GdalOpenFlags::GDAL_OF_READONLY,
+        ..Default::default()
+    };
+    Dataset::open_ex(path, options)
+        .is_ok_and(|dataset| dataset.raster_count() > 0 || dataset.metadata_domain("SUBDATASETS").is_some_and(|subdatasets| !subdatasets.is_empty()))
 }
 
 fn open_csv_dataset(path: &Path) -> Result<Dataset> {
