@@ -13,6 +13,7 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectDelegate, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IndexPath, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
@@ -417,6 +418,11 @@ impl RasterPanel {
     fn active(&self) -> Option<&Arc<RasterSource>> {
         let SelectionId::Raster(id) = self.selected? else { return None };
         self.sources.get(*self.source_indices.get(&id)?)
+    }
+
+    /// True when the active raster is a valid COG served by the optimized COG tile provider.
+    fn active_is_cog(&self) -> bool {
+        self.active().is_some_and(|source| source.metadata().source_format == tiler::LayerSourceType::CloudOptimizedGeoTiff)
     }
 
     fn active_vector(&self) -> Option<&Arc<VectorSource>> {
@@ -1470,11 +1476,13 @@ impl RasterPanel {
         // Match small Select padding, its rem-based caret + gap, and physical borders.
         let chrome_width = gpui_kit::component::Size::Small.input_px() * 2.0 + rem * 1.125 + gpui_kit::px(2.0);
         let viewport_width = window.viewport_size().width;
+        let is_cog = self.active_is_cog();
         // Reserve the background selector's 24% width cap, a drag region,
-        // Open, trailing actions, and native window controls.
-        let max_width = (viewport_width * 0.5).min((viewport_width * 0.76 - rem * 14.0).max(gpui_kit::Pixels::ZERO));
+        // Open, the COG tag, trailing actions, and native window controls.
+        let reserved = rem * if is_cog { 17.0 } else { 14.0 };
+        let max_width = (viewport_width * 0.5).min((viewport_width * 0.76 - reserved).max(gpui_kit::Pixels::ZERO));
 
-        div()
+        let selector = div()
             .id("raster-band-scroll")
             .w((text_width + chrome_width).ceil().min(max_width))
             .min_w_0()
@@ -1493,7 +1501,19 @@ impl RasterPanel {
                     .accessibility_label("Layer")
                     .placeholder(PLACEHOLDER)
                     .disabled(self.sources.is_empty() && self.vectors.is_empty()),
+            );
+
+        div().flex().items_center().gap_1p5().min_w_0().flex_shrink_0().child(selector).when(is_cog, |row| {
+            row.child(
+                div()
+                    .id("raster-cog-tag")
+                    .role(gpui_kit::Role::Status)
+                    .aria_label("Cloud Optimized GeoTIFF")
+                    .test_support()
+                    .flex_shrink_0()
+                    .child(Tag::success().outline().xsmall().child("COG")),
             )
+        })
     }
 }
 
