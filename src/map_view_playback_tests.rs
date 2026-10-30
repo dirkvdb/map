@@ -448,8 +448,9 @@ fn playback_band_refreshes_keep_the_hover_value_visible_until_sampling_finishes(
     cx.run_until_parked();
     let first = hover_value(&harness, cx);
     for (position, expected) in [(1.25, 78.0), (3.25, 196.0), (0.25, first)] {
-        // Looping can reuse the first band's cached tile immediately.
-        let immediate = if position < 1.0 { first } else { hover_value(&harness, cx) };
+        // Neighbour prefetches evict earlier bands' tiles, so even looping back
+        // keeps the displayed value until the first band is sampled again.
+        let immediate = hover_value(&harness, cx);
         let frame = harness.frame(Some(feedback(&command, position, false)), cx);
         cx.update_window(harness.window, |_, window, cx| {
             harness.view.update(cx, |view, cx| view.apply_frame(frame, window, cx));
