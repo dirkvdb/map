@@ -42,10 +42,11 @@ impl RasterSource {
             zoom_level_strategy: geo::ZoomLevelStrategy::PreferHigher,
         };
         let RasterMetadata {
-            layers: metadata,
+            layers: mut metadata,
             source_files,
         } = raster_metadata(path, &options)?;
         ensure!(!metadata.is_empty(), "No raster bands found in {}", path.display());
+        refresh_dataset_metadata(&mut metadata)?;
         metadata
             .into_iter()
             .map(|metadata| Self::from_metadata(metadata, source_files.clone()))
@@ -54,7 +55,6 @@ impl RasterSource {
 
     fn from_metadata(mut metadata: LayerMetadata, source_files: Option<Arc<tempfile::TempDir>>) -> Result<Arc<Self>> {
         prepare_raster_metadata(&mut metadata)?;
-        refresh_band_metadata(&mut metadata)?;
         validate_raster_scaling(&metadata)?;
         let unscaling_enabled = metadata.scale.is_some();
         let range = scaled_range(&metadata, metadata.scale.unwrap_or_default());
@@ -415,9 +415,23 @@ fn prepare_raster_metadata(metadata: &mut LayerMetadata) -> Result<()> {
     Ok(())
 }
 
-fn refresh_band_metadata(metadata: &mut LayerMetadata) -> Result<()> {
+fn refresh_dataset_metadata(metadata: &mut [LayerMetadata]) -> Result<()> {
+    // Opening a many-band TIFF reparses metadata for every band. Reuse the
+    // dataset for adjacent bands, without retaining all NetCDF grid handles.
+    for layers in metadata.chunk_by_mut(|left, right| left.path == right.path) {
+        if layers.iter().all(|layer| layer.band_nr.is_none()) {
+            continue;
+        }
+        let dataset = gdal::Dataset::open(&layers[0].path)?;
+        for layer in layers {
+            refresh_band_metadata(layer, &dataset)?;
+        }
+    }
+    Ok(())
+}
+
+fn refresh_band_metadata(metadata: &mut LayerMetadata, dataset: &gdal::Dataset) -> Result<()> {
     let Some(band_nr) = metadata.band_nr else { return Ok(()) };
-    let dataset = gdal::Dataset::open(&metadata.path)?;
     let band = dataset.rasterband(band_nr)?;
     metadata.description = band.description()?.trim().to_owned();
     metadata.scale = match (band.scale(), band.offset()) {
@@ -1005,6 +1019,39 @@ mod tests {
     fn constant_and_missing_statistics_have_usable_ranges() {
         assert_eq!(display_range(5.0, 5.0), (4.0, 6.0));
         assert_eq!(display_range(f32::NAN, f32::NAN), (0.0, 255.0));
+    }
+
+    #[test]
+    fn dataset_metadata_refresh_preserves_each_band_and_source_path() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let options = TileProviderOptions {
+            calculate_stats: false,
+            zoom_level_strategy: geo::ZoomLevelStrategy::PreferHigher,
+        };
+        let mut metadata = Vec::new();
+        for name in ["first.tif", "second.tif"] {
+            let path = directory.path().join(name);
+            test_support::write_raster(&path, 3857, 3)?;
+            metadata.extend(provider_metadata(&path, &options)?);
+        }
+        refresh_dataset_metadata(&mut metadata)?;
+        for layer in metadata {
+            let band_nr = layer.band_nr.unwrap();
+            assert_eq!(layer.min_value, (8 + band_nr * 10) as f32);
+            assert_eq!(layer.max_value, (126 + band_nr * 10) as f32);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires MAP_TEST_RASTER pointing to a local raster file"]
+    fn local_raster_opens_all_bands() -> Result<()> {
+        let path = std::path::PathBuf::from(std::env::var("MAP_TEST_RASTER")?);
+        let started = std::time::Instant::now();
+        let sources = RasterSource::open(&path)?;
+        eprintln!("Opened {} raster bands in {:?}", sources.len(), started.elapsed());
+        assert_eq!(sources.len(), gdal::Dataset::open(&path)?.raster_count());
+        Ok(())
     }
 
     #[test]

@@ -428,7 +428,7 @@ fn renderer_feedback_syncs_band_name_slider_and_style_without_emitting_or_seekin
     assert_eq!(accepted.revision(), command.revision());
     assert_eq!(accepted.position(), 1.25);
     assert_eq!(accepted.style().palette_for(&accepted.bands()[1]), ColorMapPreset::Gray);
-    assert_eq!(accepted.style().range_for(&accepted.bands()[1]), (10.0, 20.0));
+    assert_eq!(Some(accepted.style().range_for(&accepted.bands()[1])), command.data_range());
     assert_raw_bands_unchanged(&command, &accepted);
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -436,8 +436,9 @@ fn renderer_feedback_syncs_band_name_slider_and_style_without_emitting_or_seekin
         assert_eq!(state.active().unwrap().metadata().band_nr, Some(2));
         assert_eq!(state.band_slider.read(cx).value().end(), 2.25);
         assert_eq!(state.palette.read(cx).selected_value(), Some(&"Gray"));
-        assert_eq!(state.min.read(cx).value().as_str(), "10.00");
-        assert_eq!(state.max.read(cx).value().as_str(), "20.00");
+        let (min, max) = command.data_range().unwrap();
+        assert_eq!(state.min.read(cx).value().as_str(), format!("{min:.2}"));
+        assert_eq!(state.max.read(cx).value().as_str(), format!("{max:.2}"));
         assert_eq!(window.find("raster-band-label").label(), Some("Band Frame 2"));
         assert_eq!(window.find("raster-playback-status").label(), Some("Buffering"));
     })
@@ -729,6 +730,49 @@ fn scaled_cog_path(directory: &tempfile::TempDir) -> PathBuf {
     dataset.close().unwrap();
     write_aligned_cog(&input, &output).unwrap();
     output
+}
+
+#[gpui_kit::test]
+fn all_band_bounds_keep_colors_and_slider_positions_stable_during_playback(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (panel, handle) = open_panel(cx);
+    load(&panel, handle, vec![scaled_cog_path(&dir)], cx);
+    let initial = request(&panel, cx);
+    let minimum = initial.bands().iter().map(|band| band.data_range().0).fold(f32::INFINITY, f32::min);
+    let maximum = initial.bands().iter().map(|band| band.data_range().1).fold(f32::NEG_INFINITY, f32::max);
+    assert_ne!(initial.bands()[0].data_range(), initial.bands()[2].data_range());
+    assert_eq!(initial.data_range(), Some((minimum, maximum)));
+    assert!(initial.bands().iter().all(|band| initial.style().range_for(band) == (minimum, maximum)));
+    click(handle, "toggle-raster-playback", cx);
+    edit_maximum(handle, minimum + (maximum - minimum) * 0.75, cx);
+    let command = request(&panel, cx);
+    let positions = cx.update(|cx| {
+        let state = panel.read(cx);
+        let value = state.range_slider.read(cx).value();
+        (value.start(), value.end())
+    });
+    for position in [1.25, 2.75, 0.0] {
+        apply_frame(
+            &panel,
+            handle,
+            PlaybackFrame::new(command.dataset_id().unwrap(), command.revision(), position, false),
+            cx,
+        );
+        cx.update(|cx| {
+            let state = panel.read(cx);
+            assert_eq!(state.range_domain, (f64::from(minimum), f64::from(maximum)));
+            let value = state.range_slider.read(cx).value();
+            assert_eq!((value.start(), value.end()), positions);
+            let (min, max) = command.style().range().unwrap();
+            assert_eq!(state.color_range(), Some((f64::from(min), f64::from(max))));
+        });
+    }
+    click(handle, "reset-raster-range", cx);
+    let reset = request(&panel, cx);
+    let (reset_min, reset_max) = reset.style().range().unwrap();
+    assert!((reset_min - minimum).abs() <= 0.005);
+    assert!((reset_max - maximum).abs() <= 0.005);
+    assert!(reset.is_playing());
 }
 
 #[gpui_kit::test]

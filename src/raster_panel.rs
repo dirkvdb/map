@@ -422,7 +422,8 @@ impl RasterPanel {
 
     /// True when the active raster is a valid COG served by the optimized COG tile provider.
     fn active_is_cog(&self) -> bool {
-        self.active().is_some_and(|source| source.metadata().source_format == tiler::LayerSourceType::CloudOptimizedGeoTiff)
+        self.active()
+            .is_some_and(|source| source.metadata().source_format == tiler::LayerSourceType::CloudOptimizedGeoTiff)
     }
 
     fn active_vector(&self) -> Option<&Arc<VectorSource>> {
@@ -816,15 +817,13 @@ impl RasterPanel {
     }
 
     fn data_range(&self) -> Option<(f64, f64)> {
-        self.active()
-            .map(|source| {
-                let (min, max) = if self.playback_dataset().is_some() {
-                    source.data_range_with_scale(self.playback_style().scale_for(source))
-                } else {
-                    source.data_range()
-                };
-                (f64::from(min), f64::from(max))
-            })
+        let range = if let Some(request) = self.playback_dataset().and_then(|dataset| dataset.playback.as_ref()) {
+            request.data_range()
+        } else {
+            self.active().map(|source| source.data_range())
+        };
+        range
+            .map(|(min, max)| (f64::from(min), f64::from(max)))
             .or_else(|| self.active_vector().and_then(|source| source.data_range()))
     }
 
@@ -1503,17 +1502,24 @@ impl RasterPanel {
                     .disabled(self.sources.is_empty() && self.vectors.is_empty()),
             );
 
-        div().flex().items_center().gap_1p5().min_w_0().flex_shrink_0().child(selector).when(is_cog, |row| {
-            row.child(
-                div()
-                    .id("raster-cog-tag")
-                    .role(gpui_kit::Role::Status)
-                    .aria_label("Cloud Optimized GeoTIFF")
-                    .test_support()
-                    .flex_shrink_0()
-                    .child(Tag::success().outline().xsmall().child("COG")),
-            )
-        })
+        div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .min_w_0()
+            .flex_shrink_0()
+            .child(selector)
+            .when(is_cog, |row| {
+                row.child(
+                    div()
+                        .id("raster-cog-tag")
+                        .role(gpui_kit::Role::Status)
+                        .aria_label("Cloud Optimized GeoTIFF")
+                        .test_support()
+                        .flex_shrink_0()
+                        .child(Tag::success().outline().xsmall().child("COG")),
+                )
+            })
     }
 }
 

@@ -121,10 +121,13 @@ pub struct PlaybackRequest {
     bands_per_second: f64,
     interpolation: bool,
     style: PlaybackStyle,
+    data_range: Option<(f32, f32)>,
 }
 
 impl PlaybackRequest {
     pub fn new(bands: Vec<Arc<RasterSource>>, position: f64, revision: u64, playing: bool, bands_per_second: f64, interpolation: bool) -> Self {
+        let style = PlaybackStyle::default();
+        let data_range = playback_data_range(&bands, style);
         Self {
             bands: bands.into(),
             position,
@@ -132,7 +135,8 @@ impl PlaybackRequest {
             playing,
             bands_per_second,
             interpolation,
-            style: PlaybackStyle::default(),
+            style: PlaybackStyle { range: data_range, ..style },
+            data_range,
         }
     }
 
@@ -146,8 +150,19 @@ impl PlaybackRequest {
     }
 
     pub fn with_style(mut self, style: PlaybackStyle) -> Self {
-        self.style = style;
+        if self.style.unscaling() != style.unscaling() {
+            self.data_range = playback_data_range(&self.bands, style);
+        }
+        self.style = PlaybackStyle {
+            range: style.range().or(self.data_range),
+            ..style
+        };
         self
+    }
+
+    /// Combined bounds of every playback band in the current display units.
+    pub fn data_range(&self) -> Option<(f32, f32)> {
+        self.data_range
     }
 
     /// Changes playback controls while retaining the immutable band allocation and style.
@@ -194,6 +209,13 @@ impl PlaybackRequest {
     pub fn interpolation(&self) -> bool {
         self.interpolation
     }
+}
+
+fn playback_data_range(bands: &[Arc<RasterSource>], style: PlaybackStyle) -> Option<(f32, f32)> {
+    bands
+        .iter()
+        .map(|source| source.data_range_with_scale(style.scale_for(source)))
+        .reduce(|(min, max), (band_min, band_max)| (min.min(band_min), max.max(band_max)))
 }
 
 #[cfg(test)]
@@ -262,6 +284,30 @@ mod tests {
         assert_eq!(style.with_unscaling(false).scale_for(&bands[0]), RasterScale::default());
         assert!(!style.unscaling_for(&bands[1]));
         assert_eq!(style.scale_for(&bands[1]), RasterScale::default());
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_bounds_include_every_band_in_the_selected_units() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let bands = sources(directory.path(), true)?;
+        let request = PlaybackRequest::for_dataset(&bands).unwrap();
+        let expected = (
+            bands[0].data_range().0.min(bands[1].data_range().0),
+            bands[0].data_range().1.max(bands[1].data_range().1),
+        );
+        assert_eq!(request.data_range(), Some(expected));
+        assert!(bands.iter().all(|band| request.style().range_for(band) == expected));
+        let raw = request.clone().with_style(PlaybackStyle::default().with_unscaling(false));
+        let first = bands[0].data_range_with_scale(RasterScale::default());
+        let last = bands[1].data_range_with_scale(RasterScale::default());
+        let expected_raw = (first.0.min(last.0), first.1.max(last.1));
+        assert_eq!(raw.data_range(), Some(expected_raw));
+        assert!(bands.iter().all(|band| raw.style().range_for(band) == expected_raw));
+        assert!(raw.shares_bands(&request));
+        let edited = raw.clone().with_style(raw.style().with_range((10.0, 30.0))?);
+        assert_eq!(edited.data_range(), raw.data_range());
+        assert_eq!(edited.style().range(), Some((10.0, 30.0)));
         Ok(())
     }
 
