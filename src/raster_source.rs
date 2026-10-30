@@ -201,6 +201,15 @@ impl RasterSource {
     pub fn metadata(&self) -> &LayerMetadata {
         &self.metadata
     }
+
+    /// Borrows the native COG reader retained by the tile provider, without file I/O.
+    pub(crate) fn cog_reader(&self) -> Option<&geo::cog::WebTilesReader> {
+        self.metadata
+            .tileprovider_data
+            .as_deref()
+            .and_then(|data| data.as_ref().downcast_ref::<geo::cog::WebTilesReader>())
+    }
+
     pub fn range(&self) -> (f32, f32) {
         self.range
     }
@@ -1921,6 +1930,37 @@ pub(crate) mod test_support {
     pub fn write_raster(path: &Path, epsg: u32, bands: usize) -> Result<()> {
         let mut dataset = create_test_raster("GTiff", path, epsg, bands)?;
         dataset.flush_cache()?;
+        Ok(())
+    }
+
+    pub fn cog_fixture(bands: usize) -> Result<(tempfile::TempDir, Vec<Arc<RasterSource>>)> {
+        let directory = tempfile::tempdir()?;
+        let input_path = directory.path().join("input.tif");
+        write_raster(&input_path, 3857, bands)?;
+        let path = directory.path().join("playback.tif");
+        write_test_cog(&input_path, &path)?;
+        let sources = RasterSource::open(&path)?;
+        ensure!(sources.len() == bands, "COG fixture did not preserve band count");
+        Ok((directory, sources))
+    }
+
+    fn write_test_cog(input_path: &Path, path: &Path) -> Result<()> {
+        let input = gdal::Dataset::open(input_path)?;
+        let options = gdal::raster::RasterCreationOptions::from_iter([
+            "TILING_SCHEME=GoogleMapsCompatible",
+            "ZOOM_LEVEL=3",
+            "BLOCKSIZE=256",
+            "OVERVIEWS=NONE",
+            "COMPRESS=DEFLATE",
+            "INTERLEAVE=BAND",
+            "ADD_ALPHA=NO",
+        ]);
+        input.create_copy(&gdal::DriverManager::get_driver_by_name("COG")?, path, &options)?.close()?;
+        // The native COG probe reads a complete 16-KiB header even for tiny fixtures.
+        let file = std::fs::OpenOptions::new().write(true).open(path)?;
+        file.set_len(file.metadata()?.len().max(16 * 1024))?;
+        let metadata = geo::geotiff::GeoTiffMetadata::from_file(path)?;
+        geo::cog::WebTilesReader::new(metadata).context("COG fixture is not readable by the native tile reader")?;
         Ok(())
     }
 

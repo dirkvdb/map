@@ -7,6 +7,8 @@ use gpui_kit::{App, FontWeight, InteractiveElement, IntoElement, ParentElement, 
 use crate::raster_source::RasterSource;
 use crate::vector_source::VectorSource;
 
+mod cog;
+
 gpui_kit::actions!(dataset_properties, [OpenDatasetProperties]);
 
 type PropertyRows = Vec<(SharedString, SharedString)>;
@@ -35,6 +37,9 @@ impl DatasetProperties {
         }
         let mut sections = vec![("Dataset", general), ("Spatial reference", spatial)];
         sections.push(("Raster", raster_rows(source)));
+        if let Some(reader) = source.cog_reader() {
+            sections.extend(cog::sections(reader, metadata.max_zoom));
+        }
         let mut additional = metadata.additional_data.iter().map(|(key, value)| pair(key, value)).collect::<Vec<_>>();
         additional.sort_by(|left, right| left.0.cmp(&right.0));
         if !additional.is_empty() {
@@ -72,6 +77,7 @@ impl DatasetProperties {
                     .test_support()
                     .flex()
                     .flex_col()
+                    .flex_shrink_0()
                     .text_sm()
                     .gap_6()
                     .children(self.sections.iter().map(|(heading, rows)| section(heading, rows, cx)))
@@ -101,9 +107,8 @@ fn bounds_rows([west, south, east, north]: [f64; 4]) -> PropertyRows {
 fn raster_rows(source: &RasterSource) -> PropertyRows {
     let metadata = source.metadata();
     let mut rows = vec![pair("Zoom levels", format!("{}–{}", metadata.min_zoom, metadata.max_zoom))];
-    if let Some(band) = metadata.band_nr {
+    if metadata.band_nr.is_some() {
         rows.extend([
-            pair("Selected band", band),
             pair("Data type", metadata.data_type),
             pair("Stored range", format!("{} – {}", metadata.min_value, metadata.max_value)),
         ]);
@@ -137,6 +142,7 @@ fn section(heading: &'static str, rows: &[(SharedString, SharedString)], cx: &Ap
     div()
         .flex()
         .flex_col()
+        .flex_shrink_0()
         .gap_2()
         .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(heading))
         .child(
@@ -166,11 +172,32 @@ mod tests {
         for expected in [
             pair("Source", "original.nc"),
             pair("Bands", 2),
-            pair("Selected band", 2),
+            pair("Data type", sources[1].metadata().data_type),
             pair("Source CRS", "EPSG:3857"),
         ] {
             assert!(rows.contains(&&expected), "Missing property: {expected:?}");
         }
+        assert!(rows.iter().all(|(label, _)| label.as_ref() != "Selected band"));
+        assert!(!properties.sections.iter().any(|(title, _)| *title == "COG storage"));
+    }
+
+    #[test]
+    fn cog_properties_use_retained_metadata_after_the_file_is_moved() {
+        let (_directory, sources) = crate::raster_source::test_support::cog_fixture(2).unwrap();
+        let source = &sources[1];
+        let path = source.metadata().path.clone();
+        std::fs::rename(&path, path.with_extension("moved.tif")).unwrap();
+        let restyled = source.restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0)).unwrap();
+        let properties = DatasetProperties::raster(&restyled, &path, sources.len());
+        assert!(properties.sections.iter().any(|(title, _)| *title == "COG storage"));
+        assert!(properties.sections.iter().any(|(title, _)| *title == "Image pyramid"));
+        assert!(
+            properties
+                .sections
+                .iter()
+                .flat_map(|(_, rows)| rows)
+                .all(|(label, _)| label.as_ref() != "Selected band")
+        );
     }
 
     #[test]

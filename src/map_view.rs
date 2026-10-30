@@ -1107,6 +1107,57 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn cog_properties_scroll_in_short_windows_and_at_larger_font_sizes(cx: &mut TestAppContext) {
+        use gpui_kit::component::Theme;
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx).unwrap();
+            cx.set_reduce_motion(true);
+        });
+        let (_directory, sources) = crate::raster_source::test_support::cog_fixture(2).unwrap();
+        for (viewport, font_size, mode) in [
+            (size(px(800.), px(600.)), px(14.), ThemeMode::Light),
+            (size(px(640.), px(400.)), px(20.), ThemeMode::Dark),
+        ] {
+            cx.update(|cx| {
+                Theme::change(mode, None, cx);
+                Theme::update(cx, |theme| theme.font_size = font_size);
+            });
+            let (view, handle) = open_test_map(viewport, cx);
+            cx.update_window(handle.into(), |_, window, cx| {
+                crate::dataset_properties::DatasetProperties::raster(&sources[1], &sources[1].metadata().path, sources.len()).open(window, cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let surface = window.within("dialog").find("surface").bounds();
+                let content = window.find("dataset-properties").bounds();
+                assert_eq!(window.rem_size(), font_size);
+                assert!(surface.left() >= px(0.) && surface.right() <= viewport.width);
+                assert!(surface.top() >= px(0.) && surface.bottom() <= viewport.height);
+                assert!(content.left() >= surface.left() && content.right() <= surface.right());
+                assert!(content.bottom() > surface.bottom(), "The expanded COG metadata should scroll");
+                window.within("dialog").scroll("surface", ScrollDelta::Lines(point(0., -100.)), cx);
+                let scrolled = window.find("dataset-properties").bounds();
+                assert!(scrolled.top() < content.top(), "The dialog body must own scrolling");
+                assert!(scrolled.bottom() <= surface.bottom(), "The last metadata section must remain reachable");
+                assert!(!view.read(cx).focus.is_focused(window));
+                window.press("escape", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.try_find("dataset-properties").is_none());
+                assert!(view.read(cx).focus.is_focused(window));
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
     fn logs_start_hidden_without_a_toolbar_button_and_toggle_from_the_keyboard(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
