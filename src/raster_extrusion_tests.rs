@@ -4,6 +4,48 @@ use crate::raster_tiles::test_support::{device, parameters};
 
 #[test]
 #[ignore = "requires a native graphics device"]
+fn gpu_extrusion_static_opaque_bypass_releases_targets_without_reloading_tiles() -> Result<()> {
+    let (_directory, bands) = crate::raster_source::test_support::cog_fixture(1)?;
+    let source = bands[0].restyled(ColorMapPreset::Gray, (0.0, 255.0))?.with_extrusion(true, 2.0)?;
+    let (device, queue) = device()?;
+    let mut layer = RasterLayer::new(device.clone(), queue.clone())?;
+    layer.set_reduce_motion(true);
+    layer.set_source(Some(source.clone()), 1.0, 1);
+
+    let mut parameters = parameters(0.0);
+    parameters.depth_format = 0x30;
+    parameters.projection[10] = -0.000001;
+    parameters.projection[14] = 0.8;
+    layer.coverage = layer.view_tiles(&parameters, &source, None).iter().map(|tile| tile.canonical()).collect();
+    for tile in &layer.coverage {
+        let texture = upload_tile(&device, &queue, sample_tile([2; 2], &[100.0; 4]));
+        layer.cache_bytes += texture.bytes;
+        layer.cache.insert(
+            *tile,
+            CachedTile {
+                texture: Some(texture),
+                used: 0,
+            },
+        );
+    }
+    let counts = (layer.requests, layer.uploads, layer.generation, layer.cache_bytes);
+    for opacity in [1.0, 0.5, 1.0] {
+        layer.set_source(Some(source.clone()), opacity, 1);
+        paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+        assert_eq!(layer.composite.is_some(), opacity < 1.0);
+        assert_eq!((layer.requests, layer.uploads, layer.generation, layer.cache_bytes), counts);
+        assert_eq!(layer.cache.len(), layer.coverage.len());
+    }
+    assert_eq!(layer.pipeline.as_ref().unwrap().formats, (0x16, 0x30, false));
+    layer.previous = Some(PreviousRaster { source, cache: HashMap::new() });
+    assert!(layer.needs_compositing(), "Opaque palettes can still fade against missing endpoints");
+    paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+    assert!(layer.composite.is_some());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
 fn gpu_extrusion_static_toggle_animates_without_invalidating_raw_tiles() -> Result<()> {
     let (_directory, bands) = crate::raster_source::test_support::cog_fixture(1)?;
     let flat = bands[0].with_extrusion(false, 4.0)?.with_extrusion_averaging(true)?;

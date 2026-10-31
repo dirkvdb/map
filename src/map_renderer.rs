@@ -587,6 +587,7 @@ impl NativeMap {
             move || needs_frame.set(true)
         });
         let numeric = Rc::new(RefCell::new(RasterLayer::new(device.clone(), queue.clone())?));
+        numeric.borrow_mut().set_pixel_ratio(viewport.scale);
         let mut map = Self {
             renderer,
             basemap,

@@ -6,6 +6,109 @@ use crate::raster_source::NumericTile;
 use crate::raster_tiles::test_support::device;
 
 #[test]
+fn temporal_transparency_tracks_playing_current_and_retained_interpolation() -> Result<()> {
+    let (_directory, bands) = tiles::cog_fixture(3)?;
+    let request = tests::request(&bands, 0.0, 1);
+    let integer = endpoints(0.0, bands.len(), true);
+    let fractional = endpoints(0.5, bands.len(), true);
+    let retained = RetainedFrame {
+        draws: HashMap::new(),
+        frame: fractional,
+        window_size: DEFAULT_WINDOW,
+        fade_from: None,
+    };
+    assert!(!temporal_transparency(&request, false, integer, None));
+    assert!(temporal_transparency(&request, false, fractional, None));
+    assert!(temporal_transparency(&request, false, integer, Some(&retained)));
+    assert!(!temporal_transparency(&request, true, fractional, Some(&retained)));
+    let playing = request.with_controls(0.0, 1, true, 10.0);
+    assert!(temporal_transparency(&playing, false, integer, None));
+    let discrete = PlaybackRequest::new(bands, 0.5, 1, true, 10.0, false);
+    assert!(!temporal_transparency(&discrete, false, fractional, Some(&retained)));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_opaque_bypass_releases_composite_without_reloading_raw_tiles() -> Result<()> {
+    let (_directory, bands) = tiles::cog_fixture(3)?;
+    let (device, queue) = device()?;
+    let mut layer = MultibandLayer::new(device, queue)?;
+    let request = tests::request(&bands, 0.0, 1).with_style(
+        PlaybackStyle::default()
+            .with_extrusion(true, 2.0)
+            .with_palette(ColorMapPreset::Gray)
+            .with_color_map_direction(ColorMapDirection::Reversed),
+    );
+    layer.set_playback(request.clone(), 1.0);
+    tests::load_until_idle(&mut layer)?;
+    paint_playback_depth(&mut layer)?;
+    assert!(layer.composite.is_none(), "The first opaque frame must bypass offscreen targets");
+    assert_eq!(layer.pipeline.as_ref().unwrap().formats, (0x16, 0x30, false));
+    let counts = (layer.requests, layer.uploads, layer.generation, layer.cache.len(), layer.cache_bytes);
+    for opacity in [0.5, 1.0] {
+        layer.set_playback(request.clone(), opacity);
+        paint_playback_depth(&mut layer)?;
+        assert_eq!(layer.composite.is_some(), opacity < 1.0);
+        assert_eq!((layer.requests, layer.uploads, layer.generation, layer.cache.len(), layer.cache_bytes), counts);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_interpolation_and_manual_fades_keep_compositing() -> Result<()> {
+    let (_directory, bands) = tiles::cog_fixture(3)?;
+    let (device, queue) = device()?;
+    let mut layer = MultibandLayer::new(device, queue)?;
+    let request = tests::request(&bands, 0.5, 1).with_style(PlaybackStyle::default().with_extrusion(true, 2.0).with_palette(ColorMapPreset::Gray));
+    layer.set_playback(request.clone(), 1.0);
+    tests::load_until_idle(&mut layer)?;
+    paint_playback_depth(&mut layer)?;
+    assert!(layer.composite.is_some());
+    layer.set_playback(request.with_controls(1.0, 2, false, 10.0), 1.0);
+    assert!(layer.band_fade.is_some());
+    paint_playback_depth(&mut layer)?;
+    assert!(layer.composite.is_some());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_retained_interpolation_and_fades_keep_compositing() -> Result<()> {
+    let (_directory, bands) = tiles::cog_fixture(3)?;
+    let (device, queue) = device()?;
+    let mut layer = MultibandLayer::new(device, queue)?;
+    let request = tests::request(&bands, 0.0, 1).with_style(PlaybackStyle::default().with_extrusion(true, 2.0).with_palette(ColorMapPreset::Gray));
+    layer.set_playback(request.clone(), 1.0);
+    tests::load_until_idle(&mut layer)?;
+    for (fraction, fade_from) in [(0.5, None), (0.0, Some(endpoints(0.0, bands.len(), true)))] {
+        layer.retained = Some(RetainedFrame {
+            draws: HashMap::new(),
+            frame: Endpoints {
+                fraction,
+                ..endpoints(0.0, bands.len(), true)
+            },
+            window_size: layer.window_size,
+            fade_from,
+        });
+        assert!(layer.needs_compositing(&request));
+        paint_playback_depth(&mut layer)?;
+        assert!(layer.composite.is_some());
+    }
+    Ok(())
+}
+
+fn paint_playback_depth(layer: &mut MultibandLayer) -> Result<()> {
+    let mut parameters = tests::parameters();
+    parameters.depth_format = 0x30;
+    parameters.projection[10] = -0.000001;
+    parameters.projection[14] = 0.8;
+    paint_depth(&layer.device.clone(), &layer.queue.clone(), |pass| layer.render(pass, &parameters))?;
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires a native graphics device"]
 fn gpu_extrusion_playback_toggle_animates_uniforms_without_seeking_or_reloading() -> Result<()> {
     let (_directory, bands) = tiles::cog_fixture(3)?;

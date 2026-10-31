@@ -47,6 +47,33 @@ fn fade_image(layer: &mut MultibandLayer, elapsed: Duration) -> Result<image::Rg
 
 #[test]
 #[ignore = "requires a native graphics device; deterministic local tiles, no network"]
+fn gpu_dataset_switch_does_not_fade_from_outgoing_band_indices() -> Result<()> {
+    let (_outgoing_directory, outgoing) = tiles::cog_fixture(43)?;
+    let (_incoming_directory, incoming) = tiles::cog_fixture(3)?;
+    let (device, queue) = device()?;
+    for position in [42.0, 42.5] {
+        let mut layer = MultibandLayer::new(device.clone(), queue.clone())?;
+        layer.set_playback(command(&outgoing, position, 1), 1.0);
+        seed(&mut layer, &outgoing, 40)?;
+        seed(&mut layer, &outgoing, 0)?;
+        image(&mut layer)?;
+        assert!(!layer.clock.is_buffering());
+        layer.set_playback(command(&incoming, 1.0, 2), 1.0);
+        assert!(layer.band_fade.is_none(), "Dataset switches must discard outgoing band indices");
+        tests::load_until_idle(&mut layer)?;
+        assert_eq!(layer.playback_frame().unwrap().position(), 1.0);
+        assert!(
+            incoming[0].errors().try_recv().is_err(),
+            "The new dataset must load without invalid band requests"
+        );
+        layer.set_playback(command(&incoming, 2.0, 3), 1.0);
+        assert!(layer.band_fade.is_some(), "Selections within the new dataset must still crossfade");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device; deterministic local tiles, no network"]
 fn gpu_manual_band_selection_keeps_outgoing_pixels_then_crossfades_across_windows() -> Result<()> {
     let (_directory, bands) = tiles::cog_fixture(43)?;
     let (device, queue) = device()?;

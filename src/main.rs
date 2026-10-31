@@ -13,6 +13,7 @@ mod map_renderer;
 mod map_view;
 mod multiband_layer;
 mod pixel_info;
+mod raster_composite;
 mod raster_extrusion_animation;
 mod raster_layer;
 mod raster_panel;

@@ -14,6 +14,7 @@ use maplibre_native::{WgpuCustomLayer, WgpuLayerParameters, texture_format_from_
 use wgpu::util::DeviceExt;
 
 use crate::multiband_layer::MultibandLayer;
+use crate::raster_composite::{PaletteOpacity, RasterComposite};
 use crate::raster_extrusion_animation::ExtrusionAnimation;
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest};
 use crate::raster_source::{NumericTile, RasterSource};
@@ -119,6 +120,10 @@ pub struct RasterLayer {
     source: Option<Arc<RasterSource>>,
     dpi: u8,
     opacity: f32,
+    pixel_ratio: f32,
+    composite: Option<RasterComposite>,
+    compositing: bool,
+    palette_opacity: PaletteOpacity,
     generation: u64,
     workers: TileWorkers,
     pending: HashSet<Tile>,
@@ -151,6 +156,10 @@ impl RasterLayer {
             source: None,
             dpi: 1,
             opacity: 1.0,
+            pixel_ratio: 1.0,
+            composite: None,
+            compositing: false,
+            palette_opacity: PaletteOpacity::default(),
             generation: 0,
             workers: TileWorkers::new()?,
             pending: HashSet::new(),
@@ -174,6 +183,10 @@ impl RasterLayer {
             #[cfg(test)]
             uploads: 0,
         })
+    }
+
+    pub fn set_pixel_ratio(&mut self, pixel_ratio: f32) {
+        self.pixel_ratio = pixel_ratio;
     }
 
     pub fn set_source(&mut self, source: Option<Arc<RasterSource>>, opacity: f32, dpi: u8) {
@@ -350,12 +363,45 @@ impl RasterLayer {
 
     fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
         if let Some(layer) = &mut self.multiband {
-            layer.render(pass, parameters);
+            layer.render_scaled(pass, parameters, self.pixel_ratio);
             return;
         }
         let now = Instant::now();
         self.extrusion_animation.advance(now);
         self.finish_fade(now);
+        let extruded = self
+            .source
+            .as_ref()
+            .is_some_and(|source| self.extrusion_animation.height(effective_height(source)) > 0.0)
+            || self.previous.as_ref().is_some_and(|previous| effective_height(&previous.source) > 0.0);
+        if !extruded || (parameters.depth_format != 0 && !self.needs_compositing()) {
+            self.composite = None;
+            self.render_content(pass, parameters, now);
+            self.draw_debug_tiles(pass, parameters);
+            return;
+        }
+        let target = RasterComposite::prepare(self.composite.take(), &self.device, parameters, self.pixel_ratio);
+        let device = self.device.clone();
+        let queue = self.queue.clone();
+        self.compositing = true;
+        target.render_surface(&device, &queue, parameters, |surface, parameters| self.render_content(surface, parameters, now));
+        self.compositing = false;
+        target.composite(pass, &self.queue, self.opacity);
+        self.draw_debug_tiles(pass, parameters);
+        self.composite = Some(target);
+    }
+
+    fn needs_compositing(&mut self) -> bool {
+        // Missing endpoints can fade nodata in/out even with opaque palettes.
+        if self.opacity < 1.0 || self.previous.is_some() {
+            return true;
+        }
+        self.source
+            .as_ref()
+            .is_some_and(|source| !self.palette_opacity.is_opaque(source.palette(), source.color_map_direction()))
+    }
+
+    fn render_content(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters, now: Instant) {
         let Some(source) = self.source.clone() else { return };
         self.frame += 1;
         self.prepare_pipeline(parameters);
@@ -382,7 +428,6 @@ impl RasterLayer {
         let ready = !self.waiting || self.previous.is_some();
         let visible = retained_zoom_tiles(&mut self.displayed, visible, ready);
         self.draw_visible_tiles(pass, parameters, &source, &visible, blend);
-        self.draw_debug_tiles(pass);
         self.evict();
     }
 
@@ -417,8 +462,12 @@ impl RasterLayer {
         tiles
     }
 
+    fn draw_opacity(&self) -> f32 {
+        if self.compositing { 1.0 } else { self.opacity }
+    }
+
     fn opaque_draw(&self, blend: f32) -> bool {
-        self.opacity >= 1.0
+        self.draw_opacity() >= 1.0
             && (blend <= 0.0 || blend >= 1.0)
             && self
                 .pipeline
@@ -521,7 +570,7 @@ impl RasterLayer {
         visible_tile: VisibleTile,
         blend: f32,
     ) {
-        let opaque = self.opaque_draw(blend);
+        let (opaque, opacity) = (self.opaque_draw(blend), self.draw_opacity());
         let current_height = self.extrusion_animation.height(effective_height(source));
         let previous_height = self.previous.as_ref().map_or(current_height, |previous| effective_height(&previous.source));
         let tile = visible_tile.canonical();
@@ -581,7 +630,7 @@ impl RasterLayer {
                 previous_range: [previous_range.0, previous_range.1],
                 scale_offset,
                 previous_scale_offset,
-                opacity: self.opacity,
+                opacity,
                 blend,
                 tile_size: (512.0 * parameters.zoom.exp2() / f64::from(1_u32 << tile.z)) as f32,
                 previous_extrusion_height: previous_height,
@@ -595,13 +644,18 @@ impl RasterLayer {
         draw_pixels(pass, extrusion, geometry, &pipeline.extrusion_indices);
     }
 
-    fn draw_debug_tiles(&mut self, pass: &mut wgpu::RenderPass<'_>) {
+    fn draw_debug_tiles(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
         if self.debug
             && let Some(pipeline) = &mut self.pipeline
         {
-            let debug_pipeline = pipeline
-                .debug_pipeline
-                .get_or_insert_with(|| create_pipeline(&self.device, pipeline.formats, &pipeline.layout, "debug_fragment"));
+            let debug_pipeline = pipeline.debug_pipeline.get_or_insert_with(|| {
+                create_pipeline(
+                    &self.device,
+                    (parameters.color_format, parameters.depth_format, parameters.depth_test),
+                    &pipeline.layout,
+                    "debug_fragment",
+                )
+            });
             // Draw after every raster quad so neighboring tiles cannot cover
             // the grid or labels. Debug visibility is independent of opacity.
             pass.set_pipeline(debug_pipeline);
@@ -646,6 +700,7 @@ impl WgpuCustomLayer for RasterLayerHost {
     fn deinitialize(&mut self) {
         let mut layer = self.0.borrow_mut();
         layer.pipeline = None;
+        layer.composite = None;
         layer.draws.clear();
         layer.displayed.clear();
         layer.cache.clear();
@@ -832,7 +887,11 @@ fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wg
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: texture_format_from_webgpu(formats.0),
-                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                blend: Some(if extruded {
+                    wgpu::BlendState::REPLACE
+                } else {
+                    wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
+                }),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
