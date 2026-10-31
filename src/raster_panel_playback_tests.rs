@@ -452,6 +452,71 @@ fn renderer_feedback_syncs_band_name_slider_and_style_without_emitting_or_seekin
     .unwrap();
 }
 
+fn assert_value_range(panel: &Entity<RasterPanel>, domain: (f64, f64), range: (f64, f64), cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let panel = panel.read(cx);
+        assert_eq!(panel.data_range(), Some(domain));
+        assert_eq!(panel.range_domain, domain);
+        assert_eq!(panel.color_range(), Some(range));
+        let slider = panel.range_slider.read(cx).value();
+        assert_eq!(slider.start(), range_position(domain, range.0) as f32 * 1000.0);
+        assert_eq!(slider.end(), range_position(domain, range.1) as f32 * 1000.0);
+        for (input, value) in [(&panel.min, range.0), (&panel.max, range.1)] {
+            let actual = input.read(cx).value().parse::<f64>().unwrap();
+            assert_eq!(format!("{actual:.2}"), format!("{value:.2}"));
+        }
+    });
+}
+
+#[gpui_kit::test]
+fn value_range_uses_all_bands_and_stays_fixed_through_playback_and_manual_edits(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (panel, handle) = open_panel(cx);
+    for paths in [cog_paths(&dir, &[5]), vec![scaled_cog_path(&dir)]] {
+        load(&panel, handle, paths, cx);
+        let initial = request(&panel, cx);
+        let domain = initial
+            .bands()
+            .iter()
+            .map(|band| band.data_range())
+            .reduce(|(min, max), (next_min, next_max)| (min.min(next_min), max.max(next_max)))
+            .unwrap();
+        assert_ne!(domain, initial.bands()[0].data_range(), "The fixture must have different band limits");
+        let domain = (f64::from(domain.0), f64::from(domain.1));
+        assert_value_range(&panel, domain, domain, cx);
+        click(handle, "toggle-raster-playback", cx);
+        let playing = request(&panel, cx);
+        assert_value_range(&panel, domain, domain, cx);
+        for position in [1.25, initial.bands().len() as f64 - 0.25, 0.25] {
+            apply_frame(
+                &panel,
+                handle,
+                PlaybackFrame::new(playing.dataset_id().unwrap(), playing.revision(), position, false),
+                cx,
+            );
+            assert_value_range(&panel, domain, domain, cx);
+        }
+        let edited_max = ((domain.0 + domain.1) / 2.0).floor() as f32;
+        edit_maximum(handle, edited_max, cx);
+        let edited = request(&panel, cx).style().range().unwrap();
+        assert_eq!(edited.1, edited_max);
+        let edited = (f64::from(edited.0), f64::from(edited.1));
+        for position in [1.25, initial.bands().len() as f64 - 0.25, 0.25] {
+            apply_frame(
+                &panel,
+                handle,
+                PlaybackFrame::new(playing.dataset_id().unwrap(), playing.revision(), position, false),
+                cx,
+            );
+            assert_value_range(&panel, domain, edited, cx);
+        }
+        click(handle, "toggle-raster-playback", cx);
+        assert_value_range(&panel, domain, edited, cx);
+        click(handle, "last-raster-band", cx);
+        assert_value_range(&panel, domain, edited, cx);
+    }
+}
+
 #[gpui_kit::test]
 fn final_band_fractional_feedback_wraps_to_first_and_pauses_without_losing_its_fraction(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();

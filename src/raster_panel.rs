@@ -886,13 +886,12 @@ impl RasterPanel {
     }
 
     fn data_range(&self) -> Option<(f64, f64)> {
+        if let Some(request) = self.playback_dataset().and_then(|dataset| dataset.playback.as_ref()) {
+            return request.data_range().map(|(min, max)| (f64::from(min), f64::from(max)));
+        }
         self.active()
             .map(|source| {
-                let (min, max) = if self.playback_dataset().is_some() {
-                    source.data_range_with_scale(self.playback_style().scale_for(source))
-                } else {
-                    source.data_range()
-                };
+                let (min, max) = source.data_range();
                 (f64::from(min), f64::from(max))
             })
             .or_else(|| self.active_vector().and_then(|source| source.data_range()))

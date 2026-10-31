@@ -167,9 +167,22 @@ impl PlaybackRequest {
         }
     }
 
-    /// The paused initial command for a dataset with several playable bands.
+    /// The paused initial command, with a shared display range covering all playable bands.
     pub fn for_dataset(bands: &[Arc<RasterSource>]) -> Option<Self> {
-        (bands.len() > 1 && validate_bands(bands).is_ok()).then(|| Self::new(bands.to_vec(), 0.0, 0, false, 3.0, true))
+        if bands.len() < 2 || validate_bands(bands).is_err() {
+            return None;
+        }
+        let mut request = Self::new(bands.to_vec(), 0.0, 0, false, 3.0, true);
+        request.style = request.style.with_range(request.data_range()?).ok()?;
+        Some(request)
+    }
+
+    /// Combined bounds of every band in the current display units, independent of playback position.
+    pub fn data_range(&self) -> Option<(f32, f32)> {
+        self.bands
+            .iter()
+            .map(|band| band.data_range_with_scale(self.style.scale_for(band)))
+            .reduce(|(min, max), (next_min, next_max)| (min.min(next_min), max.max(next_max)))
     }
 
     pub fn style(&self) -> PlaybackStyle {
@@ -331,6 +344,39 @@ mod tests {
         ] {
             assert_eq!(restyled.extrusion_averaging(), Some(true));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_commands_share_all_band_bounds_without_modifying_sources() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut bands = sources(directory.path(), true)?;
+        bands[1] = bands[1].restyled(ColorMapPreset::Gray, (-1000.0, 2000.0))?;
+        let first = bands[0].data_range();
+        let second = bands[1].data_range();
+        let expected = (first.0.min(second.0), first.1.max(second.1));
+        let request = PlaybackRequest::for_dataset(&bands).unwrap();
+        assert_eq!(request.data_range(), Some(expected));
+        assert_eq!(request.style().range(), Some(expected));
+        for (original, band) in bands.iter().zip(request.bands()) {
+            assert!(Arc::ptr_eq(original, band));
+            assert_eq!(request.style().range_for(band), expected);
+        }
+        assert_eq!(bands[1].range(), (-1000.0, 2000.0));
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_bounds_follow_each_bands_units_but_not_style_ranges_or_position() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let bands = sources(directory.path(), true)?;
+        let first = bands[0].data_range_with_scale(RasterScale::default());
+        let second = bands[1].data_range_with_scale(RasterScale::default());
+        let expected = (first.0.min(second.0), first.1.max(second.1));
+        let request = PlaybackRequest::for_dataset(&bands).unwrap();
+        let style = request.style().with_unscaling(false).with_range((0.0, 1.0))?;
+        let request = request.with_style(style).with_controls(1.5, 1, true, 3.0);
+        assert_eq!(request.data_range(), Some(expected));
         Ok(())
     }
 
