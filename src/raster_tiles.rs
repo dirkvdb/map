@@ -141,8 +141,8 @@ fn intersects_bounds(tile: VisibleTile, bounds: LatLonBounds) -> bool {
     }
 }
 
-/// Coverage for the application's north-up, unpitched camera. Projection of the
-/// quads still uses MapLibre's own matrix, not an independent screen transform.
+/// Conservative ground coverage from MapLibre's projection, including pitch,
+/// bearing, and unwrapped world copies.
 pub fn visible_tiles(parameters: &WgpuLayerParameters, source: &RasterSource) -> Vec<VisibleTile> {
     tiles_at_zoom(parameters, selected_zoom(parameters, source), &[source.metadata().bounds.into()])
 }
@@ -171,10 +171,17 @@ fn tiles_at_zoom(parameters: &WgpuLayerParameters, z: i32, bounds: &[LatLonBound
     let world = 512.0 * parameters.zoom.exp2();
     let center = normalized_mercator(Coordinate::latlon(parameters.latitude, parameters.longitude));
     let (center_x, center_y) = (center.x(), center.y());
-    let left = ((center_x - parameters.width / (2.0 * world)) * n).floor() as i64;
-    let right = ((center_x + parameters.width / (2.0 * world)) * n).ceil() as i64;
-    let top = ((center_y - parameters.height / (2.0 * world)) * n).floor().max(0.0) as i32;
-    let bottom = ((center_y + parameters.height / (2.0 * world)) * n).ceil().min(n) as i32;
+    // Preserve bounded flat coverage when no invertible projection is available.
+    let [left, top, right, bottom] = crate::map_camera::projected_ground_bounds(&parameters.projection, parameters.zoom).unwrap_or([
+        center_x - parameters.width / (2.0 * world),
+        center_y - parameters.height / (2.0 * world),
+        center_x + parameters.width / (2.0 * world),
+        center_y + parameters.height / (2.0 * world),
+    ]);
+    let left = (left * n).floor() as i64;
+    let right = (right * n).ceil() as i64;
+    let top = (top * n).floor().max(0.0) as i32;
+    let bottom = (bottom * n).ceil().min(n) as i32;
     let mut tiles = Vec::new();
     for y in top..bottom {
         for x in left..right {

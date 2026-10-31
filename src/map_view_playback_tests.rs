@@ -24,7 +24,7 @@ impl Harness {
             cx.set_reduce_motion(true);
         });
         let mut view = None;
-        let window = cx.open_window(size(px(1000.0), px(900.0)), |window, cx| {
+        let window = cx.open_window(size(px(1000.0), px(1100.0)), |window, cx| {
             let map = cx.new(|cx| MapView::with_renderer(None, window, cx));
             view = Some(map.clone());
             Root::new(map, window, cx)

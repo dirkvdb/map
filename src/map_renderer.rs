@@ -2134,24 +2134,13 @@ mod tests {
         assert_eq!(image.dimensions(), (1200, 760));
         assert_global_latitude_registration(&image, camera, &source);
 
-        // Recreate the old 85%-height world without changing production camera code.
-        let mut unconstrained = camera;
-        unconstrained.zoom_at(0.85_f64.log2(), (0.0, 0.0));
-        let coordinate = unconstrained.coordinate_at((-39.5, 212.5));
-        assert!(coordinate.latitude < -74.0, "The old camera must predict southern data: {coordinate:?}");
-        let old_image = map.render_raster(
-            MapRequest {
-                camera: unconstrained,
-                ..request
-            },
-            Some(source),
-            1.0,
-        )?;
-        assert_eq!(
-            *old_image.get_pixel(560, 592),
-            image::Rgba([32, 32, 32, 255]),
-            "Native HeightOnly zoom puts this old-camera southern-data probe over nodata"
-        );
+        // Zooming below HeightOnly's minimum must not recreate the old 85%-height
+        // camera mismatch, even when the scroll anchor is away from the center.
+        let mut zoomed = camera;
+        zoomed.zoom_at(0.85_f64.log2(), (-39.5, 212.5));
+        assert_eq!(zoomed, camera);
+        let zoomed_image = map.render_raster(MapRequest { camera: zoomed, ..request }, Some(source.clone()), 1.0)?;
+        assert_global_latitude_registration(&zoomed_image, zoomed, &source);
         Ok(())
     }
 

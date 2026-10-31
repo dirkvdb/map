@@ -25,6 +25,10 @@ const BAND_FADE: Duration = Duration::from_millis(180);
 #[path = "raster_layer_zoom_tests.rs"]
 mod zoom_tests;
 
+#[cfg(test)]
+#[path = "raster_extrusion_tests.rs"]
+pub(crate) mod extrusion_tests;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct DrawUniform {
@@ -38,15 +42,17 @@ struct DrawUniform {
     opacity: f32,
     blend: f32,
     tile_size: f32,
-    padding: f32,
+    previous_extrusion_height: f32,
     tile_id: [u32; 4],
     clamp_colors: [u32; 4],
+    extrusion: [f32; 4],
 }
 
 struct TileTexture {
     values: wgpu::TextureView,
     valid: wgpu::TextureView,
     bytes: usize,
+    size: [u32; 2],
 }
 
 struct CachedTile {
@@ -63,6 +69,7 @@ struct DrawTile {
 struct RasterPipeline {
     formats: (u32, u32, bool),
     pipeline: wgpu::RenderPipeline,
+    extrusion_pipeline: wgpu::RenderPipeline,
     debug_pipeline: Option<wgpu::RenderPipeline>,
     layout: wgpu::BindGroupLayout,
     palettes: [wgpu::Texture; 2],
@@ -459,6 +466,14 @@ impl RasterLayer {
         if draw.sampled != pair {
             *draw = pipeline.draw_tile(&self.device, pair, texture, previous_texture);
         }
+        let previous_source = self.previous.as_ref().map_or(source, |previous| &previous.source);
+        let uv = sampled.map_or([0.0, 0.0, 1.0, 1.0], |sampled| parent_uv(tile, sampled));
+        let previous_uv = previous_sampled.map_or([0.0, 0.0, 1.0, 1.0], |sampled| parent_uv(tile, sampled));
+        let grid = extrusion_grid(texture.map(|t| t.size), uv, previous_texture.map(|t| t.size), previous_uv, blend);
+        let height = effective_height(previous_source) * (1.0 - blend) + effective_height(source) * blend;
+        let mut extrusion = extrusion_uniform(parameters, visible_tile, grid, effective_height(source));
+        extrusion[3] = height;
+        pass.set_pipeline(if height > 0.0 { &pipeline.extrusion_pipeline } else { &pipeline.pipeline });
         let range = source.range();
         let previous_range = self.previous.as_ref().map_or(range, |previous| previous.source.range());
         let scale = source.scale();
@@ -470,8 +485,8 @@ impl RasterLayer {
             0,
             bytemuck::bytes_of(&DrawUniform {
                 matrix: tile_matrix(&parameters.projection, parameters.zoom, visible_tile),
-                uv: sampled.map_or([0.0, 0.0, 1.0, 1.0], |sampled| parent_uv(tile, sampled)),
-                previous_uv: previous_sampled.map_or([0.0, 0.0, 1.0, 1.0], |sampled| parent_uv(tile, sampled)),
+                uv,
+                previous_uv,
                 range: [range.0, range.1],
                 previous_range: [previous_range.0, previous_range.1],
                 scale_offset,
@@ -479,8 +494,9 @@ impl RasterLayer {
                 opacity: self.opacity,
                 blend,
                 tile_size: (512.0 * parameters.zoom.exp2() / f64::from(1_u32 << tile.z)) as f32,
-                padding: 0.0,
+                previous_extrusion_height: extrusion_uniform(parameters, visible_tile, grid, effective_height(previous_source))[2],
                 tile_id: [tile.z as u32, tile.x as u32, tile.y as u32, 0],
+                extrusion,
                 clamp_colors: [
                     u32::from(source.clamp_colors()),
                     u32::from(self.previous.as_ref().map_or(source.clamp_colors(), |previous| previous.source.clamp_colors())),
@@ -490,7 +506,7 @@ impl RasterLayer {
             }),
         );
         pass.set_bind_group(0, &draw.bindings, &[]);
-        pass.draw(0..6, 0..1);
+        draw_pixels(pass, extrusion);
     }
 
     fn draw_debug_tiles(&mut self, pass: &mut wgpu::RenderPass<'_>) {
@@ -568,7 +584,7 @@ impl RasterPipeline {
     fn new(device: &wgpu::Device, formats: (u32, u32, bool)) -> Self {
         let texture_binding = |binding| wgpu::BindGroupLayoutEntry {
             binding,
-            visibility: wgpu::ShaderStages::FRAGMENT,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Texture {
                 sample_type: wgpu::TextureSampleType::Float { filterable: false },
                 view_dimension: wgpu::TextureViewDimension::D2,
@@ -603,6 +619,7 @@ impl RasterPipeline {
         Self {
             formats,
             pipeline,
+            extrusion_pipeline: create_pipeline(device, formats, &layout, "extruded_fragment"),
             debug_pipeline: None,
             layout,
             palettes,
@@ -612,6 +629,7 @@ impl RasterPipeline {
                 values: create_texture(device, 1, 1, wgpu::TextureFormat::R32Float).create_view(&Default::default()),
                 valid: create_texture(device, 1, 1, wgpu::TextureFormat::R8Unorm).create_view(&Default::default()),
                 bytes: 5,
+                size: [1, 1],
             },
         }
     }
@@ -684,15 +702,15 @@ fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wg
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: Some("vertex"),
+            entry_point: Some(if fragment == "extruded_fragment" { "extruded_vertex" } else { "vertex" }),
             compilation_options: Default::default(),
             buffers: &[],
         },
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: (formats.1 != 0).then(|| wgpu::DepthStencilState {
             format: texture_format_from_webgpu(formats.1),
-            depth_write_enabled: Some(false),
-            depth_compare: Some(if formats.2 && fragment == "fragment" {
+            depth_write_enabled: Some(fragment == "extruded_fragment"),
+            depth_compare: Some(if fragment == "extruded_fragment" || (formats.2 && fragment == "fragment") {
                 wgpu::CompareFunction::LessEqual
             } else {
                 wgpu::CompareFunction::Always
@@ -773,6 +791,39 @@ fn upload_tile(device: &wgpu::Device, queue: &wgpu::Queue, mut data: NumericTile
         values: values.create_view(&Default::default()),
         valid: mask.create_view(&Default::default()),
         bytes: data.values.len() * 5,
+        size: [data.width, data.height],
+    }
+}
+
+fn effective_height(source: &RasterSource) -> f32 {
+    if source.is_extruded() { source.extrusion_height() } else { 0.0 }
+}
+
+fn extrusion_grid(current: Option<[u32; 2]>, uv: [f32; 4], previous: Option<[u32; 2]>, previous_uv: [f32; 4], blend: f32) -> [u32; 2] {
+    std::array::from_fn(|axis| {
+        let a = current.filter(|_| blend > 0.0).map_or(1.0, |size| size[axis] as f32 * uv[axis + 2]);
+        let b = previous.filter(|_| blend < 1.0).map_or(1.0, |size| size[axis] as f32 * previous_uv[axis + 2]);
+        a.max(b).round().max(1.0) as u32
+    })
+}
+
+pub(crate) fn extrusion_uniform(parameters: &WgpuLayerParameters, tile: VisibleTile, grid: [u32; 2], height: f32) -> [f32; 4] {
+    // MapLibre Camera::getWorldToCamera scales Z meters to world pixels.
+    // Its Earth radius is 6378137 m; latitude matches the camera center.
+    let tile_meters = std::f64::consts::TAU * 6_378_137.0 * parameters.latitude.to_radians().cos() / f64::from(1_u32 << tile.z);
+    [
+        grid[0] as f32,
+        grid[1] as f32,
+        (tile_meters * f64::from(height * crate::raster_source::EXTRUSION_HEIGHT_FACTOR) / f64::from(grid[0])) as f32,
+        height,
+    ]
+}
+
+pub(crate) fn draw_pixels(pass: &mut wgpu::RenderPass<'_>, extrusion: [f32; 4]) {
+    if extrusion[3] > 0.0 {
+        pass.draw(0..30, 0..(extrusion[0] as u32 * extrusion[1] as u32));
+    } else {
+        pass.draw(0..6, 0..1);
     }
 }
 

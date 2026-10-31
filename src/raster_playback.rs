@@ -17,6 +17,7 @@ pub struct PlaybackStyle {
     color_map_direction: Option<ColorMapDirection>,
     clamp_colors: Option<bool>,
     unscaling: Option<bool>,
+    extrusion: Option<(bool, f32)>,
 }
 
 impl PlaybackStyle {
@@ -47,6 +48,19 @@ impl PlaybackStyle {
     pub fn with_unscaling(mut self, enabled: bool) -> Self {
         self.unscaling = Some(enabled);
         self
+    }
+
+    pub fn with_extrusion(mut self, enabled: bool, height: f32) -> Self {
+        self.extrusion = Some((enabled, crate::raster_source::normalized_extrusion_height(height)));
+        self
+    }
+
+    pub fn extrusion(self) -> Option<(bool, f32)> {
+        self.extrusion
+    }
+
+    pub fn extrusion_for(self, source: &RasterSource) -> (bool, f32) {
+        self.extrusion().unwrap_or((source.is_extruded(), source.extrusion_height()))
     }
 
     pub fn range(self) -> Option<(f32, f32)> {

@@ -16,6 +16,7 @@ use tiler::tileproviderfactory::TileProviderOptions;
 use tiler::{DynamicTileProvider, LayerMetadata, LayerSourceType, TileFormat, TileProvider, TileRequest, WarpingTileProvider};
 
 const TILE_SIZE: u32 = 256;
+pub(crate) const EXTRUSION_HEIGHT_FACTOR: f32 = 10.0;
 const MAX_RANGE_SAMPLE_BANDS: usize = 8;
 const URL_PREFIX: &str = "raster://";
 static NEXT_STYLE_ID: AtomicU64 = AtomicU64::new(1);
@@ -39,12 +40,19 @@ pub struct RasterSource {
     source_files: Option<Arc<tempfile::TempDir>>,
     unscaling_enabled: bool,
     clamp_colors: bool,
+    extruded: bool,
+    extrusion_height: f32,
     legend: Legend,
     palette: ColorMapPreset,
     color_map_direction: ColorMapDirection,
     range: (f32, f32),
     errors: async_channel::Sender<String>,
     error_receiver: async_channel::Receiver<String>,
+}
+
+/// Shared normalization for source snapshots and playback overrides.
+pub(crate) fn normalized_extrusion_height(height: f32) -> f32 {
+    if height.is_finite() { height.clamp(0.0, 10.0) } else { 1.0 }
 }
 
 impl RasterSource {
@@ -83,7 +91,7 @@ impl RasterSource {
             ColorMapDirection::Regular,
             range,
             unscaling_enabled,
-            true,
+            (true, false, 1.0),
         )
     }
 
@@ -94,7 +102,7 @@ impl RasterSource {
         color_map_direction: ColorMapDirection,
         range: (f32, f32),
         unscaling_enabled: bool,
-        clamp_colors: bool,
+        display: (bool, bool, f32),
     ) -> Result<Arc<Self>> {
         ensure!(valid_range(range), "Minimum must be less than maximum; both must be finite numbers.");
         let legend = Legend::linear(&ColorMap::Preset(palette, color_map_direction), range.0..range.1, None)?;
@@ -104,7 +112,9 @@ impl RasterSource {
             metadata,
             source_files,
             unscaling_enabled,
-            clamp_colors,
+            clamp_colors: display.0,
+            extruded: display.1,
+            extrusion_height: display.2,
             legend,
             palette,
             color_map_direction,
@@ -122,7 +132,7 @@ impl RasterSource {
             self.color_map_direction,
             range,
             self.unscaling_enabled,
-            self.clamp_colors,
+            (self.clamp_colors, self.extruded, self.extrusion_height),
         )
     }
 
@@ -135,7 +145,7 @@ impl RasterSource {
             direction,
             self.range,
             self.unscaling_enabled,
-            self.clamp_colors,
+            (self.clamp_colors, self.extruded, self.extrusion_height),
         )
     }
 
@@ -153,7 +163,30 @@ impl RasterSource {
             self.color_map_direction,
             self.range,
             self.unscaling_enabled,
-            enabled,
+            (enabled, self.extruded, self.extrusion_height),
+        )
+    }
+
+    pub fn is_extruded(&self) -> bool {
+        self.extruded
+    }
+
+    /// Maximum bar height in units of ten rendered raster-pixel widths. Each scaled
+    /// pixel value multiplies this by its clamped position within the color-map range.
+    pub fn extrusion_height(&self) -> f32 {
+        self.extrusion_height
+    }
+
+    /// Creates an immutable style snapshot without invalidating numeric tiles.
+    pub fn with_extrusion(&self, enabled: bool, height: f32) -> Result<Arc<Self>> {
+        Self::styled(
+            self.metadata.clone(),
+            self.source_files.clone(),
+            self.palette,
+            self.color_map_direction,
+            self.range,
+            self.unscaling_enabled,
+            (self.clamp_colors, enabled, normalized_extrusion_height(height)),
         )
     }
 
@@ -196,7 +229,7 @@ impl RasterSource {
             self.color_map_direction,
             range,
             enabled,
-            self.clamp_colors,
+            (self.clamp_colors, self.extruded, self.extrusion_height),
         )
     }
 

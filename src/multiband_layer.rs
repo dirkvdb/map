@@ -7,6 +7,9 @@
 
 #[path = "multiband_clock.rs"]
 mod clock;
+#[cfg(test)]
+#[path = "multiband_extrusion_tests.rs"]
+mod extrusion_tests;
 #[path = "multiband_tiles.rs"]
 mod tiles;
 #[cfg(test)]
@@ -40,6 +43,7 @@ struct DrawUniform {
     parameters: [f32; 4],
     // current array layer, next array layer, clamp colors, debug status
     layers: [u32; 4],
+    extrusion: [f32; 4],
 }
 
 struct DrawTile {
@@ -59,6 +63,7 @@ struct RetainedFrame {
 struct MultibandPipeline {
     formats: (u32, u32, bool),
     pipeline: wgpu::RenderPipeline,
+    extrusion_pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     palette: wgpu::Texture,
     palette_view: wgpu::TextureView,
@@ -459,7 +464,11 @@ impl MultibandLayer {
             &self.queue,
             (request.style().palette_for(source), request.style().color_map_direction_for(source)),
         );
-        pass.set_pipeline(&pipeline.pipeline);
+        pass.set_pipeline(if request.style().extrusion_for(source).0 && request.style().extrusion_for(source).1 > 0.0 {
+            &pipeline.extrusion_pipeline
+        } else {
+            &pipeline.pipeline
+        });
         for (&tile, draw) in &retained.draws {
             let data = draw_uniform(
                 parameters,
@@ -494,7 +503,11 @@ impl MultibandLayer {
             &self.queue,
             (request.style().palette_for(source), request.style().color_map_direction_for(source)),
         );
-        pass.set_pipeline(&pipeline.pipeline);
+        pass.set_pipeline(if request.style().extrusion_for(source).0 && request.style().extrusion_for(source).1 > 0.0 {
+            &pipeline.extrusion_pipeline
+        } else {
+            &pipeline.pipeline
+        });
         for &tile in visible {
             let keys = [frame.current, frame.next].map(|band| WindowKey {
                 tile: tile.canonical(),
@@ -523,7 +536,7 @@ fn paint_draw(queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'_>, draw: &DrawT
     data.layers[3] = debug_status;
     queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&data));
     pass.set_bind_group(0, &draw.bindings, &[]);
-    pass.draw(0..6, 0..1);
+    crate::raster_layer::draw_pixels(pass, data.extrusion);
 }
 
 fn adaptive_window_size(current: usize, maximum: usize, bytes_per_band: usize, tile_count: usize) -> usize {
@@ -563,7 +576,10 @@ fn draw_uniform(
 ) -> DrawUniform {
     let scales = sources.map(|source| style.scale_for(source));
     let ranges = sources.map(|source| style.range_for(source));
+    let (enabled, height) = style.extrusion_for(sources[0]);
+    let pixels = sources[0].metadata().tile_size.unwrap_or(256);
     DrawUniform {
+        extrusion: crate::raster_layer::extrusion_uniform(parameters, tile, [pixels; 2], if enabled { height } else { 0.0 }),
         matrix: tile_matrix(&parameters.projection, parameters.zoom, tile),
         scale: [scales[0].scale as f32, scales[0].offset as f32],
         next_scale: [scales[1].scale as f32, scales[1].offset as f32],
@@ -587,7 +603,7 @@ fn draw_uniform(
 impl MultibandPipeline {
     fn new(device: &wgpu::Device, formats: (u32, u32, bool)) -> Self {
         let layout = create_layout(device);
-        let pipeline = create_pipeline(device, formats, &layout);
+        let pipeline = create_pipeline(device, formats, &layout, false);
         let palette = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Multiband palette"),
             size: wgpu::Extent3d {
@@ -615,6 +631,7 @@ impl MultibandPipeline {
         Self {
             formats,
             pipeline,
+            extrusion_pipeline: create_pipeline(device, formats, &layout, true),
             layout,
             palette,
             palette_view,
@@ -702,7 +719,7 @@ fn create_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     }];
     entries.extend((1..=5).map(|binding| wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
+        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: false },
             view_dimension: if binding == 5 {
@@ -720,7 +737,7 @@ fn create_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wgpu::BindGroupLayout) -> wgpu::RenderPipeline {
+fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wgpu::BindGroupLayout, extruded: bool) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Multiband pipeline layout"),
         bind_group_layouts: &[Some(layout)],
@@ -735,15 +752,15 @@ fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wg
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: Some("vertex"),
+            entry_point: Some(if extruded { "extruded_vertex" } else { "vertex" }),
             compilation_options: Default::default(),
             buffers: &[],
         },
         primitive: Default::default(),
         depth_stencil: (formats.1 != 0).then(|| wgpu::DepthStencilState {
             format: texture_format_from_webgpu(formats.1),
-            depth_write_enabled: Some(false),
-            depth_compare: Some(if formats.2 {
+            depth_write_enabled: Some(extruded),
+            depth_compare: Some(if extruded || formats.2 {
                 wgpu::CompareFunction::LessEqual
             } else {
                 wgpu::CompareFunction::Always
@@ -754,7 +771,7 @@ fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wg
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: Some("fragment"),
+            entry_point: Some(if extruded { "extruded_fragment" } else { "fragment" }),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: texture_format_from_webgpu(formats.0),
@@ -785,11 +802,11 @@ mod tests {
         })
     }
 
-    fn request(bands: &[Arc<RasterSource>], position: f64, revision: u64) -> PlaybackRequest {
+    pub(super) fn request(bands: &[Arc<RasterSource>], position: f64, revision: u64) -> PlaybackRequest {
         PlaybackRequest::new(bands.to_vec(), position, revision, false, 10.0, true)
     }
 
-    fn parameters() -> WgpuLayerParameters {
+    pub(super) fn parameters() -> WgpuLayerParameters {
         WgpuLayerParameters {
             width: 256.0,
             height: 256.0,
@@ -825,7 +842,7 @@ mod tests {
         layer.queue.submit([encoder.finish()]);
     }
 
-    fn load_until_idle(layer: &mut MultibandLayer) -> Result<()> {
+    pub(super) fn load_until_idle(layer: &mut MultibandLayer) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             paint_layer(layer);
@@ -1192,6 +1209,7 @@ mod tests {
                     next_range: [0.0, next_max],
                     parameters: [0.25, 1.0, 2.0, 0.0],
                     layers: [0, 1, 1, 0],
+                    extrusion: [0.0; 4],
                 }),
             );
             let output = render_test_quad(&device, &queue, &pipeline.pipeline, &draw.bindings);
@@ -1317,7 +1335,7 @@ mod tests {
 
     #[test]
     fn uniform_layout_matches_wgsl_alignment() {
-        assert_eq!(std::mem::size_of::<DrawUniform>(), 128);
+        assert_eq!(std::mem::size_of::<DrawUniform>(), 144);
     }
 
     #[test]

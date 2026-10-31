@@ -6,6 +6,7 @@ struct Draw {
     next_range: vec2<f32>,
     parameters: vec4<f32>,
     layers: vec4<u32>,
+    extrusion: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> draw: Draw;
@@ -40,14 +41,19 @@ fn sample_band(data: texture_2d_array<f32>, mask: texture_2d_array<f32>, uv: vec
     return vec2(textureLoad(data, pixel, i32(layer), 0).r, textureLoad(mask, pixel, i32(layer), 0).r);
 }
 
-fn raster_color(uv: vec2<f32>) -> vec4<f32> {
+struct RasterSample {
+    color: vec4<f32>,
+    height: f32,
+};
+
+fn raster_sample(uv: vec2<f32>) -> RasterSample {
     let a = sample_band(values, valid, uv, draw.layers.x);
     let b = sample_band(next_values, next_valid, uv, draw.layers.y);
     let t = draw.parameters.x;
     let a_valid = a.y > 0.5;
     let b_valid = b.y > 0.5;
     if !a_valid && !b_valid {
-        return vec4(0.0);
+        return RasterSample(vec4(0.0), 0.0);
     }
 
     // Apply EACH endpoint's physical conversion BEFORE temporal interpolation,
@@ -70,12 +76,16 @@ fn raster_color(uv: vec2<f32>) -> vec4<f32> {
         alpha = 1.0 - t;
     }
     if draw.layers.z == 0u && (value < range.x || value > range.y) {
-        return vec4(0.0);
+        return RasterSample(vec4(0.0), 0.0);
     }
     let normalized = clamp((value - range.x) / max(range.y - range.x, 1e-30), 0.0, 1.0);
     let color = textureLoad(palette, vec2<i32>(i32(floor(normalized * 255.0 + 0.5)), 0), 0);
     let opacity = color.a * alpha * draw.parameters.y;
-    return vec4(color.rgb * opacity, opacity);
+    return RasterSample(vec4(color.rgb * opacity, opacity), normalized * draw.extrusion.z);
+}
+
+fn raster_color(uv: vec2<f32>) -> vec4<f32> {
+    return raster_sample(uv).color;
 }
 
 @fragment
@@ -88,4 +98,39 @@ fn fragment(in: Vertex) -> @location(0) vec4<f32> {
         }
     }
     return raster_color(in.uv);
+}
+
+// One instance per sampled pixel: top and four walls, no CPU mesh or bottom.
+@vertex
+fn extruded_vertex(@builtin(vertex_index) ix: u32, @builtin(instance_index) instance: u32) -> Vertex {
+    let grid = draw.extrusion.xy;
+    let pixel = vec2(f32(instance % u32(grid.x)), f32(instance / u32(grid.x)));
+    let triangles = array<vec2<f32>, 6>(vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
+        vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0));
+    let corner = triangles[ix % 6u];
+    let face = ix / 6u;
+    var local = vec3(corner, 1.0);
+    switch face {
+        case 1u: { local = vec3(corner.x, 0.0, corner.y); }
+        case 2u: { local = vec3(1.0, corner.x, corner.y); }
+        case 3u: { local = vec3(1.0 - corner.x, 1.0, corner.y); }
+        case 4u: { local = vec3(0.0, 1.0 - corner.x, corner.y); }
+        default: {}
+    }
+    var out: Vertex;
+    out.uv = (pixel + vec2(0.5)) / grid;
+    let sample = raster_sample(out.uv);
+    out.position = draw.matrix * vec4((pixel + local.xy) / grid, local.z * sample.height, 1.0);
+    if sample.color.a <= 0.0 {
+        out.position = vec4(2.0, 2.0, 2.0, 1.0);
+    }
+    return out;
+}
+
+@fragment
+fn extruded_fragment(in: Vertex) -> @location(0) vec4<f32> {
+    let color = raster_color(in.uv);
+    // Transparent pixels must not hide other bars through depth writes.
+    if color.a <= 0.0 { discard; }
+    return color;
 }

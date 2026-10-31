@@ -14,6 +14,7 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectDelegate, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IndexPath, Selectable, Sizable};
@@ -144,6 +145,12 @@ impl PaletteChoice {
                     .child(color_strip((0..=255).map(|ix| colors.get_color_by_value(ix)))),
             )
     }
+}
+
+fn initial_palette(window: &mut Window, cx: &mut Context<SelectState<PaletteChoices>>) -> SelectState<PaletteChoices> {
+    let items = palette_choices(ColorMapDirection::Regular);
+    let selected = items.0.iter().position(|item| item.name == "Turbo").map(IndexPath::new);
+    SelectState::new(items, selected, window, cx)
 }
 
 fn color_strip(colors: impl IntoIterator<Item = inf::Color>) -> impl IntoElement {
@@ -332,6 +339,7 @@ pub struct RasterPanel {
     band_slider: Entity<SliderState>,
     playback: PlaybackState,
 
+    extrusion_height: Entity<SliderState>,
     range_slider: Entity<SliderState>,
     range_domain: (f64, f64),
     min: Entity<InputState>,
@@ -356,11 +364,8 @@ impl EventEmitter<RasterEvent> for RasterPanel {}
 impl RasterPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let bands = cx.new(|cx| SelectState::new(Vec::<BandChoice>::new(), None, window, cx));
-        let palette = cx.new(|cx| {
-            let items = palette_choices(ColorMapDirection::Regular);
-            let selected = items.0.iter().position(|item| item.name == "Turbo").map(IndexPath::new);
-            SelectState::new(items, selected, window, cx)
-        });
+        let palette = cx.new(|cx| initial_palette(window, cx));
+        let (extrusion_height, extrusion_subscription) = Self::extrusion_control(window, cx);
         let property = cx.new(|cx| SelectState::new(SearchableVec::new(Vec::<SharedString>::new()), None, window, cx).searchable(true));
         let opacity = cx.new(|_| SliderState::new().min(0.0).max(100.0).step(1.0).default_value(100.0));
         let band_slider = cx.new(|_| SliderState::new().min(1.0).max(1.0).step(1.0).default_value(1.0));
@@ -371,6 +376,7 @@ impl RasterPanel {
         let min = cx.new(|cx| InputState::new(window, cx).placeholder("Minimum"));
         let max = cx.new(|cx| InputState::new(window, cx).placeholder("Maximum"));
         let subscriptions = vec![
+            extrusion_subscription,
             cx.subscribe_in(&bands, window, |this, _, event, window, cx| {
                 let SelectEvent::Confirm(id) = event;
                 this.select_layer(*id, window, cx);
@@ -419,6 +425,7 @@ impl RasterPanel {
             band_slider,
             playback: PlaybackState::default(),
 
+            extrusion_height,
             range_slider,
             range_domain: (0.0, 1.0),
             min,
@@ -1015,6 +1022,7 @@ impl RasterPanel {
         }
         self.sync_palette(window, cx);
         self.sync_range_slider(window, cx);
+        self.sync_extrusion_control(window, cx);
     }
 
     fn select_property(&mut self, property: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
@@ -1317,6 +1325,7 @@ impl RasterPanel {
             self.set_range_inputs((f64::from(range.0), f64::from(range.1)), window, cx);
         }
         self.sync_range_slider(window, cx);
+        self.sync_extrusion_control(window, cx);
     }
 
     /// Accept renderer feedback without emitting a new command or changing its revision.
@@ -1686,7 +1695,7 @@ impl Render for RasterPanel {
             .min_h_0()
             .child(self.render_layers_card(window, cx));
         if !self.collapsed && self.color_range().is_some() {
-            panel = panel.child(self.render_value_range(cx));
+            panel = panel.child(self.render_value_range(cx)).children(self.render_visualization(cx));
         }
         panel = panel.children(self.render_band_selector(cx));
         div()
@@ -1704,6 +1713,93 @@ impl Render for RasterPanel {
 }
 
 impl RasterPanel {
+    fn extrusion_control(window: &mut Window, cx: &mut Context<Self>) -> (Entity<SliderState>, Subscription) {
+        let height = cx.new(|_| SliderState::new().min(0.0).max(10.0).step(0.1).default_value(1.0));
+        let subscription = cx.subscribe_in(&height, window, |this, _, event: &SliderEvent, _, cx| {
+            if let SliderEvent::Change(value) = event
+                && this.extrusion().0
+            {
+                this.set_extrusion(true, value.end(), cx);
+            }
+        });
+        (height, subscription)
+    }
+
+    fn extrusion(&self) -> (bool, f32) {
+        self.active().map_or((false, 1.0), |source| self.playback_style().extrusion_for(source))
+    }
+
+    fn sync_extrusion_control(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let (_, height) = self.extrusion();
+        self.extrusion_height.update(cx, |slider, cx| slider.set_value(height, window, cx));
+    }
+
+    fn set_extrusion(&mut self, enabled: bool, height: f32, cx: &mut Context<Self>) {
+        let Some(source) = self.active().filter(|source| source.is_numeric()) else {
+            return;
+        };
+        if self.extrusion() == (enabled, height) {
+            return;
+        }
+        let result = if self.playback_dataset().is_some() {
+            self.set_playback_style(self.playback_style().with_extrusion(enabled, height));
+            Ok(())
+        } else {
+            source.with_extrusion(enabled, height).map(|source| self.replace_raster(source))
+        };
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.watch_tile_errors(cx);
+                self.emit(false, cx);
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not change pixel extrusion: {error}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn render_visualization(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        self.active().filter(|source| source.is_numeric())?;
+        let (enabled, height) = self.extrusion();
+        Some(
+            overlay_card("raster-visualization-card", cx)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Icon::new(IconName::ChartNoAxesColumn).small())
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Visualization")),
+                )
+                .child(
+                    Switch::new("raster-extrude-pixels")
+                        .small()
+                        .label("Extrude pixels")
+                        .checked(enabled)
+                        .on_change(cx.listener(|this, enabled, _, cx| {
+                            this.set_extrusion(*enabled, this.extrusion().1, cx);
+                        })),
+                )
+                .child(
+                    div().flex().justify_between().child(field_label("Maximum height", cx)).child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{:.1} × pixel width", height * crate::raster_source::EXTRUSION_HEIGHT_FACTOR)),
+                    ),
+                )
+                .child(
+                    div().id("raster-extrusion-height").test_support().px_2().child(
+                        Slider::new(&self.extrusion_height)
+                            .disabled(!enabled)
+                            .accessibility_label("Maximum extrusion height"),
+                    ),
+                ),
+        )
+    }
+
     fn render_legend(&self, cx: &App) -> impl IntoElement {
         let mut legend = div().id("raster-legend").test_support().flex().flex_col().gap_1();
         if let Some(((min, max), _)) = self.color_range().zip(self.color_palette()) {
@@ -2247,7 +2343,7 @@ mod tests {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![per_band_style_test_path(&dir, 2)];
-        let (panel, handle) = open_test_panel(cx, 760.0);
+        let (panel, handle) = open_test_panel(cx, 1000.0);
         load_test_paths(&panel, handle, paths, cx);
         let events = record_events(&panel, cx);
         let original = cx.update(|cx| panel.read(cx).active().unwrap().clone());
@@ -2587,7 +2683,7 @@ mod tests {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
         let paths = raster_test_paths(&dir, &[5]);
-        let (panel, handle) = open_test_panel(cx, 760.0);
+        let (panel, handle) = open_test_panel(cx, 1000.0);
         let events = record_events(&panel, cx);
         load_test_paths(&panel, handle, paths, cx);
         let original_source = cx.update(|cx| panel.read(cx).active().unwrap().id());
@@ -2641,12 +2737,14 @@ mod tests {
         let card = window.find("raster-band-controls").bounds();
         let slider = window.find("raster-band-slider");
         let mut previous = window.find("raster-layers-card").bounds();
-        if let Some(range) = window.try_find("raster-range-card") {
-            assert!((range.bounds().top() - previous.bottom() - window.rem_size() * 0.75).abs() <= px(1.0));
-            previous = range.bounds();
+        for id in ["raster-range-card", "raster-visualization-card"] {
+            if let Some(peer) = window.try_find(id) {
+                assert!((peer.bounds().top() - previous.bottom() - window.rem_size() * 0.75).abs() <= px(1.0));
+                previous = peer.bounds();
+            }
         }
         assert!((card.top() - previous.bottom() - window.rem_size() * 0.75).abs() <= px(1.0));
-        for id in ["raster-layers-card", "raster-range-card"] {
+        for id in ["raster-layers-card", "raster-range-card", "raster-visualization-card"] {
             if let Some(peer) = window.try_find(id) {
                 assert!((card.left() - peer.bounds().left()).abs() <= px(1.0), "{id} must share the band's left edge");
                 assert!((card.right() - peer.bounds().right()).abs() <= px(1.0), "{id} must share the band's right edge");
@@ -2687,7 +2785,7 @@ mod tests {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![per_band_style_test_path(&dir, 3)];
-        let (panel, handle) = open_test_panel(cx, 760.0);
+        let (panel, handle) = open_test_panel(cx, 1000.0);
         load_test_paths(&panel, handle, paths, cx);
         let first = style_active_band(&panel, handle, 1, (25.0, 45.0), cx);
         assert_eq!(first.palette(), ColorMapPreset::YlGnBu);
@@ -3153,6 +3251,64 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn extrusion_controls_preserve_per_band_style_and_support_keyboard(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![per_band_style_test_path(&dir, 2)];
+        let (panel, handle) = open_test_panel(cx, 1200.0);
+        load_test_paths(&panel, handle, paths, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("raster-visualization-card").bounds().top() >= window.find("raster-range-card").bounds().bottom());
+            assert_eq!(window.find("raster-extrude-pixels").checked(), Some(false));
+            window.click("raster-extrusion-height", cx);
+            assert_eq!(panel.read(cx).extrusion(), (false, 1.0));
+            window.click("raster-extrude-pixels", cx);
+            assert_eq!(panel.read(cx).extrusion(), (true, 1.0));
+            window.click("raster-extrusion-height", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let height = panel.read(cx).extrusion().1;
+            assert!(height > 1.0);
+            window.click("next-raster-band", cx);
+            assert_eq!(panel.read(cx).extrusion(), (false, 1.0));
+            window.click("previous-raster-band", cx);
+            assert_eq!(panel.read(cx).extrusion(), (true, height));
+            assert_eq!(panel.read(cx).extrusion_height.read(cx).value().end(), height);
+            window.click("raster-extrude-pixels", cx);
+            assert_eq!(panel.read(cx).extrusion(), (false, height));
+            window.press("space", cx);
+            assert_eq!(panel.read(cx).extrusion(), (true, height));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn extrusion_playback_style_is_shared_without_revising_playback(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[2]);
+        let (panel, handle) = open_test_panel(cx, 1200.0);
+        load_test_paths(&panel, handle, paths, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let revision = panel.read(cx).playback.revision;
+            window.click("raster-extrude-pixels", cx);
+            assert_eq!(panel.read(cx).playback.revision, revision);
+            assert_eq!(panel.read(cx).playback_style().extrusion(), Some((true, 1.0)));
+            window.click("next-raster-band", cx);
+            assert_eq!(panel.read(cx).extrusion(), (true, 1.0));
+            panel.update(cx, |panel, cx| panel.clear(window, cx));
+            window.render_frame(cx);
+            assert!(window.try_find("raster-visualization-card").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn clamp_colors_checkbox_updates_style_and_retains_per_band_state_through_the_ui(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
@@ -3475,7 +3631,7 @@ mod tests {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
         let path = per_band_style_test_path(&dir, 2);
-        let (panel, handle) = open_test_panel(cx, 760.0);
+        let (panel, handle) = open_test_panel(cx, 1000.0);
         verify_picker_cancel_and_open(&panel, handle, path, cx);
         let original_band = cx.update(|cx| panel.read(cx).selected);
         verify_band_navigation(&panel, handle, original_band, cx);
