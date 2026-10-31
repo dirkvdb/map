@@ -16,8 +16,20 @@ use tiler::tileproviderfactory::TileProviderOptions;
 use tiler::{DynamicTileProvider, LayerMetadata, LayerSourceType, TileFormat, TileProvider, TileRequest, WarpingTileProvider};
 
 const TILE_SIZE: u32 = 256;
+const MAX_RANGE_SAMPLE_BANDS: usize = 8;
 const URL_PREFIX: &str = "raster://";
 static NEXT_STYLE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+pub(crate) struct MissingProjection;
+
+impl std::fmt::Display for MissingProjection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("The raster has no coordinate reference system")
+    }
+}
+
+impl std::error::Error for MissingProjection {}
 
 /// An immutable display-style snapshot. Numeric tile caches use metadata.id,
 /// not this snapshot's ID, so styling never invalidates the data.
@@ -37,25 +49,31 @@ pub struct RasterSource {
 
 impl RasterSource {
     pub fn open(path: &Path) -> Result<Vec<Arc<Self>>> {
+        Self::open_with_epsg(path, None)
+    }
+
+    /// Supplies a source CRS only where the raster has none, without modifying the file.
+    pub(crate) fn open_with_epsg(path: &Path, epsg: Option<u32>) -> Result<Vec<Arc<Self>>> {
+        let started = std::time::Instant::now();
         let options = TileProviderOptions {
             calculate_stats: false,
             zoom_level_strategy: geo::ZoomLevelStrategy::PreferHigher,
         };
         let RasterMetadata {
-            layers: metadata,
+            layers: mut metadata,
             source_files,
-        } = raster_metadata(path, &options)?;
+        } = raster_metadata(path, &options, epsg)?;
         ensure!(!metadata.is_empty(), "No raster bands found in {}", path.display());
+        log::info!(target: "map::raster_load", "path={path:?} stage=provider-metadata bands={} elapsed={:?}", metadata.len(), started.elapsed());
+        refresh_raster_metadata(&mut metadata)?;
+        log::info!(target: "map::raster_load", "path={path:?} stage=band-metadata elapsed={:?}", started.elapsed());
         metadata
             .into_iter()
             .map(|metadata| Self::from_metadata(metadata, source_files.clone()))
             .collect()
     }
 
-    fn from_metadata(mut metadata: LayerMetadata, source_files: Option<Arc<tempfile::TempDir>>) -> Result<Arc<Self>> {
-        prepare_raster_metadata(&mut metadata)?;
-        refresh_band_metadata(&mut metadata)?;
-        validate_raster_scaling(&metadata)?;
+    fn from_metadata(metadata: LayerMetadata, source_files: Option<Arc<tempfile::TempDir>>) -> Result<Arc<Self>> {
         let unscaling_enabled = metadata.scale.is_some();
         let range = scaled_range(&metadata, metadata.scale.unwrap_or_default());
         Self::styled(
@@ -200,6 +218,12 @@ impl RasterSource {
     }
     pub fn metadata(&self) -> &LayerMetadata {
         &self.metadata
+    }
+
+    pub(crate) fn viewport_bounds(&self) -> [f64; 4] {
+        self.cog_reader()
+            .and_then(|reader| reader.cog_metadata().data_bounds)
+            .unwrap_or(self.metadata.bounds)
     }
 
     /// Borrows the native COG reader retained by the tile provider, without file I/O.
@@ -374,22 +398,52 @@ struct RasterMetadata {
     source_files: Option<Arc<tempfile::TempDir>>,
 }
 
-fn raster_metadata(path: &Path, options: &TileProviderOptions) -> Result<RasterMetadata> {
+fn raster_metadata(path: &Path, options: &TileProviderOptions, epsg: Option<u32>) -> Result<RasterMetadata> {
     // Probing must not prevent formats handled by native readers (such as
     // raster MBTiles) from opening without their optional GDAL driver.
     let dataset = gdal::Dataset::open(path);
     if dataset.as_ref().is_ok_and(|dataset| dataset.driver().short_name() == "netCDF") {
-        let (metadata, directory) = netcdf_metadata(path, options)?;
+        let (metadata, directory) = netcdf_metadata(path, options, epsg)?;
         return Ok(RasterMetadata {
             layers: metadata,
             source_files: Some(directory),
         });
+    }
+    if let Ok(dataset) = dataset
+        && dataset.raster_count() > 0
+        && dataset.spatial_ref().is_err()
+    {
+        return raster_metadata_with_epsg(path, options, epsg.context(MissingProjection)?);
     }
     let metadata = provider_metadata(path, options)?;
     Ok(RasterMetadata {
         layers: metadata,
         source_files: None,
     })
+}
+
+fn raster_metadata_with_epsg(path: &Path, options: &TileProviderOptions, epsg: u32) -> Result<RasterMetadata> {
+    let directory = Arc::new(tempfile::tempdir().context("Could not create raster projection directory")?);
+    let output = directory
+        .path()
+        .join(path.file_name().context("Raster has no file name")?)
+        .with_extension("vrt");
+    create_projected_vrt(path, &output, epsg)?;
+    Ok(RasterMetadata {
+        layers: WarpingTileProvider::new(&output, options)?.layers(),
+        source_files: Some(directory),
+    })
+}
+
+fn create_projected_vrt(path: &Path, output: &Path, epsg: u32) -> Result<()> {
+    // Keep lazy source references and all bands/metadata; no raster pixels are copied.
+    // An absolute source keeps those references valid in the temporary directory.
+    let dataset = gdal::Dataset::open(path.canonicalize()?)?;
+    let mut vrt = dataset.create_copy(&gdal::DriverManager::get_driver_by_name("VRT")?, output, &Default::default())?;
+    let mut reference = gdal::spatial_ref::SpatialRef::from_epsg(epsg)?;
+    reference.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
+    vrt.set_spatial_ref(&reference)?;
+    Ok(vrt.close()?)
 }
 
 fn provider_metadata(path: &Path, options: &TileProviderOptions) -> Result<Vec<LayerMetadata>> {
@@ -424,9 +478,68 @@ fn prepare_raster_metadata(metadata: &mut LayerMetadata) -> Result<()> {
     Ok(())
 }
 
-fn refresh_band_metadata(metadata: &mut LayerMetadata) -> Result<()> {
+fn refresh_raster_metadata(layers: &mut [LayerMetadata]) -> Result<()> {
+    // A time series can contain thousands of bands in one VRT. Reopening it
+    // for every band repeatedly parses the entire band list and source metadata.
+    let mut datasets = HashMap::new();
+    for metadata in layers.iter_mut() {
+        prepare_raster_metadata(metadata)?;
+        if metadata.band_nr.is_none() {
+            continue;
+        }
+        let dataset = match datasets.entry(metadata.path.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let dataset = gdal::Dataset::open(entry.key())?;
+                entry.insert(dataset)
+            }
+        };
+        let is_time_series = matches!((metadata.source_format, dataset.raster_count()), (LayerSourceType::Netcdf, 2..));
+        refresh_band_metadata(metadata, dataset, !is_time_series)?;
+        validate_raster_scaling(metadata)?;
+    }
+    for (path, dataset) in datasets {
+        refresh_time_series_ranges(layers, &path, &dataset)?;
+    }
+    Ok(())
+}
+
+fn refresh_time_series_ranges(layers: &mut [LayerMetadata], path: &Path, dataset: &gdal::Dataset) -> Result<()> {
+    let mut layers: Vec<_> = layers
+        .iter_mut()
+        .filter(|layer| layer.source_format == LayerSourceType::Netcdf && layer.path == path)
+        .collect();
+    if layers.len() < 2 || layers.iter().all(|layer| has_statistics(layer)) {
+        return Ok(());
+    }
+    // Opening must not scan every hour in a year. Keep cached per-band ranges;
+    // estimate missing ranges from a bounded set spanning the whole time series.
+    let samples = layers.len().min(MAX_RANGE_SAMPLE_BANDS);
+    for sample in 0..samples {
+        let index = sample * (layers.len() - 1) / (samples - 1);
+        refresh_band_metadata(layers[index], dataset, true)?;
+    }
+    let range = layers
+        .iter()
+        .filter(|layer| has_statistics(layer))
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), layer| {
+            (min.min(layer.min_value), max.max(layer.max_value))
+        });
+    let range = display_range(range.0, range.1);
+    for layer in &mut layers {
+        if !has_statistics(layer) {
+            (layer.min_value, layer.max_value) = range;
+        }
+    }
+    Ok(())
+}
+
+fn has_statistics(metadata: &LayerMetadata) -> bool {
+    metadata.min_value.is_finite() && metadata.max_value.is_finite() && metadata.min_value <= metadata.max_value
+}
+
+fn refresh_band_metadata(metadata: &mut LayerMetadata, dataset: &gdal::Dataset, force_statistics: bool) -> Result<()> {
     let Some(band_nr) = metadata.band_nr else { return Ok(()) };
-    let dataset = gdal::Dataset::open(&metadata.path)?;
     let band = dataset.rasterband(band_nr)?;
     metadata.description = band.description()?.trim().to_owned();
     metadata.scale = match (band.scale(), band.offset()) {
@@ -436,9 +549,7 @@ fn refresh_band_metadata(metadata: &mut LayerMetadata) -> Result<()> {
             offset: offset.unwrap_or(0.0),
         }),
     };
-    // Force calculation when no statistics were stored; otherwise the range
-    // can be 0..f32::MAX, including in debug builds.
-    if let Some(stats) = band.get_statistics(true, true)? {
+    if let Some(stats) = band.get_statistics(force_statistics, true)? {
         metadata.min_value = stats.min as f32;
         metadata.max_value = stats.max as f32;
     }
@@ -486,13 +597,13 @@ fn read_numeric_tile(metadata: &LayerMetadata, request: &TileRequest) -> tiler::
 
 /// GDAL exposes spatial NetCDF variables as subdatasets and flattens extra
 /// dimensions into bands. VRTs retain that mapping without copying grid data.
-fn netcdf_metadata(path: &Path, options: &TileProviderOptions) -> Result<(Vec<LayerMetadata>, Arc<tempfile::TempDir>)> {
+fn netcdf_metadata(path: &Path, options: &TileProviderOptions, epsg: Option<u32>) -> Result<(Vec<LayerMetadata>, Arc<tempfile::TempDir>)> {
     // VRTs live in a different directory; their sources must be absolute paths.
     let absolute = path.canonicalize()?;
     let dataset = gdal::Dataset::open(&absolute)?;
     let grids = netcdf_subdatasets(&dataset, &absolute);
     let directory = Arc::new(tempfile::tempdir().context("Could not create NetCDF raster directory")?);
-    let name = path.file_stem().context("NetCDF file has no name")?.to_string_lossy();
+    let name = path.file_stem().unwrap_or(path.as_os_str()).to_string_lossy();
     let mut metadata = Vec::new();
     let mut errors = Vec::new();
     let mut auxiliary_variables = HashSet::new();
@@ -502,8 +613,9 @@ fn netcdf_metadata(path: &Path, options: &TileProviderOptions) -> Result<(Vec<La
             continue;
         }
         let output = directory.path().join(format!("grid-{}.vrt", candidate.index));
-        match netcdf_grid_metadata(&candidate.dataset, &absolute, &output, &name, options) {
+        match netcdf_grid_metadata(&candidate.dataset, &absolute, &output, &name, options, epsg) {
             Ok(layers) => metadata.extend(layers),
+            Err(error) if error.is::<MissingProjection>() => return Err(error),
             Err(error) => {
                 log::warn!("Skipping NetCDF variable {}: {error:#}", candidate.source);
                 errors.push(format!("{}: {error:#}", candidate.source));
@@ -614,11 +726,18 @@ fn open_netcdf_grid(grid: &str) -> gdal::errors::Result<gdal::Dataset> {
     Ok(dataset)
 }
 
-fn netcdf_grid_metadata(dataset: &gdal::Dataset, source: &Path, output: &Path, file_name: &str, options: &TileProviderOptions) -> Result<Vec<LayerMetadata>> {
+fn netcdf_grid_metadata(
+    dataset: &gdal::Dataset,
+    source: &Path,
+    output: &Path,
+    file_name: &str,
+    options: &TileProviderOptions,
+    epsg: Option<u32>,
+) -> Result<Vec<LayerMetadata>> {
     ensure!(dataset.raster_count() > 0, "No raster bands found");
     let first_band = dataset.rasterband(1)?;
     let mut vrt = dataset.create_copy(&gdal::DriverManager::get_driver_by_name("VRT")?, output, &Default::default())?;
-    netcdf_georeference_vrt(dataset, &first_band, &mut vrt, source, output)?;
+    netcdf_georeference_vrt(dataset, &first_band, &mut vrt, source, output, epsg)?;
     vrt.close()?;
     let mut metadata = WarpingTileProvider::new(output, options)?.layers();
     netcdf_label_layers(dataset, file_name, &mut metadata)?;
@@ -631,6 +750,7 @@ fn netcdf_georeference_vrt(
     vrt: &mut gdal::Dataset,
     source: &Path,
     output: &Path,
+    epsg: Option<u32>,
 ) -> Result<()> {
     if dataset.geo_transform().is_err() {
         // Some producers put GeoTransform on the data variable instead of the
@@ -645,8 +765,13 @@ fn netcdf_georeference_vrt(
     if dataset.spatial_ref().is_err() {
         let crs = dataset
             .metadata_item("NC_GLOBAL#crs", "")
-            .context("No coordinate reference system or global crs attribute")?;
-        vrt.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_definition(&crs)?)?;
+            .or_else(|| epsg.map(|code| format!("EPSG:{code}")))
+            .context(MissingProjection)?;
+        // Raster transforms use X/Y (easting/northing or longitude/latitude),
+        // even for authority CRSs such as EPSG:3035 with reversed axis order.
+        let mut reference = gdal::spatial_ref::SpatialRef::from_definition(&crs)?;
+        reference.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
+        vrt.set_spatial_ref(&reference)?;
     }
     Ok(())
 }
@@ -668,10 +793,10 @@ fn netcdf_explicit_transform(band: &gdal::raster::RasterBand<'_>) -> Result<[f64
 }
 
 fn netcdf_label_layers(dataset: &gdal::Dataset, file_name: &str, metadata: &mut [LayerMetadata]) -> Result<()> {
+    let variable = netcdf_variable_name(dataset)?;
     for meta in metadata {
         let band_nr = meta.band_nr.context("NetCDF raster has no band number")?;
         let band = dataset.rasterband(band_nr)?;
-        let variable = netcdf_variable_name(dataset)?;
         let mut dimensions = band
             .metadata_domain("")
             .unwrap_or_default()
@@ -986,6 +1111,10 @@ impl FileSource for RasterFileSource {
 }
 
 #[cfg(test)]
+#[path = "raster_source_loading_tests.rs"]
+mod loading_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1020,11 +1149,22 @@ mod tests {
     #[ignore = "requires MAP_TEST_NETCDF pointing to a local NetCDF file"]
     fn netcdf_local_file_opens_all_layers_and_reads_tiles() -> Result<()> {
         let path = std::path::PathBuf::from(std::env::var("MAP_TEST_NETCDF")?);
+        let epsg = std::env::var("MAP_TEST_EPSG").ok().map(|value| value.parse::<u32>()).transpose()?;
+        let _ = env_logger::try_init();
+        let started = std::time::Instant::now();
         assert!(crate::vector_source::VectorSource::open(&path)?.is_none());
         print_netcdf_coordinates(&path)?;
-        let sources = RasterSource::open(&path)?;
-        eprintln!("Opened {} NetCDF raster layers", sources.len());
-        for source in sources {
+        let dataset = gdal::Dataset::open(&path)?;
+        eprintln!(
+            "Raster size={:?}, bands={}, subdatasets={:?}",
+            dataset.raster_size(),
+            dataset.raster_count(),
+            dataset.metadata_domain("SUBDATASETS")
+        );
+        let sources = RasterSource::open_with_epsg(&path, epsg)?;
+        eprintln!("Opened {} NetCDF raster layers in {:?}", sources.len(), started.elapsed());
+        // A time series may have thousands of bands; sample the endpoints.
+        for source in sources.first().into_iter().chain(sources.last()) {
             let metadata = source.metadata();
             let [west, south, east, north] = metadata.bounds;
             let coordinate = geo::Coordinate::latlon((south + north) / 2.0, (west + east) / 2.0);
@@ -1033,6 +1173,7 @@ mod tests {
             assert_eq!(data.values.len(), data.width as usize * data.height as usize);
             eprintln!("{}: bounds={:?}, range={:?}", metadata.name, metadata.bounds, source.range());
         }
+        eprintln!("Opened and sampled NetCDF in {:?}", started.elapsed());
         Ok(())
     }
 
@@ -1178,7 +1319,7 @@ mod tests {
         assert_grouped_netcdf_values(&sources)?;
         let selected = gdal::Dataset::open(format!("NETCDF:\"{}\":/forecast/day/WBGT", path.display()))?;
         let output = dir.path().join("selected.vrt");
-        let metadata = netcdf_grid_metadata(&selected, &path, &output, "grouped", &TileProviderOptions::default())?;
+        let metadata = netcdf_grid_metadata(&selected, &path, &output, "grouped", &TileProviderOptions::default(), None)?;
         assert_eq!(metadata.len(), 2);
         assert!(metadata[0].name.starts_with("grouped - /forecast/day/WBGT"));
         assert_eq!(read_raster_values(&output, 2, (0, 0), (1, 2))?.data(), &[20.0, 21.0]);
@@ -1839,6 +1980,50 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn cog_viewport_bounds_use_stored_data_bounds_without_changing_tile_coverage() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("input.tif");
+        super::test_support::write_raster(&path, 3857, 1)?;
+        let mut input = gdal::Dataset::open_ex(
+            &path,
+            gdal::DatasetOptions {
+                open_flags: gdal::GdalOpenFlags::GDAL_OF_UPDATE,
+                ..Default::default()
+            },
+        )?;
+        input.set_metadata_item("data_bounds", "[-5,1,-1,5]", "")?;
+        input.close()?;
+        let cog_path = directory.path().join("aligned-cog.tif");
+        write_aligned_cog(&path, &cog_path)?;
+        let source = RasterSource::open(&cog_path)?.remove(0);
+        assert!(source.cog_reader().is_some());
+        assert_eq!(source.viewport_bounds(), [-5.0, 1.0, -1.0, 5.0]);
+        assert_ne!(source.viewport_bounds(), source.metadata().bounds);
+        assert_eq!(source.source_json(1)["bounds"], json!(source.metadata().bounds));
+        Ok(())
+    }
+
+    #[test]
+    fn cog_viewport_bounds_fall_back_to_coverage_without_stored_data_bounds() -> Result<()> {
+        let (_directory, sources) = super::test_support::cog_fixture(1)?;
+        let source = &sources[0];
+        assert!(source.cog_reader().unwrap().cog_metadata().data_bounds.is_none());
+        assert_eq!(source.viewport_bounds(), source.metadata().bounds);
+        Ok(())
+    }
+
+    #[test]
+    fn plain_raster_viewport_bounds_use_geographic_bounds() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("input.tif");
+        super::test_support::write_raster(&path, 4326, 1)?;
+        let source = RasterSource::open(&path)?.remove(0);
+        assert!(source.cog_reader().is_none());
+        assert_eq!(source.viewport_bounds(), source.metadata().bounds);
+        Ok(())
+    }
+
     fn write_aligned_cog(path: &Path, cog_path: &Path) -> Result<()> {
         let input = gdal::Dataset::open(path)?;
         let options = gdal::raster::RasterCreationOptions::from_iter([
@@ -1966,9 +2151,11 @@ pub(crate) mod test_support {
 
     fn create_test_raster(driver: &str, path: &Path, epsg: u32, bands: usize) -> Result<gdal::Dataset> {
         let mut dataset = gdal::DriverManager::get_driver_by_name(driver)?.create_with_band_type::<f32, _>(path, 64, 64, bands)?;
-        let extent = if epsg == 4326 { 10.0 } else { 1_000_000.0 };
+        let extent = if matches!(epsg, 0 | 4326) { 10.0 } else { 1_000_000.0 };
         dataset.set_geo_transform(&[-extent, extent / 32.0, 0.0, extent, 0.0, -extent / 32.0])?;
-        dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(epsg)?)?;
+        if epsg != 0 {
+            dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(epsg)?)?;
+        }
         for band_nr in 1..=bands {
             write_raster_band(&dataset, band_nr)?;
         }

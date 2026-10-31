@@ -4,15 +4,31 @@ use std::{
 };
 
 use anyhow::Context as _;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{state_dir, write_json};
 
 const MAX_ENTRIES: usize = 50;
 
+#[derive(Debug, Deserialize, Serialize)]
+struct RecentFile {
+    path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epsg: Option<u32>,
+}
+
+// Accept the original path-only history as well as entries with open options.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredEntry {
+    File(RecentFile),
+    Path(PathBuf),
+}
+
 /// Successfully opened paths, ordered from most to least recent.
 #[derive(Debug, Default)]
 pub(crate) struct RecentFiles {
-    paths: Vec<PathBuf>,
+    entries: Vec<RecentFile>,
     storage: Option<PathBuf>,
 }
 
@@ -29,11 +45,11 @@ impl RecentFiles {
         Self::load_from(storage)
     }
 
-    fn load_from(storage: Option<PathBuf>) -> Self {
+    pub(crate) fn load_from(storage: Option<PathBuf>) -> Self {
         let mut recent = Self { storage, ..Self::default() };
         if let Some(path) = &recent.storage {
             match read_entries(path) {
-                Ok(paths) => recent.paths = paths,
+                Ok(entries) => recent.entries = entries,
                 Err(error) => log::warn!("Could not load recent files: {error:#}"),
             }
         }
@@ -43,40 +59,49 @@ impl RecentFiles {
     /// Records a successfully opened path; callers must only call this after opening succeeds.
     /// Uses a canonical path when possible, otherwise an absolute path. Persistence errors
     /// are returned after updating memory; without storage, history remains in memory only.
-    pub(crate) fn record(&mut self, path: &Path) -> anyhow::Result<()> {
+    pub(crate) fn record(&mut self, path: &Path, epsg: Option<u32>) -> anyhow::Result<()> {
         let path = normalize(path)?;
-        self.paths.retain(|entry| entry != &path);
-        self.paths.insert(0, path);
-        self.paths.truncate(MAX_ENTRIES);
+        self.entries.retain(|entry| entry.path != path);
+        self.entries.insert(0, RecentFile { path, epsg });
+        self.entries.truncate(MAX_ENTRIES);
         if let Some(storage) = &self.storage {
-            write_json(storage, &serde_json::to_vec_pretty(&self.paths)?)?;
+            write_json(storage, &serde_json::to_vec_pretty(&self.entries)?)?;
         }
         Ok(())
     }
 
-    pub(crate) fn paths(&self) -> &[PathBuf] {
-        &self.paths
+    pub(crate) fn paths(&self) -> Vec<PathBuf> {
+        self.entries.iter().map(|entry| entry.path.clone()).collect()
+    }
+
+    pub(crate) fn epsg(&self, path: &Path) -> Option<u32> {
+        let path = normalize(path).ok()?;
+        self.entries.iter().find(|entry| entry.path == path)?.epsg
     }
 }
 
-fn read_entries(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+fn read_entries(path: &Path) -> anyhow::Result<Vec<RecentFile>> {
     let content = match fs::read(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error).with_context(|| format!("Could not read {}", path.display())),
     };
-    let entries: Vec<PathBuf> = serde_json::from_slice(&content).with_context(|| format!("Could not parse {}", path.display()))?;
-    let mut paths = Vec::new();
+    let entries: Vec<StoredEntry> = serde_json::from_slice(&content).with_context(|| format!("Could not parse {}", path.display()))?;
+    let mut files: Vec<RecentFile> = Vec::new();
     for entry in entries {
-        let entry = normalize(&entry)?;
-        if !paths.contains(&entry) {
-            paths.push(entry);
+        let mut entry = match entry {
+            StoredEntry::File(file) => file,
+            StoredEntry::Path(path) => RecentFile { path, epsg: None },
+        };
+        entry.path = normalize(&entry.path)?;
+        if !files.iter().any(|file| file.path == entry.path) {
+            files.push(entry);
         }
-        if paths.len() == MAX_ENTRIES {
+        if files.len() == MAX_ENTRIES {
             break;
         }
     }
-    Ok(paths)
+    Ok(files)
 }
 
 fn normalize(path: &Path) -> anyhow::Result<PathBuf> {
@@ -97,7 +122,7 @@ mod tests {
         let third = directory.path().join("third.tif");
         let mut recent = RecentFiles::default();
         for path in [&first, &second, &third, &second] {
-            recent.record(path).unwrap();
+            recent.record(path, None).unwrap();
         }
         assert_eq!(recent.paths(), &[second, third, first]);
     }
@@ -107,7 +132,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut recent = RecentFiles::default();
         for index in 0..60 {
-            recent.record(&directory.path().join(format!("{index}.tif"))).unwrap();
+            recent.record(&directory.path().join(format!("{index}.tif")), None).unwrap();
         }
         let expected: Vec<_> = (10..60).rev().map(|index| directory.path().join(format!("{index}.tif"))).collect();
         assert_eq!(recent.paths(), expected);
@@ -118,11 +143,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = directory.path().join("state/map/recent-files.json");
         let mut recent = RecentFiles::load_from(Some(storage.clone()));
-        recent.record(&directory.path().join("first.tif")).unwrap();
-        recent.record(&directory.path().join("second.tif")).unwrap();
+        recent.record(&directory.path().join("first.tif"), Some(31370)).unwrap();
+        recent.record(&directory.path().join("second.tif"), None).unwrap();
         let loaded = RecentFiles::load_from(Some(storage.clone()));
         assert_eq!(loaded.paths(), recent.paths());
-        assert_eq!(serde_json::from_slice::<Vec<PathBuf>>(&fs::read(storage).unwrap()).unwrap(), recent.paths());
+        assert_eq!(loaded.epsg(&directory.path().join("first.tif")), Some(31370));
+        assert_eq!(loaded.epsg(&directory.path().join("second.tif")), None);
     }
 
     #[test]
@@ -144,7 +170,7 @@ mod tests {
             let mut recent = RecentFiles::load_from(Some(storage.clone()));
             assert!(recent.paths().is_empty());
             assert_eq!(fs::read_to_string(&storage).unwrap(), content);
-            recent.record(&directory.path().join("opened.tif")).unwrap();
+            recent.record(&directory.path().join("opened.tif"), None).unwrap();
             assert_eq!(RecentFiles::load_from(Some(storage.clone())).paths(), recent.paths());
         }
     }
@@ -156,7 +182,7 @@ mod tests {
         let mut recent = RecentFiles::load_from(Some(storage));
         assert!(recent.paths().is_empty());
         let opened = directory.path().join("opened.tif");
-        assert!(recent.record(&opened).is_err());
+        assert!(recent.record(&opened, None).is_err());
         assert_eq!(recent.paths(), &[opened]);
     }
 
@@ -174,12 +200,35 @@ mod tests {
     }
 
     #[test]
+    fn legacy_paths_and_projection_entries_can_be_loaded_and_saved_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = directory.path().join("recent-files.json");
+        let legacy = directory.path().join("legacy.tif");
+        let projected = directory.path().join("projected.tif");
+        write_json(
+            &storage,
+            &serde_json::to_vec(&serde_json::json!([legacy, {"path": projected, "epsg": 31370}])).unwrap(),
+        )
+        .unwrap();
+        let mut recent = RecentFiles::load_from(Some(storage.clone()));
+        assert_eq!(recent.paths(), [legacy.clone(), projected.clone()]);
+        assert_eq!(recent.epsg(&legacy), None);
+        assert_eq!(recent.epsg(&projected), Some(31370));
+        recent.record(&legacy, Some(4326)).unwrap();
+        let reloaded = RecentFiles::load_from(Some(storage));
+        assert_eq!(reloaded.epsg(&legacy), Some(4326));
+        assert_eq!(reloaded.epsg(&projected), Some(31370));
+    }
+
+    #[test]
     fn relative_and_absolute_existing_paths_share_a_canonical_entry() {
         let mut recent = RecentFiles::default();
-        recent.record(Path::new("./Cargo.toml")).unwrap();
+        recent.record(Path::new("./Cargo.toml"), Some(4326)).unwrap();
         let canonical = fs::canonicalize("Cargo.toml").unwrap();
-        recent.record(&canonical).unwrap();
+        assert_eq!(recent.epsg(&canonical), Some(4326));
+        recent.record(&canonical, Some(3857)).unwrap();
         assert_eq!(recent.paths(), &[canonical]);
+        assert_eq!(recent.epsg(Path::new("Cargo.toml")), Some(3857));
     }
 
     #[test]
@@ -187,7 +236,7 @@ mod tests {
         let directory = tempfile::tempdir_in(".").unwrap();
         let path = directory.path().join("removed.tif");
         let mut recent = RecentFiles::default();
-        recent.record(&path).unwrap();
+        recent.record(&path, None).unwrap();
         assert_eq!(recent.paths(), &[std::path::absolute(path).unwrap()]);
     }
 
@@ -200,8 +249,9 @@ mod tests {
         fs::write(&target, []).unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let mut recent = RecentFiles::default();
-        recent.record(&link).unwrap();
-        recent.record(&target).unwrap();
+        recent.record(&link, Some(4326)).unwrap();
+        assert_eq!(recent.epsg(&target), Some(4326));
+        recent.record(&target, Some(4326)).unwrap();
         assert_eq!(recent.paths(), &[fs::canonicalize(target).unwrap()]);
     }
 }

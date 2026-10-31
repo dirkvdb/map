@@ -136,7 +136,7 @@ impl MapCoast {
 }
 
 fn basemap_style(cx: &App) -> BasemapStyle {
-    if cx.theme().mode.is_dark() { BasemapStyle::Dark } else { BasemapStyle::Light }
+    BasemapStyle::default_for_theme(cx)
 }
 
 #[derive(PartialEq)]
@@ -313,7 +313,7 @@ impl MapView {
     fn source_bounds(&self) -> Option<[f64; 4]> {
         self.raster
             .as_ref()
-            .map(|source| source.metadata().bounds)
+            .map(|source| source.viewport_bounds())
             .or_else(|| self.vector.as_ref().map(|source| source.bounds()))
     }
 
@@ -499,6 +499,15 @@ impl MapView {
         self.renderer = Some(renderer);
         self.requested = None;
         self.request_render(cx);
+    }
+
+    /// Extent previews render on a worker of their own, so the main map keeps
+    /// its request and camera. Fixtures without a renderer get no preview worker.
+    fn preview_renderer(&self) -> Option<MapRenderer> {
+        self.renderer.as_ref()?;
+        MapRenderer::new()
+            .map_err(|error| log::warn!("Could not start the extent preview renderer: {error:#}"))
+            .ok()
     }
 
     fn selected_basemap(&self, cx: &App) -> BasemapStyle {
@@ -915,6 +924,29 @@ impl MapView {
                     .on_click(cx.listener(|view, _, _, cx| view.toggle_tile_boundaries(cx))),
             )
             .child(
+                Button::new("fit-dataset-extent")
+                    .small()
+                    .ghost()
+                    .icon(IconName::SquareDimensions)
+                    .accessibility_label("Fit dataset extent")
+                    .tooltip_with_action("Fit dataset extent", &FitRaster, Some("RasterWorkspace"))
+                    .disabled(self.source_bounds().is_none())
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(FitRaster), cx)),
+            )
+            .child(
+                Button::new("open-dataset-properties")
+                    .small()
+                    .ghost()
+                    .icon(IconName::Info)
+                    .accessibility_label("Dataset properties")
+                    .tooltip_with_action(
+                        "Dataset properties…",
+                        &crate::dataset_properties::OpenDatasetProperties,
+                        Some("RasterWorkspace"),
+                    )
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::dataset_properties::OpenDatasetProperties), cx)),
+            )
+            .child(
                 Button::new("open-settings")
                     .small()
                     .ghost()
@@ -1012,7 +1044,7 @@ impl Render for MapView {
                 view.coast = None;
                 view.drag = None;
                 let properties = view.raster_panel.read(cx).properties();
-                properties.open(window, cx);
+                properties.open(view.preview_renderer(), window, cx);
             }))
             .on_action(cx.listener(|view, _: &OpenDataset, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx))))
             .on_action(cx.listener(|view, _: &crate::recent_files_picker::OpenRecentFiles, window, cx| {
@@ -1093,6 +1125,7 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.find("dataset-properties").visible());
+            assert!(window.try_find("dataset-extent-map").is_none(), "No dataset must not imply a geographic extent");
             assert!(!view.read(cx).focus.is_focused(window));
             window.press("escape", cx);
         })
@@ -1102,6 +1135,35 @@ mod tests {
             window.render_frame(cx);
             assert!(window.try_find("dataset-properties").is_none());
             assert!(view.read(cx).focus.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn title_bar_extent_info_and_settings_buttons_follow_the_requested_order(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx).unwrap();
+            cx.set_reduce_motion(true);
+        });
+        let (_view, handle) = open_test_map(size(px(800.), px(600.)), cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let button = window.find("open-dataset-properties");
+            assert_eq!(button.label(), Some("Dataset properties"));
+            let fit = window.find("fit-dataset-extent");
+            assert_eq!(fit.label(), Some("Fit dataset extent"));
+            assert_eq!(fit.disabled(), Some(true));
+            assert!(fit.bounds().right() < button.bounds().left());
+            assert!(button.bounds().right() < window.find("open-settings").bounds().left());
+            assert!(window.try_find("dataset-properties").is_none());
+            window.click("open-dataset-properties", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("dataset-properties").visible());
         })
         .unwrap();
     }
@@ -1126,7 +1188,7 @@ mod tests {
             });
             let (view, handle) = open_test_map(viewport, cx);
             cx.update_window(handle.into(), |_, window, cx| {
-                crate::dataset_properties::DatasetProperties::raster(&sources[1], &sources[1].metadata().path, sources.len()).open(window, cx);
+                crate::dataset_properties::DatasetProperties::raster(&sources[1], &sources[1].metadata().path, sources.len()).open(None, window, cx);
             })
             .unwrap();
             cx.run_until_parked();
@@ -1134,12 +1196,20 @@ mod tests {
                 window.render_frame(cx);
                 let surface = window.within("dialog").find("surface").bounds();
                 let content = window.find("dataset-properties").bounds();
+                let preview = window.find("dataset-extent-map");
+                let map_bounds = preview.bounds();
+                assert!(preview.visible());
+                assert!(preview.label().unwrap().starts_with("Map showing dataset extent:"));
+                assert_eq!(map_bounds.size.width, map_bounds.size.height * 2.);
+                assert!(map_bounds.left() >= content.left() && map_bounds.right() <= content.right());
+                assert_extent_corner_annotations(map_bounds, window);
+                assert_cog_grid_annotations(map_bounds, window);
                 assert_eq!(window.rem_size(), font_size);
                 assert!(surface.left() >= px(0.) && surface.right() <= viewport.width);
                 assert!(surface.top() >= px(0.) && surface.bottom() <= viewport.height);
                 assert!(content.left() >= surface.left() && content.right() <= surface.right());
                 assert!(content.bottom() > surface.bottom(), "The expanded COG metadata should scroll");
-                window.within("dialog").scroll("surface", ScrollDelta::Lines(point(0., -100.)), cx);
+                window.scroll("dataset-extent-map", ScrollDelta::Lines(point(0., -100.)), cx);
                 let scrolled = window.find("dataset-properties").bounds();
                 assert!(scrolled.top() < content.top(), "The dialog body must own scrolling");
                 assert!(scrolled.bottom() <= surface.bottom(), "The last metadata section must remain reachable");
@@ -1155,6 +1225,45 @@ mod tests {
             })
             .unwrap();
         }
+    }
+
+    fn assert_extent_corner_annotations(map: Bounds<Pixels>, window: &mut Window) {
+        let northwest = window.find("dataset-extent-nw");
+        let northeast = window.find("dataset-extent-ne");
+        let southwest = window.find("dataset-extent-sw");
+        let southeast = window.find("dataset-extent-se");
+        assert!(northwest.label().unwrap().starts_with("NW "));
+        assert!(northeast.label().unwrap().starts_with("NE "));
+        assert!(southwest.label().unwrap().starts_with("SW "));
+        assert!(southeast.label().unwrap().starts_with("SE "));
+        assert!(northwest.bounds().bottom() <= map.top() && northeast.bounds().bottom() <= map.top());
+        assert!(southwest.bounds().top() >= map.bottom() && southeast.bounds().top() >= map.bottom());
+        assert!(northwest.bounds().right() <= northeast.bounds().left());
+        assert!(southwest.bounds().right() <= southeast.bounds().left());
+    }
+
+    fn assert_cog_grid_annotations(map: Bounds<Pixels>, window: &mut Window) {
+        let dimensions = window.find("dataset-extent-dimensions");
+        assert_eq!(dimensions.label(), Some("512x512"));
+        let summary = dimensions.bounds();
+        let tolerance = px(0.5) / window.scale_factor();
+        assert!(summary.left() >= map.left() && summary.right() <= map.right());
+        assert!(summary.top() >= map.top() && summary.bottom() <= map.bottom());
+        let cell_size = window.find("dataset-extent-cell-size");
+        assert!(cell_size.label().unwrap().ends_with(" m"));
+        assert!(!cell_size.label().unwrap().contains("EPSG"));
+        let cell = cell_size.bounds();
+        assert!(cell.right() < map.right());
+        assert!((summary.left() - cell.left()).abs() <= tolerance, "Grid tags must share a left edge");
+        assert!((cell.top() - summary.bottom() - window.rem_size() * 0.5).abs() <= tolerance);
+        assert!((cell.left() - map.left() - window.rem_size()).abs() <= tolerance);
+        assert!((map.bottom() - cell.bottom() - window.rem_size()).abs() <= tolerance);
+        let crs = window.find("dataset-extent-crs");
+        assert_eq!(crs.label(), Some("EPSG:3857"));
+        let tag = crs.bounds();
+        assert!((tag.left() - map.left() - window.rem_size()).abs() <= tolerance);
+        assert!((tag.top() - map.top() - window.rem_size()).abs() <= tolerance);
+        assert!(tag.right() <= map.right() && tag.bottom() <= map.bottom());
     }
 
     #[gpui_kit::test]
@@ -2233,6 +2342,16 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         cx.update(|cx| assert_eq!(view.read(cx).camera, fitted, "The explicit fit command must still fit the active band"));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.press("right", cx);
+            assert_ne!(view.read(cx).camera, fitted);
+            let button = window.find("fit-dataset-extent");
+            assert_ne!(button.disabled(), Some(true));
+            window.click("fit-dataset-extent", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(view.read(cx).camera, fitted, "The title-bar fit button must restore the active extent"));
     }
 
     #[gpui_kit::test]

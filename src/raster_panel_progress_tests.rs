@@ -511,7 +511,7 @@ fn progress_loader_aggregates_real_vector_callbacks_with_raster_paths_and_errors
     let (progress, receiver) = async_channel::bounded(1);
     // Deliberately never drain during loading: progress delivery cannot block
     // either a GDAL callback or processing the remaining paths.
-    let loaded = load_paths(vec![directory.path().join("missing.tif"), vector, raster], progress);
+    let loaded = load_paths(vec![directory.path().join("missing.tif").into(), vector.into(), raster.into()], progress);
     assert_eq!(loaded.errors.len(), 1);
     assert_eq!(loaded.vectors.len(), 1);
     assert_eq!(loaded.sources.len(), 2);
@@ -530,7 +530,7 @@ fn progress_loader_finishes_vector_paths_in_preparing_without_fake_overall_compl
     let raster = directory.path().join("raster.tif");
     crate::raster_source::test_support::write_raster(&raster, 4326, 2).unwrap();
     let (progress, receiver) = async_channel::bounded(1);
-    let loaded = load_paths(vec![directory.path().join("missing.tif"), raster, vector], progress);
+    let loaded = load_paths(vec![directory.path().join("missing.tif").into(), raster.into(), vector.into()], progress);
     assert_eq!(loaded.errors.len(), 1);
     assert_eq!(loaded.sources.len(), 2);
     assert_eq!(loaded.vectors.len(), 1);

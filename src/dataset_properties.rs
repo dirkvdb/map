@@ -2,12 +2,15 @@ use std::path::Path;
 
 use gpui_kit::component::description_list::{DescriptionItem, DescriptionList};
 use gpui_kit::component::{ActiveTheme, Sizable, WindowExt};
-use gpui_kit::{App, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, TestSupportExt, Window, div, rems};
+use gpui_kit::{App, AppContext, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, TestSupportExt, Window, div, rems};
 
+use crate::map_renderer::MapRenderer;
 use crate::raster_source::RasterSource;
 use crate::vector_source::VectorSource;
 
 mod cog;
+mod extent_map;
+mod extent_preview;
 
 gpui_kit::actions!(dataset_properties, [OpenDatasetProperties]);
 
@@ -17,6 +20,8 @@ type PropertyRows = Vec<(SharedString, SharedString)>;
 #[derive(Default)]
 pub(crate) struct DatasetProperties {
     sections: Vec<(&'static str, PropertyRows)>,
+    extent: Option<[f64; 4]>,
+    preview_grid: Option<extent_map::RasterGrid>,
 }
 
 impl DatasetProperties {
@@ -45,7 +50,11 @@ impl DatasetProperties {
         if !additional.is_empty() {
             sections.push(("Metadata", additional));
         }
-        Self { sections }
+        Self {
+            sections,
+            extent: Some(metadata.bounds),
+            preview_grid: preview_grid(source),
+        }
     }
 
     pub(crate) fn vector(source: &VectorSource) -> Self {
@@ -66,12 +75,22 @@ impl DatasetProperties {
         if !attributes.is_empty() {
             sections.push(("Attributes", attributes));
         }
-        Self { sections }
+        Self {
+            sections,
+            extent: Some(source.bounds()),
+            preview_grid: None,
+        }
     }
 
-    pub(crate) fn open(self, window: &mut Window, cx: &mut App) {
+    /// The preview's basemap renders on `basemap_renderer`; without one the
+    /// extent is drawn over a plain frame.
+    pub(crate) fn open(self, basemap_renderer: Option<MapRenderer>, window: &mut Window, cx: &mut App) {
+        let preview = self.extent.map(|extent| {
+            let map = extent_map::ExtentMap::new(extent).with_grid(self.preview_grid.clone());
+            cx.new(|cx| extent_preview::ExtentPreview::new(map, basemap_renderer, window, cx))
+        });
         window.open_dialog(cx, move |dialog, window, cx| {
-            dialog.title("Dataset properties").w(window.rem_size() * 40.).max_w_full().child(
+            dialog.title("Dataset properties").w(window.rem_size() * 50.).max_w_full().child(
                 div()
                     .id("dataset-properties")
                     .test_support()
@@ -80,6 +99,7 @@ impl DatasetProperties {
                     .flex_shrink_0()
                     .text_sm()
                     .gap_6()
+                    .children(preview.clone())
                     .children(self.sections.iter().map(|(heading, rows)| section(heading, rows, cx)))
                     .children(self.sections.is_empty().then(|| {
                         div()
@@ -94,6 +114,14 @@ impl DatasetProperties {
 
 fn pair(label: impl std::fmt::Display, value: impl std::fmt::Display) -> (SharedString, SharedString) {
     (label.to_string().into(), value.to_string().into())
+}
+
+/// Native COGs also report their cell size; other rasters only retain their grid dimensions.
+fn preview_grid(source: &RasterSource) -> Option<extent_map::RasterGrid> {
+    source
+        .cog_reader()
+        .map(|reader| extent_map::RasterGrid::cog(reader.cog_metadata()))
+        .or_else(|| source.metadata().geo_reference.as_deref().map(extent_map::RasterGrid::source))
 }
 
 fn bounds_rows([west, south, east, north]: [f64; 4]) -> PropertyRows {
@@ -168,6 +196,18 @@ mod tests {
         crate::raster_source::test_support::write_raster(&path, 3857, 2).unwrap();
         let sources = RasterSource::open(&path).unwrap();
         let properties = DatasetProperties::raster(&sources[1], Path::new("original.nc"), sources.len());
+        assert_eq!(properties.extent, Some(sources[1].metadata().bounds));
+        let grid = properties.preview_grid.as_ref().expect("GDAL rasters retain their grid dimensions");
+        let reference = sources[1].metadata().geo_reference.as_ref().unwrap();
+        assert_eq!(
+            grid.dimensions.as_ref(),
+            format!("{}x{}", reference.rows().count(), reference.columns().count())
+        );
+        assert_eq!(
+            grid.corners[0].as_ref(),
+            format!("{:.2}, {:.2}", reference.top_left().x(), reference.top_left().y()),
+            "Corners must use the EPSG:3857 source units"
+        );
         let rows = properties.sections.iter().flat_map(|(_, rows)| rows).collect::<Vec<_>>();
         for expected in [
             pair("Source", "original.nc"),
@@ -189,6 +229,7 @@ mod tests {
         std::fs::rename(&path, path.with_extension("moved.tif")).unwrap();
         let restyled = source.restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 255.0)).unwrap();
         let properties = DatasetProperties::raster(&restyled, &path, sources.len());
+        assert!(properties.preview_grid.is_some(), "Preview grid metadata must not require reopening the source");
         assert!(properties.sections.iter().any(|(title, _)| *title == "COG storage"));
         assert!(properties.sections.iter().any(|(title, _)| *title == "Image pyramid"));
         assert!(
@@ -211,6 +252,11 @@ mod tests {
         .unwrap();
         let sources = VectorSource::open(&path).unwrap().unwrap();
         let properties = DatasetProperties::vector(&sources[0]);
+        assert_eq!(properties.extent, Some([4., 51., 4., 51.]));
+        assert!(
+            properties.preview_grid.is_none(),
+            "Vector previews must not invent raster dimensions or cell sizes"
+        );
         assert!(
             properties
                 .sections

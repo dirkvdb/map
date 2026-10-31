@@ -4,6 +4,13 @@ use maplibre_native::{CameraUpdate, LatLng};
 
 const MIN_ZOOM: f64 = 0.0;
 const MAX_ZOOM: f64 = 18.0;
+/// Web Mercator cuts off here; latitudes beyond project onto the map edge.
+const MAX_LATITUDE: f64 = 85.05112878;
+
+/// Normalized Web Mercator y of a latitude: zero at the northern cap, one at the southern cap.
+pub fn mercator_y(latitude: f64) -> f64 {
+    (1.0 - latitude.clamp(-MAX_LATITUDE, MAX_LATITUDE).to_radians().tan().asinh() / PI) / 2.0
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MapCamera {
@@ -61,14 +68,13 @@ impl MapCamera {
 
     pub fn fit_bounds(bounds: [f64; 4], width: f64, height: f64) -> Self {
         let [west, south, east, north] = bounds;
-        let project_y = |latitude: f64| (1.0 - latitude.clamp(-85.05112878, 85.05112878).to_radians().tan().asinh() / PI) / 2.0;
         let left = (west + 180.0) / 360.0;
         let mut right = (east + 180.0) / 360.0;
         if right < left {
             right += 1.0;
         }
-        let top = project_y(north);
-        let bottom = project_y(south);
+        let top = mercator_y(north);
+        let bottom = mercator_y(south);
         let zoom_x = (width.max(1.0) * 0.85 / (512.0 * (right - left).max(1e-12))).log2();
         let zoom_y = (height.max(1.0) * 0.85 / (512.0 * (bottom - top).max(1e-12))).log2();
         let mut camera = Self {
@@ -87,6 +93,15 @@ impl MapCamera {
         self.zoom = self.zoom.max((height / 512.0).log2());
         let half_height = (height / self.world_size() / 2.0).min(0.5);
         self.y = self.y.clamp(half_height, 1.0 - half_height);
+    }
+
+    /// Normalized Web Mercator `[left, top, right, bottom]` visible in a north-up
+    /// viewport of logical pixels. Longitudes stay unwrapped: `left` can be negative
+    /// and `right` can exceed one when repeated worlds are visible.
+    pub fn visible_region(self, width: f64, height: f64) -> [f64; 4] {
+        let half_width = width / self.world_size() / 2.0;
+        let half_height = height / self.world_size() / 2.0;
+        [self.x - half_width, self.y - half_height, self.x + half_width, self.y + half_height]
     }
 
     pub fn update(self) -> CameraUpdate {
@@ -316,6 +331,20 @@ mod tests {
                 "bounds: {bounds:?}, viewport: {width} x {height}"
             );
         }
+    }
+
+    #[test]
+    fn visible_region_matches_the_coordinates_under_the_viewport_corners() {
+        assert_eq!(MapCamera { x: 0.5, y: 0.5, zoom: 0.0 }.visible_region(512.0, 256.0), [0.0, 0.25, 1.0, 0.75]);
+        let camera = MapCamera::fit_bounds([170.0, -10.0, -170.0, 10.0], 640.0, 320.0);
+        let [left, top, right, bottom] = camera.visible_region(640.0, 320.0);
+        assert!(left < 0.0 && right > 0.0, "Dateline viewports keep unwrapped longitudes");
+        let south_east = camera.coordinate_at((320.0, 160.0));
+        assert!((right * 360.0 - 180.0 - south_east.longitude).abs() < 1e-9);
+        assert!((mercator_y(south_east.latitude) - bottom).abs() < 1e-12);
+        let north_west = camera.coordinate_at((-320.0, -160.0));
+        assert!(((left + 1.0) * 360.0 - 180.0 - north_west.longitude).abs() < 1e-9);
+        assert!((mercator_y(north_west.latitude) - top).abs() < 1e-12);
     }
 
     #[test]

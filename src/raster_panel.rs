@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,6 +7,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 
+use gpui_kit::component::WindowExt;
 use gpui_kit::component::input::{InputEvent, InputState, NumberInput};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement;
@@ -29,6 +30,9 @@ use crate::raster_source::RasterSource;
 use crate::vector_source::{VectorLoadProgress, VectorSource};
 
 gpui_kit::actions!(raster, [OpenDataset, FitRaster, ClearRasters, ToggleRasterControls]);
+
+#[path = "raster_projection_prompt.rs"]
+mod projection_prompt;
 
 const PALETTES: [(&str, ColorMapPreset); 24] = [
     ("Blues", ColorMapPreset::Blues),
@@ -210,12 +214,31 @@ impl RasterDataset {
 
 #[derive(Default)]
 struct LoadedDatasets {
-    opened_paths: Vec<PathBuf>,
+    opened_paths: Vec<DatasetRequest>,
+    missing_projections: Vec<PathBuf>,
     sources: Vec<Arc<RasterSource>>,
     raster_datasets: Vec<RasterDataset>,
     vectors: Vec<Arc<VectorSource>>,
     errors: Vec<String>,
     selected: Option<SelectionId>,
+}
+
+struct DatasetRequest {
+    path: PathBuf,
+    epsg: Option<u32>,
+}
+
+#[derive(Default)]
+struct ProjectionPrompts {
+    paths: VecDeque<PathBuf>,
+    open: bool,
+    errors: Vec<String>,
+}
+
+impl From<PathBuf> for DatasetRequest {
+    fn from(path: PathBuf) -> Self {
+        Self { path, epsg: None }
+    }
 }
 
 pub struct RasterEvent {
@@ -316,6 +339,7 @@ pub struct RasterPanel {
     error: Option<SharedString>,
     load_error: Option<SharedString>,
     loading: bool,
+    projection_prompts: ProjectionPrompts,
     load_progress: Option<LoadProgress>,
     load_generation: u64,
     load_started: Option<Instant>,
@@ -340,7 +364,6 @@ impl RasterPanel {
         let property = cx.new(|cx| SelectState::new(SearchableVec::new(Vec::<SharedString>::new()), None, window, cx).searchable(true));
         let opacity = cx.new(|_| SliderState::new().min(0.0).max(100.0).step(1.0).default_value(100.0));
         let band_slider = cx.new(|_| SliderState::new().min(1.0).max(1.0).step(1.0).default_value(1.0));
-        let playback = PlaybackState::default();
 
         // A normalized domain keeps slider stepping useful for tiny or very
         // large data ranges without replacing retained component state.
@@ -394,7 +417,7 @@ impl RasterPanel {
             property,
             opacity,
             band_slider,
-            playback,
+            playback: PlaybackState::default(),
 
             range_slider,
             range_domain: (0.0, 1.0),
@@ -403,6 +426,7 @@ impl RasterPanel {
             error: None,
             load_error: None,
             loading: false,
+            projection_prompts: ProjectionPrompts::default(),
             load_progress: None,
             load_generation: 0,
             load_started: None,
@@ -422,7 +446,8 @@ impl RasterPanel {
 
     /// True when the active raster is a valid COG served by the optimized COG tile provider.
     fn active_is_cog(&self) -> bool {
-        self.active().is_some_and(|source| source.metadata().source_format == tiler::LayerSourceType::CloudOptimizedGeoTiff)
+        self.active()
+            .is_some_and(|source| source.metadata().source_format == tiler::LayerSourceType::CloudOptimizedGeoTiff)
     }
 
     fn active_vector(&self) -> Option<&Arc<VectorSource>> {
@@ -654,7 +679,7 @@ impl RasterPanel {
 
     pub(crate) fn open_recent_files(&self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.loading {
-            crate::recent_files_picker::open(self.recent_files.paths().to_vec(), cx.weak_entity(), window, cx);
+            crate::recent_files_picker::open(self.recent_files.paths(), cx.weak_entity(), window, cx);
         }
     }
 
@@ -702,12 +727,24 @@ impl RasterPanel {
         if self.loading || paths.is_empty() {
             return;
         }
+        self.projection_prompts = ProjectionPrompts::default();
+        let requests = paths
+            .into_iter()
+            .map(|path| DatasetRequest {
+                epsg: self.recent_files.epsg(&path),
+                path,
+            })
+            .collect();
+        self.open_requests(requests, cx);
+    }
+
+    fn open_requests(&mut self, requests: Vec<DatasetRequest>, cx: &mut Context<Self>) {
         let enqueued = Instant::now();
-        log::info!(target: "map::vector_load", "stage=open-request paths={paths:?}");
+        log::info!(target: "map::vector_load", "stage=open-request paths={:?}", requests.iter().map(|request| &request.path).collect::<Vec<_>>());
         let (progress_tx, progress_rx) = async_channel::bounded(1);
         let work = cx.background_spawn(async move {
             log::info!(target: "map::vector_load", "stage=loader-worker-start queue_delay={:?}", enqueued.elapsed());
-            load_paths(paths, progress_tx)
+            load_paths(requests, progress_tx)
         });
         self.start_load(work, progress_rx, cx);
     }
@@ -740,8 +777,8 @@ impl RasterPanel {
         self.loading = false;
         self.load_progress = None;
         let installed = Instant::now();
-        for path in &loaded.opened_paths {
-            if let Err(error) = self.recent_files.record(path) {
+        for request in &loaded.opened_paths {
+            if let Err(error) = self.recent_files.record(&request.path, request.epsg) {
                 log::warn!("Could not save recent files: {error:#}");
             }
         }
@@ -757,9 +794,35 @@ impl RasterPanel {
             Some(SelectionId::Vector(source)) => Some(LoadProgress::Rendering(source)),
             _ => None,
         };
-        self.load_error = (!loaded.errors.is_empty()).then(|| loaded.errors.join("\n").into());
+        self.projection_prompts.errors.extend(loaded.errors);
+        self.load_error = (!self.projection_prompts.errors.is_empty()).then(|| self.projection_prompts.errors.join("\n").into());
+        self.projection_prompts.paths.extend(loaded.missing_projections);
+        self.prompt_next_projection(window, cx);
         log::info!(target: "map::vector_load", "load={generation} stage=ui-install-loaded-layers elapsed={:?} since_request={:?} awaiting_vector_frame={}", installed.elapsed(), started.elapsed(), self.load_progress.is_some());
         cx.notify();
+    }
+
+    fn prompt_next_projection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.projection_prompts.paths.front() else { return };
+        self.loading = true;
+        self.load_progress = None;
+        self.projection_prompts.open = true;
+        projection_prompt::open(path, self.load_generation, cx.weak_entity(), window, cx);
+    }
+
+    fn complete_projection_prompt(&mut self, generation: u64, epsg: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.load_generation != generation || !self.projection_prompts.open {
+            return;
+        }
+        self.projection_prompts.open = false;
+        self.loading = false;
+        let Some(path) = self.projection_prompts.paths.pop_front() else { return };
+        if epsg.is_some() {
+            self.open_requests(vec![DatasetRequest { path, epsg }], cx);
+        } else {
+            self.prompt_next_projection(window, cx);
+            cx.notify();
+        }
     }
 
     fn update_load_progress(&mut self, generation: u64, progress: LoadProgress, cx: &mut Context<Self>) {
@@ -1104,6 +1167,11 @@ impl RasterPanel {
         self.reset_playback(0.0);
         self.load_generation += 1;
         self.load_task = None;
+        self.projection_prompts.paths.clear();
+        if self.projection_prompts.open {
+            self.projection_prompts.open = false;
+            window.close_dialog(cx);
+        }
         self.tile_errors_task = None;
         self.tile_errors_source = None;
         self.loading = false;
@@ -1503,17 +1571,24 @@ impl RasterPanel {
                     .disabled(self.sources.is_empty() && self.vectors.is_empty()),
             );
 
-        div().flex().items_center().gap_1p5().min_w_0().flex_shrink_0().child(selector).when(is_cog, |row| {
-            row.child(
-                div()
-                    .id("raster-cog-tag")
-                    .role(gpui_kit::Role::Status)
-                    .aria_label("Cloud Optimized GeoTIFF")
-                    .test_support()
-                    .flex_shrink_0()
-                    .child(Tag::success().outline().xsmall().child("COG")),
-            )
-        })
+        div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .min_w_0()
+            .flex_shrink_0()
+            .child(selector)
+            .when(is_cog, |row| {
+                row.child(
+                    div()
+                        .id("raster-cog-tag")
+                        .role(gpui_kit::Role::Status)
+                        .aria_label("Cloud Optimized GeoTIFF")
+                        .test_support()
+                        .flex_shrink_0()
+                        .child(Tag::success().outline().xsmall().child("COG")),
+                )
+            })
     }
 }
 
@@ -1754,7 +1829,7 @@ fn initial_recent_files() -> crate::recent_files::RecentFiles {
     }
 }
 
-fn load_paths(paths: Vec<PathBuf>, progress: async_channel::Sender<LoadProgress>) -> LoadedDatasets {
+fn load_paths(paths: Vec<DatasetRequest>, progress: async_channel::Sender<LoadProgress>) -> LoadedDatasets {
     let mut loaded = LoadedDatasets::default();
     let path_count = paths.len() as f64;
 
@@ -1767,7 +1842,8 @@ fn load_paths(paths: Vec<PathBuf>, progress: async_channel::Sender<LoadProgress>
     loaded
 }
 
-fn load_path(path: PathBuf, index: usize, path_count: f64, progress: &async_channel::Sender<LoadProgress>, loaded: &mut LoadedDatasets) {
+fn load_path(request: DatasetRequest, index: usize, path_count: f64, progress: &async_channel::Sender<LoadProgress>, loaded: &mut LoadedDatasets) {
+    let DatasetRequest { path, epsg } = request;
     let opened = Instant::now();
     let _ = progress.force_send(LoadProgress::Opening);
     let mut progress_bucket = None;
@@ -1792,27 +1868,39 @@ fn load_path(path: PathBuf, index: usize, path_count: f64, progress: &async_chan
         Ok(Some(opened)) => {
             loaded.selected = opened.first().map(|source| SelectionId::Vector(source.id()));
             loaded.vectors.extend(opened);
-            loaded.opened_paths.push(path.clone());
+            loaded.opened_paths.push(path.clone().into());
         }
-        Ok(None) => match RasterSource::open(&path) {
-            Ok(opened) => {
-                if let Some(first) = opened.first() {
-                    loaded.raster_datasets.push(RasterDataset {
-                        path: path.canonicalize().unwrap_or_else(|_| path.clone()),
-                        bands: opened.iter().map(|source| source.metadata().id).collect(),
-                        selected: first.metadata().id,
-                        playback: PlaybackRequest::for_dataset(&opened),
-                    });
-                    loaded.selected = Some(SelectionId::Raster(first.metadata().id));
-                }
-                loaded.sources.extend(opened);
-                loaded.opened_paths.push(path.clone());
-            }
-            Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
-        },
+        Ok(None) => load_raster_path(&path, epsg, loaded),
         Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
     }
     log::info!(target: "map::vector_load", "path={path:?} stage=path-loaded elapsed={:?}", opened.elapsed());
+}
+
+fn load_raster_path(path: &std::path::Path, epsg: Option<u32>, loaded: &mut LoadedDatasets) {
+    let result = match epsg {
+        Some(code) => RasterSource::open_with_epsg(path, Some(code)),
+        None => RasterSource::open(path),
+    };
+    match result {
+        Ok(opened) => {
+            if let Some(first) = opened.first() {
+                loaded.raster_datasets.push(RasterDataset {
+                    path: path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
+                    bands: opened.iter().map(|source| source.metadata().id).collect(),
+                    selected: first.metadata().id,
+                    playback: PlaybackRequest::for_dataset(&opened),
+                });
+                loaded.selected = Some(SelectionId::Raster(first.metadata().id));
+            }
+            loaded.sources.extend(opened);
+            loaded.opened_paths.push(DatasetRequest {
+                path: path.to_path_buf(),
+                epsg,
+            });
+        }
+        Err(error) if error.is::<crate::raster_source::MissingProjection>() => loaded.missing_projections.push(path.to_path_buf()),
+        Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
+    }
 }
 
 pub(crate) fn scroll_index(event: &ScrollEvent, scroll: &mut f32, ix: usize, count: usize, cx: &mut App) -> usize {
