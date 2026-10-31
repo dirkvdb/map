@@ -22,7 +22,7 @@ fn gpu_extrusion_multiband_interpolates_values_and_omits_invalid_bars() -> Resul
         }),
     ];
     let texture = tiles::upload_window(&device, &queue, bands, 2)?.expect("nonempty test bands");
-    let draw = pipeline.draw_tile(&device, [None; 2], [Some(&texture), Some(&texture)]);
+    let draw = pipeline.draw_tile(&device, [None; 3], [Some(&texture), Some(&texture), None]);
     let data = DrawUniform {
         matrix: [[2.0, 0.0, 0.0, 0.0], [0.0, -2.0, 0.0, 0.0], [0.0, 0.0, -0.2, 0.0], [-1.0, 1.0, 0.6, 1.0]],
         scale: [1.0, 0.0],
@@ -33,6 +33,7 @@ fn gpu_extrusion_multiband_interpolates_values_and_omits_invalid_bars() -> Resul
         layers: [0, 1, 1, 0],
         extrusion: [2.0, 2.0, 0.5, 1.0],
         geometry: [0; 4],
+        ..DrawUniform::zeroed()
     };
     queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&data));
     let image = paint_depth(&device, &queue, |pass| {
@@ -100,6 +101,7 @@ fn height_uniform() -> DrawUniform {
         layers: [0, 1, 1, 0],
         extrusion: [1.0, 1.0, 0.5, 1.0],
         geometry: [0; 4],
+        ..DrawUniform::zeroed()
     }
 }
 
@@ -117,7 +119,7 @@ fn render_bands(
     let size = bands[0].width;
     let bands = bands.into_iter().map(Some).collect();
     let texture = tiles::upload_window(device, queue, bands, size)?.expect("nonempty test bands");
-    let draw = pipeline.draw_tile(device, [None; 2], [Some(&texture), Some(&texture)]);
+    let draw = pipeline.draw_tile(device, [None; 3], [Some(&texture), Some(&texture), None]);
     queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&data));
     paint_depth(device, queue, |pass| {
         pass.set_pipeline(if data.extrusion[3] > 0.0 {
@@ -273,11 +275,12 @@ fn gpu_extrusion_multiband_retained_ancestors_do_not_cap_request_detail() -> Res
     layer.cache.insert(root, CachedWindow { texture: None, used: 0 });
     assert_eq!(layer.view_tiles(&p, &request, &bands[0]), target);
     let pipeline = MultibandPipeline::new(&layer.device, (0x16, 0, false));
-    let draw = pipeline.draw_tile(&layer.device, [None; 2], [None; 2]);
+    let draw = pipeline.draw_tile(&layer.device, [None; 3], [None; 3]);
     layer.retained = Some(RetainedFrame {
         draws: std::collections::HashMap::from([(VisibleTile { z: 0, x: 0, y: 0 }, draw)]),
         frame: endpoints(0.0, bands.len(), true),
         window_size: layer.window_size,
+        fade_from: None,
     });
     assert_eq!(
         layer.view_tiles(&p, &request, &bands[0]),

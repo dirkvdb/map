@@ -10,6 +10,9 @@ mod clock;
 #[cfg(test)]
 #[path = "multiband_extrusion_tests.rs"]
 mod extrusion_tests;
+#[cfg(test)]
+#[path = "multiband_layer_fade_tests.rs"]
+mod fade_tests;
 #[path = "multiband_tiles.rs"]
 mod tiles;
 #[cfg(test)]
@@ -29,7 +32,7 @@ use crate::raster_layer::geometry;
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest, PlaybackStyle, validate_bands};
 use crate::raster_source::RasterSource;
 use crate::raster_tiles::{VisibleTile, extrusion_view, tile_matrix, visible_tiles};
-use clock::{DEFAULT_WINDOW, Endpoints, PlaybackClock, endpoints, next_window, window_range, window_start};
+use clock::{BandFade, DEFAULT_WINDOW, Endpoints, PlaybackClock, endpoints, next_window, window_range, window_start};
 use tiles::{CachedWindow, MAX_CACHE_ENTRIES, MAX_GRID_BYTES, MAX_JOBS, MAX_VISIBLE_TILES, WindowKey, WindowTexture, WindowWorkers};
 
 #[repr(C)]
@@ -40,17 +43,21 @@ struct DrawUniform {
     next_scale: [f32; 2],
     range: [f32; 2],
     next_range: [f32; 2],
-    // blend, opacity, screen-space tile size, reserved
+    // blend, opacity, screen-space tile size, manual color crossfade
     parameters: [f32; 4],
     // current array layer, next array layer, clamp colors, debug status
     layers: [u32; 4],
     extrusion: [f32; 4],
     // X/Y strides, traversal flags, current/next averaging bits.
     geometry: [u32; 4],
+    outgoing_scale: [f32; 2],
+    outgoing_range: [f32; 2],
+    // Outgoing temporal fraction, extra array layer, reserved, averaging bit.
+    outgoing: [f32; 4],
 }
 
 struct DrawTile {
-    sampled: [Option<WindowKey>; 2],
+    sampled: [Option<WindowKey>; 3],
     uniform: wgpu::Buffer,
     bindings: wgpu::BindGroup,
 }
@@ -61,6 +68,7 @@ struct RetainedFrame {
     draws: HashMap<VisibleTile, DrawTile>,
     frame: Endpoints,
     window_size: usize,
+    fade_from: Option<Endpoints>,
 }
 
 struct MultibandPipeline {
@@ -85,6 +93,7 @@ pub struct MultibandLayer {
     request: Option<PlaybackRequest>,
     opacity: f32,
     clock: PlaybackClock,
+    band_fade: Option<BandFade>,
     workers: WindowWorkers,
     generation: u64,
     pending: HashSet<WindowKey>,
@@ -121,6 +130,7 @@ impl MultibandLayer {
             request: None,
             opacity: 1.0,
             clock: PlaybackClock::new(Instant::now()),
+            band_fade: None,
             workers: WindowWorkers::new()?,
             generation: 0,
             pending: HashSet::new(),
@@ -173,6 +183,7 @@ impl MultibandLayer {
             self.tile_size = request.bands().first().and_then(|source| source.metadata().tile_size).unwrap_or(256);
         }
         if command_changed {
+            self.prepare_band_fade(&request);
             self.retained = None;
             self.cancel_jobs();
             self.clock.seek(request.position(), request.bands().len(), Instant::now());
@@ -184,9 +195,27 @@ impl MultibandLayer {
         }
     }
 
+    fn prepare_band_fade(&mut self, request: &PlaybackRequest) {
+        let position = request.position();
+        if self.reduce_motion || request.is_playing() || !position.is_finite() || position.fract() != 0.0 {
+            self.band_fade = None;
+            return;
+        }
+        let to = endpoints(position, request.bands().len(), false).current;
+        if let Some(fade) = &mut self.band_fade {
+            fade.retarget(to);
+        } else if !self.clock.is_buffering() {
+            let from = self.endpoints(self.clock.position());
+            self.band_fade = (from.current != to || from.fraction > 0.0).then(|| BandFade::from_frame(from, to));
+        }
+    }
+
     /// Turns off temporal interpolation, not user-requested playback.
     pub fn set_reduce_motion(&mut self, enabled: bool) {
         self.reduce_motion = enabled;
+        if enabled {
+            self.band_fade = None;
+        }
     }
 
     /// Shows tile boundaries, orange while the global readiness barrier is closed.
@@ -232,10 +261,13 @@ impl MultibandLayer {
         changed || self.is_loading() || self.request.as_ref().is_some_and(PlaybackRequest::is_playing)
     }
 
-    /// Loading/buffering only, never the perpetual fact of playing.
+    /// Loading/buffering and finite manual fades, never the perpetual fact of playing.
     pub fn is_loading(&self) -> bool {
         self.request.as_ref().is_some_and(|request| !request.bands().is_empty())
-            && (self.clock.is_buffering() || !self.pending.is_empty() || self.wanted.iter().any(|key| !self.cache.contains_key(key)))
+            && (self.band_fade.is_some()
+                || self.clock.is_buffering()
+                || !self.pending.is_empty()
+                || self.wanted.iter().any(|key| !self.cache.contains_key(key)))
     }
 
     /// Feedback carries the accepted position, never the speculative buffered frame.
@@ -269,13 +301,26 @@ impl MultibandLayer {
         self.clock.resolve(proposed, ready);
         self.schedule_windows(&request, &visible);
         self.prepare_pipeline(parameters);
-        let frame = self.endpoints(self.clock.position());
+        let frame = self.display_frame(now);
         if self.retained.is_some() {
             self.draw_retained_frame(pass, parameters, &request);
         } else {
             self.draw_frame(pass, parameters, &request, &visible, frame);
         }
         self.make_room(0);
+    }
+
+    fn display_frame(&mut self, now: Instant) -> Endpoints {
+        let target = self.endpoints(self.clock.position());
+        let Some(mut fade) = self.band_fade.take() else { return target };
+        let ready = self.frame_ready(fade.from.current as f64) && self.frame_ready(fade.from.next as f64) && self.frame_ready(fade.to as f64);
+        let frame = fade.frame(now, ready);
+        if frame.fraction < 1.0 {
+            self.band_fade = Some(fade);
+        } else if fade.to != target.current {
+            self.band_fade = Some(BandFade::new(fade.to, target.current));
+        }
+        frame
     }
 
     fn view_tiles(&self, parameters: &WgpuLayerParameters, request: &PlaybackRequest, source: &RasterSource) -> Vec<VisibleTile> {
@@ -315,6 +360,7 @@ impl MultibandLayer {
     }
 
     fn clear_dataset(&mut self) {
+        self.band_fade = None;
         self.cancel_jobs();
         self.cache.clear();
         self.cache_bytes = 0;
@@ -340,10 +386,12 @@ impl MultibandLayer {
         let resized = size != self.window_size;
         let changed_zoom = self.coverage.iter().next().map(|tile| tile.z) != visible.first().map(|tile| tile.z);
         if (changed_zoom || resized) && self.retained.is_none() && self.draws.values().any(|draw| draw.sampled.iter().any(Option::is_some)) {
+            let frame = self.display_frame(now);
             self.retained = Some(RetainedFrame {
                 draws: std::mem::take(&mut self.draws),
-                frame: self.endpoints(self.clock.position()),
+                frame,
                 window_size: self.window_size,
+                fade_from: self.band_fade.as_ref().map(|fade| fade.from),
             });
         }
         if resized {
@@ -381,13 +429,24 @@ impl MultibandLayer {
         let current = self.endpoints(self.clock.position());
         let incoming = self.endpoints(proposed);
         let start = window_start(incoming.current, self.window_size);
-        let starts = [
+        let mut starts = [
             window_start(current.current, self.window_size),
             window_start(current.next, self.window_size),
             start,
             window_start(incoming.next, self.window_size),
             next_window(start, self.window_size, count),
         ];
+        if let Some(fade) = &self.band_fade {
+            // A fractional outgoing frame can span two windows. Reserve the
+            // third for this fade's target; queued selections wait their turn.
+            starts = [
+                window_start(fade.from.current, self.window_size),
+                window_start(fade.from.next, self.window_size),
+                window_start(fade.to, self.window_size),
+                window_start(fade.from.current, self.window_size),
+                window_start(fade.to, self.window_size),
+            ];
+        }
         self.wanted.clear();
         for tile in &self.coverage {
             for start in starts {
@@ -497,7 +556,7 @@ impl MultibandLayer {
         );
         for tile in tiles {
             let draw = &retained.draws[&tile];
-            let data = draw_uniform(
+            let mut data = draw_uniform(
                 parameters,
                 tile,
                 [source, next],
@@ -506,6 +565,7 @@ impl MultibandLayer {
                 self.opacity,
                 request.style(),
             );
+            apply_band_fade(&mut data, retained.fade_from, request, retained.window_size);
             if !extrusion_visible(parameters, tile, &data) {
                 continue;
             }
@@ -527,6 +587,7 @@ impl MultibandLayer {
     ) {
         let Some(source) = request.bands().get(frame.current) else { return };
         let Some(next) = request.bands().get(frame.next) else { return };
+        let fade_from = self.band_fade.as_ref().map(|fade| fade.from);
         let debug_status = self.debug_status();
         let Some(pipeline) = &mut self.pipeline else { return };
         pipeline.update_palette(
@@ -541,7 +602,7 @@ impl MultibandLayer {
         let mut tiles = visible.to_vec();
         pipeline.sort_tiles(parameters, &mut tiles, self.opacity, frame.fraction, request.style().extrusion_for(source).0);
         for tile in tiles {
-            let keys = [frame.current, frame.next].map(|band| WindowKey {
+            let keys = [frame.current, frame.next, fade_from.map_or(frame.current, |from| from.next)].map(|band| WindowKey {
                 tile: tile.canonical(),
                 start: window_start(band, self.window_size),
             });
@@ -551,7 +612,8 @@ impl MultibandLayer {
             if draw.sampled != sampled {
                 *draw = pipeline.draw_tile(&self.device, sampled, textures);
             }
-            let data = draw_uniform(parameters, tile, [source, next], frame, self.window_size, self.opacity, request.style());
+            let mut data = draw_uniform(parameters, tile, [source, next], frame, self.window_size, self.opacity, request.style());
+            apply_band_fade(&mut data, fade_from, request, self.window_size);
             paint_draw(&self.queue, pass, draw, data, debug_status, pipeline, parameters);
             #[cfg(test)]
             {
@@ -591,13 +653,16 @@ fn paint_draw(
     for (layer, sampled) in data.layers[..2].iter_mut().zip(draw.sampled) {
         *layer = sampled.map_or(0, |_| *layer);
     }
+    if draw.sampled[2].is_none() {
+        data.outgoing[1] = 0.0;
+    }
     data.layers[3] = debug_status;
     data.geometry = geometry::with_averaging(
         geometry::plan(
             &data.matrix,
             [parameters.width, parameters.height],
             data.extrusion,
-            pipeline.opaque(data.parameters[1], data.parameters[0]),
+            pipeline.opaque(data.parameters[1], data.parameters[0]) && data.outgoing[0] <= 0.0,
         ),
         data.geometry[3],
         data.parameters[0],
@@ -674,7 +739,22 @@ fn draw_uniform(
             u32::from(style.clamp_colors_for(sources[0])),
             0,
         ],
+        outgoing_scale: [0.0; 2],
+        outgoing_range: [0.0; 2],
+        outgoing: [0.0; 4],
     }
+}
+
+fn apply_band_fade(data: &mut DrawUniform, from: Option<Endpoints>, request: &PlaybackRequest, size: usize) {
+    let Some(from) = from else { return };
+    let Some(source) = request.bands().get(from.next) else { return };
+    let style = request.style();
+    let scale = style.scale_for(source);
+    let range = style.range_for(source);
+    data.parameters[3] = 1.0;
+    data.outgoing_scale = [scale.scale as f32, scale.offset as f32];
+    data.outgoing_range = [range.0, range.1];
+    data.outgoing = [from.fraction, (from.next % size) as f32, 0.0, f32::from(style.extrusion_averaging_for(source))];
 }
 
 impl MultibandPipeline {
@@ -764,7 +844,7 @@ impl MultibandPipeline {
         }
     }
 
-    fn draw_tile(&self, device: &wgpu::Device, sampled: [Option<WindowKey>; 2], textures: [Option<&WindowTexture>; 2]) -> DrawTile {
+    fn draw_tile(&self, device: &wgpu::Device, sampled: [Option<WindowKey>; 3], textures: [Option<&WindowTexture>; 3]) -> DrawTile {
         let textures = textures.map(|texture| texture.unwrap_or(&self.empty));
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Multiband frame uniform"),
@@ -778,6 +858,8 @@ impl MultibandPipeline {
             &textures[1].values,
             &textures[1].mask,
             &self.palette_view,
+            &textures[2].values,
+            &textures[2].mask,
         ];
         let mut entries = vec![wgpu::BindGroupEntry {
             binding: 0,
@@ -807,7 +889,7 @@ fn create_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         },
         count: None,
     }];
-    entries.extend((1..=5).map(|binding| wgpu::BindGroupLayoutEntry {
+    entries.extend((1..=7).map(|binding| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
         ty: wgpu::BindingType::Texture {
@@ -1299,7 +1381,7 @@ mod tests {
                 }),
             ];
             let texture = tiles::upload_window(&device, &queue, bands, 2)?.expect("nonempty test bands");
-            let draw = pipeline.draw_tile(&device, [None, None], [Some(&texture), Some(&texture)]);
+            let draw = pipeline.draw_tile(&device, [None; 3], [Some(&texture), Some(&texture), None]);
             queue.write_buffer(
                 &draw.uniform,
                 0,
@@ -1313,6 +1395,7 @@ mod tests {
                     layers: [0, 1, 1, 0],
                     extrusion: [0.0; 4],
                     geometry: [0; 4],
+                    ..DrawUniform::zeroed()
                 }),
             );
             let output = render_test_quad(&device, &queue, &pipeline.pipeline, &draw.bindings);
@@ -1438,7 +1521,7 @@ mod tests {
 
     #[test]
     fn uniform_layout_matches_wgsl_alignment() {
-        assert_eq!(std::mem::size_of::<DrawUniform>(), 160);
+        assert_eq!(std::mem::size_of::<DrawUniform>(), 192);
     }
 
     #[test]

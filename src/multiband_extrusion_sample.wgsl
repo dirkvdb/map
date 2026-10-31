@@ -24,9 +24,9 @@ fn extrusion_band(data: texture_2d_array<f32>, mask: texture_2d_array<f32>, uv: 
 fn extrusion_sample(uv: vec2<f32>) -> RasterSample {
     // Bit 0 averages blend=0 (current); bit 1 averages blend=1 (next).
     let flags = draw.geometry.w & 3u;
-    if flags == 0u { return raster_sample(uv); }
+    if flags == 0u && draw.outgoing.w <= 0.5 { return raster_sample(uv); }
     let t = draw.parameters.x;
-    if t <= 0.0 {
+    if t <= 0.0 && (draw.parameters.w < 0.5 || draw.outgoing.x <= 0.0) {
         let a = extrusion_band(values, valid, uv, draw.layers.x, (flags & 1u) != 0u);
         return sample_endpoint(a, draw.scale, draw.range);
     }
@@ -36,5 +36,9 @@ fn extrusion_sample(uv: vec2<f32>) -> RasterSample {
     }
     let a = extrusion_band(values, valid, uv, draw.layers.x, (flags & 1u) != 0u);
     let b = extrusion_band(next_values, next_valid, uv, draw.layers.y, (flags & 2u) != 0u);
-    return sample_temporal(a, b, t);
+    var c = vec2(0.0);
+    if draw.parameters.w > 0.5 && draw.outgoing.x > 0.0 {
+        c = extrusion_band(outgoing_values, outgoing_valid, uv, u32(draw.outgoing.y), draw.outgoing.w > 0.5);
+    }
+    return sample_transition(a, b, c, t);
 }

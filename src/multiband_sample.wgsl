@@ -8,6 +8,9 @@ struct Draw {
     layers: vec4<u32>,
     extrusion: vec4<f32>,
     geometry: vec4<u32>,
+    outgoing_scale: vec2<f32>,
+    outgoing_range: vec2<f32>,
+    outgoing: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> draw: Draw;
@@ -16,6 +19,8 @@ struct Draw {
 @group(0) @binding(3) var next_values: texture_2d_array<f32>;
 @group(0) @binding(4) var next_valid: texture_2d_array<f32>;
 @group(0) @binding(5) var palette: texture_2d<f32>;
+@group(0) @binding(6) var outgoing_values: texture_2d_array<f32>;
+@group(0) @binding(7) var outgoing_valid: texture_2d_array<f32>;
 
 struct RasterSample {
     color: vec4<f32>,
@@ -49,7 +54,7 @@ fn sample_endpoint(band: vec2<f32>, scale: vec2<f32>, range: vec2<f32>) -> Raste
 
 fn raster_sample(uv: vec2<f32>) -> RasterSample {
     let t = draw.parameters.x;
-    if t <= 0.0 {
+    if t <= 0.0 && (draw.parameters.w < 0.5 || draw.outgoing.x <= 0.0) {
         return sample_endpoint(sample_band(values, valid, uv, draw.layers.x), draw.scale, draw.range);
     }
     if t >= 1.0 {
@@ -57,10 +62,26 @@ fn raster_sample(uv: vec2<f32>) -> RasterSample {
     }
     let a = sample_band(values, valid, uv, draw.layers.x);
     let b = sample_band(next_values, next_valid, uv, draw.layers.y);
-    return sample_temporal(a, b, t);
+    var c = vec2(0.0);
+    if draw.parameters.w > 0.5 && draw.outgoing.x > 0.0 {
+        c = sample_band(outgoing_values, outgoing_valid, uv, u32(draw.outgoing.y));
+    }
+    return sample_transition(a, b, c, t);
 }
 
-fn sample_temporal(a: vec2<f32>, b: vec2<f32>, t: f32) -> RasterSample {
+fn sample_transition(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, t: f32) -> RasterSample {
+    if draw.parameters.w > 0.5 {
+        var outgoing = sample_endpoint(a, draw.scale, draw.range);
+        if draw.outgoing.x > 0.0 {
+            outgoing = sample_temporal(a, c, draw.outgoing.x, draw.outgoing_scale, draw.outgoing_range);
+        }
+        let incoming = sample_endpoint(b, draw.next_scale, draw.next_range);
+        return RasterSample(mix(outgoing.color, incoming.color, t), mix(outgoing.height, incoming.height, t));
+    }
+    return sample_temporal(a, b, t, draw.next_scale, draw.next_range);
+}
+
+fn sample_temporal(a: vec2<f32>, b: vec2<f32>, t: f32, next_scale: vec2<f32>, next_range: vec2<f32>) -> RasterSample {
     let a_valid = a.y > 0.5;
     let b_valid = b.y > 0.5;
     if !a_valid && !b_valid {
@@ -70,12 +91,12 @@ fn sample_temporal(a: vec2<f32>, b: vec2<f32>, t: f32) -> RasterSample {
     // Apply EACH endpoint's physical conversion BEFORE temporal interpolation,
     // then perform exactly one palette lookup, never a blend of palette colors.
     let a_value = a.x * draw.scale.x + draw.scale.y;
-    let b_value = b.x * draw.next_scale.x + draw.next_scale.y;
+    let b_value = b.x * next_scale.x + next_scale.y;
     var value = mix(a_value, b_value, t);
     // Display ranges describe the temporal frame, not pixel validity. Keeping
     // this rule for single-invalid pixels avoids a style jump at mask edges
     // and converges to the next band's custom range as t approaches one.
-    let range = mix(draw.range, draw.next_range, t);
+    let range = mix(draw.range, next_range, t);
     var alpha = 1.0;
     if !a_valid {
         value = b_value;
