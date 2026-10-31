@@ -11,15 +11,29 @@ use bytemuck::{Pod, Zeroable};
 use geo::Tile;
 use inf::colormap::{ColorMapDirection, ColorMapPreset};
 use maplibre_native::{WgpuCustomLayer, WgpuLayerParameters, texture_format_from_webgpu};
+use wgpu::util::DeviceExt;
 
 use crate::multiband_layer::MultibandLayer;
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest};
 use crate::raster_source::{NumericTile, RasterSource};
-use crate::raster_tiles::{MAX_PENDING_TILES, TileWorkers, VisibleTile, parent_uv, tile_matrix, transition_tiles, visible_tiles};
+use crate::raster_tiles::{MAX_PENDING_TILES, TileWorkers, VisibleTile, extrusion_view, parent_uv, tile_matrix, transition_tiles, visible_tiles};
+
+#[path = "raster_extrusion_geometry.rs"]
+pub(crate) mod geometry;
 
 const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CACHE_TILES: usize = 256;
 const BAND_FADE: Duration = Duration::from_millis(180);
+
+// Corner bits encode x/y/z, matching raster_extrusion.wgsl. No bottom face.
+// Outward faces project clockwise in the map's south-positive tile coordinates.
+const EXTRUSION_INDICES: [u16; 30] = [
+    4, 5, 6, 6, 5, 7, // top
+    0, 1, 4, 4, 1, 5, // north
+    1, 3, 5, 5, 3, 7, // east
+    3, 2, 7, 7, 2, 6, // south
+    2, 0, 6, 6, 0, 4, // west
+];
 
 #[cfg(test)]
 #[path = "raster_layer_zoom_tests.rs"]
@@ -46,6 +60,8 @@ struct DrawUniform {
     tile_id: [u32; 4],
     clamp_colors: [u32; 4],
     extrusion: [f32; 4],
+    // X/Y strides, traversal flags, previous/current averaging bits.
+    geometry: [u32; 4],
 }
 
 struct TileTexture {
@@ -70,11 +86,13 @@ struct RasterPipeline {
     formats: (u32, u32, bool),
     pipeline: wgpu::RenderPipeline,
     extrusion_pipeline: wgpu::RenderPipeline,
+    extrusion_indices: wgpu::Buffer,
     debug_pipeline: Option<wgpu::RenderPipeline>,
     layout: wgpu::BindGroupLayout,
     palettes: [wgpu::Texture; 2],
     palette_views: [wgpu::TextureView; 2],
     presets: [Option<(ColorMapPreset, ColorMapDirection)>; 2],
+    palette_opaque: [bool; 2],
     empty: TileTexture,
 }
 
@@ -325,7 +343,7 @@ impl RasterLayer {
         let Some(source) = self.source.clone() else { return };
         self.frame += 1;
         self.prepare_pipeline(parameters);
-        let visible = visible_tiles(parameters, &source);
+        let visible = self.view_tiles(parameters, &source, None);
         self.update_coverage(&visible, now);
         let blend = self.fade_started.map_or(if self.previous.is_some() { 0.0 } else { 1.0 }, |start| {
             (now.duration_since(start).as_secs_f32() / BAND_FADE.as_secs_f32()).clamp(0.0, 1.0)
@@ -338,9 +356,9 @@ impl RasterLayer {
         // footprints on the finer grid so either slot can sample ancestors.
         let visible = self.previous.as_ref().map_or(visible, |previous| {
             if loading_replacement {
-                visible_tiles(parameters, &previous.source)
+                self.view_tiles(parameters, &previous.source, None)
             } else {
-                transition_tiles(parameters, &source, &previous.source)
+                self.view_tiles(parameters, &source, Some(&previous.source))
             }
         });
         // Swap zoom grids as a unit: drawing parents and children together
@@ -350,6 +368,40 @@ impl RasterLayer {
         self.draw_visible_tiles(pass, parameters, &source, &visible, blend);
         self.draw_debug_tiles(pass);
         self.evict();
+    }
+
+    fn view_tiles(&self, parameters: &WgpuLayerParameters, source: &RasterSource, previous: Option<&RasterSource>) -> Vec<VisibleTile> {
+        let sources = [source, previous.unwrap_or(source)].map(|source| (source, effective_height(source)));
+        if sources.iter().any(|(_, height)| *height > 0.0) {
+            // Target request detail must not depend on temporary cached ancestors.
+            extrusion_view::visible_tiles(parameters, &sources, MAX_CACHE_TILES)
+        } else {
+            previous.map_or_else(|| visible_tiles(parameters, source), |previous| transition_tiles(parameters, source, previous))
+        }
+    }
+
+    fn draw_tiles(&self, parameters: &WgpuLayerParameters, source: &RasterSource, visible: &[VisibleTile], blend: f32) -> Vec<VisibleTile> {
+        let previous = self.previous.as_ref().map_or(source, |previous| &previous.source);
+        let sources = [source, previous].map(|source| (source, effective_height(source)));
+        let mut tiles = visible.to_vec();
+        if sources.iter().any(|(_, height)| *height > 0.0) {
+            let height = extrusion_view::maximum_height(parameters, &sources);
+            tiles.retain(|tile| extrusion_view::tile_visible(parameters, *tile, height));
+
+            if self.opaque_draw(blend) {
+                geometry::sort_tiles(parameters, &mut tiles);
+            }
+        }
+        tiles
+    }
+
+    fn opaque_draw(&self, blend: f32) -> bool {
+        self.opacity >= 1.0
+            && (blend <= 0.0 || blend >= 1.0)
+            && self
+                .pipeline
+                .as_ref()
+                .is_some_and(|pipeline| pipeline.palette_opaque[usize::from(blend <= 0.0)])
     }
 
     fn finish_fade(&mut self, now: Instant) {
@@ -425,14 +477,16 @@ impl RasterLayer {
         for (ix, source) in [source, previous_source].into_iter().enumerate() {
             let key = palette_key(source);
             if pipeline.presets[ix] != Some(key) {
-                write_texture(&self.queue, &pipeline.palettes[ix], &source.palette_rgba(), 256, 1, 4);
+                let rgba = source.palette_rgba();
+                pipeline.palette_opaque[ix] = rgba.as_chunks::<4>().0.iter().all(|color| color[3] == 255);
+                write_texture(&self.queue, &pipeline.palettes[ix], &rgba, 256, 1, 4);
                 pipeline.presets[ix] = Some(key);
             }
         }
         pass.set_pipeline(&pipeline.pipeline);
         let visible_set: HashSet<_> = visible.iter().copied().collect();
         self.draws.retain(|tile, _| visible_set.contains(tile));
-        for &visible_tile in visible {
+        for visible_tile in self.draw_tiles(parameters, source, visible, blend) {
             self.draw_visible_tile(pass, parameters, source, visible_tile, blend);
         }
     }
@@ -445,6 +499,7 @@ impl RasterLayer {
         visible_tile: VisibleTile,
         blend: f32,
     ) {
+        let opaque = self.opaque_draw(blend);
         let tile = visible_tile.canonical();
         let sampled = self.cached_ancestor(tile);
         let previous_sampled = self.previous.as_ref().and_then(|previous| previous.sampled(tile));
@@ -471,7 +526,7 @@ impl RasterLayer {
         let previous_uv = previous_sampled.map_or([0.0, 0.0, 1.0, 1.0], |sampled| parent_uv(tile, sampled));
         let grid = extrusion_grid(texture.map(|t| t.size), uv, previous_texture.map(|t| t.size), previous_uv, blend);
         let height = effective_height(previous_source) * (1.0 - blend) + effective_height(source) * blend;
-        let mut extrusion = extrusion_uniform(parameters, visible_tile, grid, effective_height(source));
+        let mut extrusion = extrusion_uniform(parameters, source, grid, effective_height(source));
         extrusion[3] = height;
         pass.set_pipeline(if height > 0.0 { &pipeline.extrusion_pipeline } else { &pipeline.pipeline });
         let range = source.range();
@@ -480,11 +535,19 @@ impl RasterLayer {
         let scale_offset = [scale.scale as f32, scale.offset as f32];
         let previous_scale = self.previous.as_ref().map_or(scale, |previous| previous.source.scale());
         let previous_scale_offset = [previous_scale.scale as f32, previous_scale.offset as f32];
+        let previous_height = extrusion_uniform(parameters, previous_source, grid, effective_height(previous_source))[2];
+        let matrix = tile_matrix(&parameters.projection, parameters.zoom, visible_tile);
+        let mut volume = extrusion;
+        volume[2] = previous_height * (1.0 - blend) + extrusion[2] * blend;
+        let averaging = [previous_source, source].map(|source| source.is_extruded() && source.is_extrusion_averaged());
+        let flags = u32::from(averaging[0]) | (u32::from(averaging[1]) << 1);
+        let geometry = geometry::with_averaging(geometry::plan(&matrix, [parameters.width, parameters.height], volume, opaque), flags, blend);
+
         self.queue.write_buffer(
             &draw.uniform,
             0,
             bytemuck::bytes_of(&DrawUniform {
-                matrix: tile_matrix(&parameters.projection, parameters.zoom, visible_tile),
+                matrix,
                 uv,
                 previous_uv,
                 range: [range.0, range.1],
@@ -494,9 +557,10 @@ impl RasterLayer {
                 opacity: self.opacity,
                 blend,
                 tile_size: (512.0 * parameters.zoom.exp2() / f64::from(1_u32 << tile.z)) as f32,
-                previous_extrusion_height: extrusion_uniform(parameters, visible_tile, grid, effective_height(previous_source))[2],
+                previous_extrusion_height: previous_height,
                 tile_id: [tile.z as u32, tile.x as u32, tile.y as u32, 0],
                 extrusion,
+                geometry,
                 clamp_colors: [
                     u32::from(source.clamp_colors()),
                     u32::from(self.previous.as_ref().map_or(source.clamp_colors(), |previous| previous.source.clamp_colors())),
@@ -506,7 +570,7 @@ impl RasterLayer {
             }),
         );
         pass.set_bind_group(0, &draw.bindings, &[]);
-        draw_pixels(pass, extrusion);
+        draw_pixels(pass, extrusion, geometry, &pipeline.extrusion_indices);
     }
 
     fn draw_debug_tiles(&mut self, pass: &mut wgpu::RenderPass<'_>) {
@@ -620,11 +684,13 @@ impl RasterPipeline {
             formats,
             pipeline,
             extrusion_pipeline: create_pipeline(device, formats, &layout, "extruded_fragment"),
+            extrusion_indices: create_extrusion_indices(device),
             debug_pipeline: None,
             layout,
             palettes,
             palette_views,
             presets: [None; 2],
+            palette_opaque: [false; 2],
             empty: TileTexture {
                 values: create_texture(device, 1, 1, wgpu::TextureFormat::R32Float).create_view(&Default::default()),
                 valid: create_texture(device, 1, 1, wgpu::TextureFormat::R8Unorm).create_view(&Default::default()),
@@ -693,24 +759,42 @@ fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wg
         bind_group_layouts: &[Some(layout)],
         immediate_size: 0,
     });
+    let extruded = fragment == "extruded_fragment";
+    let entry_points = if extruded {
+        concat!(include_str!("raster_extrusion_sample.wgsl"), "\n", include_str!("raster_extrusion.wgsl"))
+    } else {
+        concat!(include_str!("raster_layer.wgsl"), "\n", include_str!("raster_debug.wgsl"))
+    };
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Numeric raster shader"),
-        source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", include_str!("raster_layer.wgsl"), include_str!("raster_debug.wgsl")).into()),
+        label: Some(if extruded {
+            "Numeric raster extrusion shader"
+        } else {
+            "Numeric raster shader"
+        }),
+        source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", include_str!("raster_sample.wgsl"), entry_points).into()),
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Numeric raster"),
+        label: Some(if extruded { "Numeric raster extrusion" } else { "Numeric raster" }),
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: Some(if fragment == "extruded_fragment" { "extruded_vertex" } else { "vertex" }),
+            entry_point: Some(if extruded { "extruded_vertex" } else { "vertex" }),
             compilation_options: Default::default(),
             buffers: &[],
         },
-        primitive: wgpu::PrimitiveState::default(),
+        primitive: wgpu::PrimitiveState {
+            front_face: wgpu::FrontFace::Cw,
+            cull_mode: extruded.then_some(wgpu::Face::Back),
+            ..Default::default()
+        },
         depth_stencil: (formats.1 != 0).then(|| wgpu::DepthStencilState {
             format: texture_format_from_webgpu(formats.1),
-            depth_write_enabled: Some(fragment == "extruded_fragment"),
-            depth_compare: Some(if fragment == "extruded_fragment" || (formats.2 && fragment == "fragment") {
+            depth_write_enabled: Some(extruded),
+            // Keep the first surface on depth ties; farther walls must not
+            // overwrite tops after quantization in native depth attachments.
+            depth_compare: Some(if extruded {
+                wgpu::CompareFunction::Less
+            } else if formats.2 && fragment == "fragment" {
                 wgpu::CompareFunction::LessEqual
             } else {
                 wgpu::CompareFunction::Always
@@ -807,21 +891,27 @@ fn extrusion_grid(current: Option<[u32; 2]>, uv: [f32; 4], previous: Option<[u32
     })
 }
 
-pub(crate) fn extrusion_uniform(parameters: &WgpuLayerParameters, tile: VisibleTile, grid: [u32; 2], height: f32) -> [f32; 4] {
-    // MapLibre Camera::getWorldToCamera scales Z meters to world pixels.
-    // Its Earth radius is 6378137 m; latitude matches the camera center.
-    let tile_meters = std::f64::consts::TAU * 6_378_137.0 * parameters.latitude.to_radians().cos() / f64::from(1_u32 << tile.z);
+pub(crate) fn extrusion_uniform(parameters: &WgpuLayerParameters, source: &RasterSource, grid: [u32; 2], height: f32) -> [f32; 4] {
     [
         grid[0] as f32,
         grid[1] as f32,
-        (tile_meters * f64::from(height * crate::raster_source::EXTRUSION_HEIGHT_FACTOR) / f64::from(grid[0])) as f32,
+        crate::raster_tiles::extrusion_height::maximum(parameters, source, height) as f32,
         height,
     ]
 }
 
-pub(crate) fn draw_pixels(pass: &mut wgpu::RenderPass<'_>, extrusion: [f32; 4]) {
+pub(crate) fn create_extrusion_indices(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Raster extrusion corners"),
+        contents: bytemuck::cast_slice(&EXTRUSION_INDICES),
+        usage: wgpu::BufferUsages::INDEX,
+    })
+}
+
+pub(crate) fn draw_pixels(pass: &mut wgpu::RenderPass<'_>, extrusion: [f32; 4], geometry: [u32; 4], indices: &wgpu::Buffer) {
     if extrusion[3] > 0.0 {
-        pass.draw(0..30, 0..(extrusion[0] as u32 * extrusion[1] as u32));
+        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(0..EXTRUSION_INDICES.len() as u32, 0, 0..geometry::instance_count(extrusion, geometry));
     } else {
         pass.draw(0..6, 0..1);
     }

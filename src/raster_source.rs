@@ -17,6 +17,7 @@ use tiler::{DynamicTileProvider, LayerMetadata, LayerSourceType, TileFormat, Til
 
 const TILE_SIZE: u32 = 256;
 pub(crate) const EXTRUSION_HEIGHT_FACTOR: f32 = 10.0;
+pub(crate) const MAX_EXTRUSION_HEIGHT: f32 = 20.0;
 const MAX_RANGE_SAMPLE_BANDS: usize = 8;
 const URL_PREFIX: &str = "raster://";
 static NEXT_STYLE_ID: AtomicU64 = AtomicU64::new(1);
@@ -42,6 +43,7 @@ pub struct RasterSource {
     clamp_colors: bool,
     extruded: bool,
     extrusion_height: f32,
+    extrusion_averaged: bool,
     legend: Legend,
     palette: ColorMapPreset,
     color_map_direction: ColorMapDirection,
@@ -52,7 +54,7 @@ pub struct RasterSource {
 
 /// Shared normalization for source snapshots and playback overrides.
 pub(crate) fn normalized_extrusion_height(height: f32) -> f32 {
-    if height.is_finite() { height.clamp(0.0, 10.0) } else { 1.0 }
+    if height.is_finite() { height.clamp(0.0, MAX_EXTRUSION_HEIGHT) } else { 1.0 }
 }
 
 impl RasterSource {
@@ -91,7 +93,7 @@ impl RasterSource {
             ColorMapDirection::Regular,
             range,
             unscaling_enabled,
-            (true, false, 1.0),
+            (true, false, 1.0, false),
         )
     }
 
@@ -102,7 +104,7 @@ impl RasterSource {
         color_map_direction: ColorMapDirection,
         range: (f32, f32),
         unscaling_enabled: bool,
-        display: (bool, bool, f32),
+        display: (bool, bool, f32, bool),
     ) -> Result<Arc<Self>> {
         ensure!(valid_range(range), "Minimum must be less than maximum; both must be finite numbers.");
         let legend = Legend::linear(&ColorMap::Preset(palette, color_map_direction), range.0..range.1, None)?;
@@ -115,6 +117,7 @@ impl RasterSource {
             clamp_colors: display.0,
             extruded: display.1,
             extrusion_height: display.2,
+            extrusion_averaged: display.3,
             legend,
             palette,
             color_map_direction,
@@ -132,7 +135,7 @@ impl RasterSource {
             self.color_map_direction,
             range,
             self.unscaling_enabled,
-            (self.clamp_colors, self.extruded, self.extrusion_height),
+            (self.clamp_colors, self.extruded, self.extrusion_height, self.extrusion_averaged),
         )
     }
 
@@ -145,7 +148,7 @@ impl RasterSource {
             direction,
             self.range,
             self.unscaling_enabled,
-            (self.clamp_colors, self.extruded, self.extrusion_height),
+            (self.clamp_colors, self.extruded, self.extrusion_height, self.extrusion_averaged),
         )
     }
 
@@ -163,7 +166,7 @@ impl RasterSource {
             self.color_map_direction,
             self.range,
             self.unscaling_enabled,
-            (enabled, self.extruded, self.extrusion_height),
+            (enabled, self.extruded, self.extrusion_height, self.extrusion_averaged),
         )
     }
 
@@ -171,8 +174,9 @@ impl RasterSource {
         self.extruded
     }
 
-    /// Maximum bar height in units of ten rendered raster-pixel widths. Each scaled
-    /// pixel value multiplies this by its clamped position within the color-map range.
+    /// Maximum bar height in units of ten nominal raster-pixel widths, before
+    /// coverage/cache/geometry coarsening. Each scaled value multiplies this by
+    /// its clamped position within the color-map range.
     pub fn extrusion_height(&self) -> f32 {
         self.extrusion_height
     }
@@ -186,7 +190,26 @@ impl RasterSource {
             self.color_map_direction,
             self.range,
             self.unscaling_enabled,
-            (self.clamp_colors, enabled, normalized_extrusion_height(height)),
+            (self.clamp_colors, enabled, normalized_extrusion_height(height), self.extrusion_averaged),
+        )
+    }
+
+    /// Whether extrusion averages each 2×2 pixel block into one bar. Defaults to false.
+    pub fn is_extrusion_averaged(&self) -> bool {
+        self.extrusion_averaged
+    }
+
+    /// Changes extrusion averaging without altering raw metadata or numeric tile identity.
+    /// The setting is retained while extrusion is disabled.
+    pub fn with_extrusion_averaging(&self, enabled: bool) -> Result<Arc<Self>> {
+        Self::styled(
+            self.metadata.clone(),
+            self.source_files.clone(),
+            self.palette,
+            self.color_map_direction,
+            self.range,
+            self.unscaling_enabled,
+            (self.clamp_colors, self.extruded, self.extrusion_height, enabled),
         )
     }
 
@@ -229,7 +252,7 @@ impl RasterSource {
             self.color_map_direction,
             range,
             enabled,
-            (self.clamp_colors, self.extruded, self.extrusion_height),
+            (self.clamp_colors, self.extruded, self.extrusion_height, self.extrusion_averaged),
         )
     }
 
@@ -1834,6 +1857,65 @@ mod tests {
         assert_eq!(raw.range(), (20.0, 40.0));
         assert_eq!(physical.range(), restyled.range());
         assert!(source.clamp_colors(), "Snapshots must not mutate the original style");
+        Ok(())
+    }
+
+    #[test]
+    fn extrusion_averaging_survives_style_and_unit_snapshots_without_reads() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = open_scaled_fixture(dir.path(), Some(-2.0), Some(10.0))?;
+        assert!(!source.is_extrusion_averaged());
+        std::fs::remove_file(&source.metadata().path)?;
+        let averaged = source.with_extrusion_averaging(true)?;
+        let restyled = averaged.restyled(ColorMapPreset::Blues, (-70.0, -30.0))?;
+        let reversed = restyled.with_color_map_direction(ColorMapDirection::Reversed)?;
+        let unclamped = reversed.with_clamp_colors(false)?;
+        let raw = unclamped.with_unscaling(false)?;
+        for snapshot in [&averaged, &restyled, &reversed, &unclamped, &raw] {
+            assert!(snapshot.is_extrusion_averaged());
+            assert_shared_raster_snapshot(&source, snapshot);
+        }
+        assert_eq!(averaged.range(), source.range());
+        assert_eq!(averaged.palette_rgba(), source.palette_rgba());
+        assert_eq!(raw.range(), (20.0, 40.0));
+        assert!(!source.is_extrusion_averaged(), "Snapshots cannot mutate the original style");
+        Ok(())
+    }
+
+    #[test]
+    fn extrusion_averaging_is_retained_when_extrusion_and_height_change() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = open_scaled_fixture(dir.path(), Some(-2.0), Some(10.0))?;
+        let averaged = source.with_unscaling(false)?.with_extrusion_averaging(true)?;
+        let extruded = averaged.with_extrusion(true, 2.5)?;
+        let flat = extruded.with_extrusion(false, 7.0)?;
+        let physical = flat.with_unscaling(true)?;
+        let unaveraged = physical.with_extrusion_averaging(false)?;
+        for snapshot in [&averaged, &extruded, &flat, &physical] {
+            assert!(snapshot.is_extrusion_averaged());
+        }
+        assert!(!unaveraged.is_extrusion_averaged());
+        assert!(!unaveraged.is_extruded());
+        assert_eq!(unaveraged.extrusion_height(), 7.0);
+        assert_eq!(unaveraged.range(), source.range());
+        assert_eq!(unaveraged.palette_rgba(), source.palette_rgba());
+        assert_shared_raster_snapshot(&source, &unaveraged);
+        Ok(())
+    }
+
+    #[test]
+    fn extrusion_averaging_keeps_raw_numeric_tiles_and_metadata_unchanged() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = open_scaled_fixture(dir.path(), Some(-2.0), Some(10.0))?;
+        let averaged = source.with_extrusion_averaging(true)?;
+        let tile = Tile { z: 3, x: 3, y: 3 };
+        let before = source.numeric_tile(tile, 1)?.context("Missing original tile")?;
+        let after = averaged.numeric_tile(tile, 1)?.context("Missing averaged tile")?;
+        assert_eq!((before.width, before.height), (after.width, after.height));
+        assert!(before.values.iter().zip(&after.values).all(|(a, b)| a.to_bits() == b.to_bits()));
+        assert_eq!(averaged.scale(), source.scale());
+        assert_eq!(averaged.data_range(), source.data_range());
+        assert_shared_raster_snapshot(&source, &averaged);
         Ok(())
     }
 

@@ -1714,7 +1714,13 @@ impl Render for RasterPanel {
 
 impl RasterPanel {
     fn extrusion_control(window: &mut Window, cx: &mut Context<Self>) -> (Entity<SliderState>, Subscription) {
-        let height = cx.new(|_| SliderState::new().min(0.0).max(10.0).step(0.1).default_value(1.0));
+        let height = cx.new(|_| {
+            SliderState::new()
+                .min(0.0)
+                .max(crate::raster_source::MAX_EXTRUSION_HEIGHT)
+                .step(0.2)
+                .default_value(1.0)
+        });
         let subscription = cx.subscribe_in(&height, window, |this, _, event: &SliderEvent, _, cx| {
             if let SliderEvent::Change(value) = event
                 && this.extrusion().0
@@ -1760,6 +1766,47 @@ impl RasterPanel {
         }
     }
 
+    fn set_extrusion_averaging(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let Some(source) = self.active().filter(|source| source.is_numeric()) else {
+            return;
+        };
+        if self.playback_style().extrusion_averaging_for(source) == enabled {
+            return;
+        }
+        let result = if self.playback_dataset().is_some() {
+            self.set_playback_style(self.playback_style().with_extrusion_averaging(enabled));
+            Ok(())
+        } else {
+            source.with_extrusion_averaging(enabled).map(|source| self.replace_raster(source))
+        };
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.watch_tile_errors(cx);
+                self.emit(false, cx);
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not change extrusion averaging: {error}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn render_extrusion_averaging(&self, extrusion_enabled: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let averaged = self.active().is_some_and(|source| self.playback_style().extrusion_averaging_for(source));
+        let description = "Reduce resolution";
+        Button::new("raster-average-extrusion-pixels")
+            .small()
+            .ghost()
+            .icon(IconName::Grid2x2)
+            .selected(averaged)
+            .toggled(averaged)
+            .disabled(!extrusion_enabled)
+            .tooltip(description)
+            .accessibility_label(description)
+            .on_click(cx.listener(move |this, _, _, cx| this.set_extrusion_averaging(!averaged, cx)))
+    }
+
     fn render_visualization(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         self.active().filter(|source| source.is_numeric())?;
         let (enabled, height) = self.extrusion();
@@ -1774,13 +1821,21 @@ impl RasterPanel {
                         .child(div().font_weight(FontWeight::SEMIBOLD).child("Visualization")),
                 )
                 .child(
-                    Switch::new("raster-extrude-pixels")
-                        .small()
-                        .label("Extrude pixels")
-                        .checked(enabled)
-                        .on_change(cx.listener(|this, enabled, _, cx| {
-                            this.set_extrusion(*enabled, this.extrusion().1, cx);
-                        })),
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            Switch::new("raster-extrude-pixels")
+                                .small()
+                                .label("Extrude pixels")
+                                .checked(enabled)
+                                .on_change(cx.listener(|this, enabled, _, cx| {
+                                    this.set_extrusion(*enabled, this.extrusion().1, cx);
+                                })),
+                        )
+                        .child(self.render_extrusion_averaging(enabled, cx)),
                 )
                 .child(
                     div().flex().justify_between().child(field_label("Maximum height", cx)).child(
@@ -3284,6 +3339,227 @@ mod tests {
             assert_eq!(panel.read(cx).extrusion(), (true, height));
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn extrusion_height_slider_can_exceed_the_previous_maximum(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![per_band_style_test_path(&dir, 2)];
+        let (panel, handle) = open_test_panel(cx, 1200.0);
+        load_test_paths(&panel, handle, paths, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("raster-extrude-pixels", cx);
+            let bounds = window.find("raster-extrusion-height").bounds();
+            window.click_at("raster-extrusion-height", point(bounds.size.width * 0.9, bounds.size.height * 0.5), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let height = panel.read(cx).extrusion().1;
+            assert!(height > 10.0 && height <= crate::raster_source::MAX_EXTRUSION_HEIGHT, "height={height}");
+            assert_eq!(panel.read(cx).active().unwrap().extrusion_height(), height);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn extrusion_averaging_is_controlled_disabled_and_retained_per_band(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![per_band_style_test_path(&dir, 2)];
+        let (panel, handle) = open_test_panel(cx, 1200.0);
+        load_test_paths(&panel, handle, paths, cx);
+        let events = record_events(&panel, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let original = panel.read(cx).active().unwrap().clone();
+            let control = window.find("raster-average-extrusion-pixels");
+            assert_eq!(control.role(), Some(gpui_kit::Role::Button));
+            assert_eq!(control.label(), Some("Reduce resolution"));
+            assert!(!extrusion_averaging_pressed(window));
+            assert_eq!(control.disabled(), Some(true));
+            assert!(control.bounds().left() >= window.find("raster-extrude-pixels").bounds().right());
+            assert!(control.bounds().bottom() <= window.find("raster-extrusion-height").bounds().top());
+            window.click("raster-average-extrusion-pixels", cx);
+            assert!(Arc::ptr_eq(panel.read(cx).active().unwrap(), &original));
+            window.click("raster-extrude-pixels", cx);
+            window.click("raster-average-extrusion-pixels", cx);
+            assert!(extrusion_averaging_pressed(window));
+            assert!(panel.read(cx).active().unwrap().is_extrusion_averaged());
+            toggle_extrusion_averaging_with_keyboard(window, cx);
+            assert!(!panel.read(cx).active().unwrap().is_extrusion_averaged());
+            window.press("enter", cx);
+            assert!(extrusion_averaging_pressed(window));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("next-raster-band", cx);
+            assert!(!extrusion_averaging_pressed(window));
+            assert_eq!(window.find("raster-average-extrusion-pixels").disabled(), Some(true));
+            window.click("previous-raster-band", cx);
+            assert!(extrusion_averaging_pressed(window));
+            window.click("raster-extrude-pixels", cx);
+            assert!(extrusion_averaging_pressed(window));
+            assert_eq!(window.find("raster-average-extrusion-pixels").disabled(), Some(true));
+            window.click("raster-average-extrusion-pixels", cx);
+            assert!(panel.read(cx).active().unwrap().is_extrusion_averaged());
+            window.click("raster-extrude-pixels", cx);
+            assert!(extrusion_averaging_pressed(window));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let events = events.read(cx);
+            assert!(events.iter().all(|event| !event.should_fit()));
+            assert!(events.last().unwrap().source().unwrap().is_extrusion_averaged());
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            panel.update(cx, |panel, cx| panel.clear(window, cx));
+            window.render_frame(cx);
+            assert!(window.try_find("raster-average-extrusion-pixels").is_none());
+            assert!(window.try_find("raster-extrusion-averaging-description").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn extrusion_averaging_icon_aligns_without_overflow_at_larger_font_sizes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[1]);
+        let (panel, handle) = open_test_panel(cx, 1200.0);
+        load_test_paths(&panel, handle, paths, cx);
+        for font_size in [16.0, 20.0] {
+            cx.update(|cx| gpui_kit::component::Theme::update(cx, |theme| theme.font_size = px(font_size)));
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let card = window.find("raster-visualization-card").bounds();
+                let toggle = window.find("raster-extrude-pixels").bounds();
+                let control = window.find("raster-average-extrusion-pixels").bounds();
+                let height = window.find("raster-extrusion-height").bounds();
+                assert!(window.find("raster-average-extrusion-pixels").visible());
+                assert!(window.try_find("raster-extrusion-averaging-description").is_none());
+                assert!(control.left() >= toggle.right());
+                assert_eq!(control.center().y, toggle.center().y);
+                assert!(height.top() >= control.bottom());
+                assert!(height.bottom() <= card.bottom());
+                assert_eq!(control.right(), card.right() - (toggle.left() - card.left()));
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn extrusion_averaging_and_range_controls_remain_reachable_in_short_windows(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[1]);
+        let (panel, handle) = open_test_panel(cx, 400.0);
+        load_test_paths(&panel, handle, paths, cx);
+        cx.update(|cx| gpui_kit::component::Theme::update(cx, |theme| theme.font_size = px(18.0)));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let before = window.find("raster-visualization-card").bounds();
+            window.scroll("raster-layers-card", ScrollDelta::Lines(point(0.0, -30.0)), cx);
+            assert!(window.find("raster-visualization-card").bounds().top() < before.top());
+            assert!(window.find("raster-average-extrusion-pixels").visible());
+            assert!(window.find("raster-extrusion-height").visible());
+            window.click("raster-extrude-pixels", cx);
+            window.click("raster-average-extrusion-pixels", cx);
+            assert!(panel.read(cx).active().unwrap().is_extrusion_averaged());
+            window.scroll("raster-visualization-card", ScrollDelta::Lines(point(0.0, 5.0)), cx);
+            assert!(window.find("raster-max").visible());
+        })
+        .unwrap();
+    }
+
+    fn extrusion_averaging_pressed(window: &Window) -> bool {
+        // Kit exposes AccessKit's native toggle-button pressed state through checked().
+        window.find("raster-average-extrusion-pixels").checked().expect("Native button pressed state")
+    }
+
+    fn toggle_extrusion_averaging_with_keyboard(window: &mut Window, cx: &mut App) {
+        window.click("raster-min", cx);
+        for _ in 0..30 {
+            if window.find("raster-average-extrusion-pixels").focused() == Some(true) {
+                break;
+            }
+            window.press("tab", cx);
+        }
+        assert_eq!(window.find("raster-average-extrusion-pixels").focused(), Some(true));
+        window.press("space", cx);
+        assert!(!extrusion_averaging_pressed(window));
+    }
+
+    #[gpui_kit::test]
+    fn extrusion_averaging_updates_shared_playback_without_seeking_or_rebuilding_bands(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[3]);
+        let (panel, handle) = open_test_panel(cx, 1200.0);
+        load_test_paths(&panel, handle, paths, cx);
+        let events = record_events(&panel, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("raster-extrude-pixels", cx);
+            window.click("toggle-raster-playback", cx);
+            let playing = panel.read(cx).playback_request().unwrap();
+            panel.update(cx, |panel, cx| {
+                panel.apply_playback_frame(PlaybackFrame::new(playing.dataset_id().unwrap(), playing.revision(), 1.25, true), window, cx);
+            });
+            window.render_frame(cx);
+            let before = panel.read(cx).playback_request().unwrap();
+            assert!(before.is_playing());
+            assert_eq!(before.style().extrusion_averaging(), None);
+            window.click("raster-average-extrusion-pixels", cx);
+            let averaged = panel.read(cx).playback_request().unwrap();
+            assert_averaging_playback_controls_unchanged(&before, &averaged);
+            assert_eq!(averaged.style().extrusion_averaging(), Some(true));
+            assert!(averaged.bands().iter().all(|source| averaged.style().extrusion_averaging_for(source)));
+            assert!(panel.read(cx).playback.buffering);
+            window.click("raster-extrude-pixels", cx);
+            assert!(extrusion_averaging_pressed(window));
+            assert_eq!(window.find("raster-average-extrusion-pixels").disabled(), Some(true));
+            window.click("raster-extrude-pixels", cx);
+            window.click("raster-extrusion-height", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let before = panel.read(cx).playback_request().unwrap();
+            assert!(before.style().extrusion().unwrap().1 > 1.0);
+            assert!(extrusion_averaging_pressed(window));
+            toggle_extrusion_averaging_with_keyboard(window, cx);
+            let unaveraged = panel.read(cx).playback_request().unwrap();
+            assert_averaging_playback_controls_unchanged(&before, &unaveraged);
+            assert_eq!(unaveraged.style().extrusion_averaging(), Some(false));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let events = events.read(cx);
+            assert!(events.iter().all(|event| !event.should_fit()));
+            let last = events.last().unwrap().playback().unwrap();
+            assert_eq!(last.style().extrusion_averaging(), Some(false));
+            assert_eq!(last.position(), 1.25);
+        });
+    }
+
+    fn assert_averaging_playback_controls_unchanged(before: &PlaybackRequest, after: &PlaybackRequest) {
+        assert!(after.shares_bands(before));
+        assert_eq!(after.revision(), before.revision());
+        assert_eq!(after.position(), before.position());
+        assert_eq!(after.is_playing(), before.is_playing());
+        assert_eq!(after.bands_per_second(), before.bands_per_second());
+        assert_eq!(after.interpolation(), before.interpolation());
+        for (before, after) in before.bands().iter().zip(after.bands()) {
+            assert!(Arc::ptr_eq(before, after));
+            assert!(!after.is_extrusion_averaged(), "Shared overrides cannot restyle the raw bands");
+        }
     }
 
     #[gpui_kit::test]

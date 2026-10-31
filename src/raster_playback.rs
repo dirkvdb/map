@@ -18,6 +18,7 @@ pub struct PlaybackStyle {
     clamp_colors: Option<bool>,
     unscaling: Option<bool>,
     extrusion: Option<(bool, f32)>,
+    extrusion_averaging: Option<bool>,
 }
 
 impl PlaybackStyle {
@@ -53,6 +54,22 @@ impl PlaybackStyle {
     pub fn with_extrusion(mut self, enabled: bool, height: f32) -> Self {
         self.extrusion = Some((enabled, crate::raster_source::normalized_extrusion_height(height)));
         self
+    }
+
+    /// Overrides averaging for all playback bands without rebuilding their sources.
+    pub fn with_extrusion_averaging(mut self, enabled: bool) -> Self {
+        self.extrusion_averaging = Some(enabled);
+        self
+    }
+
+    /// The shared override, or None to retain each band's averaging setting.
+    pub fn extrusion_averaging(self) -> Option<bool> {
+        self.extrusion_averaging
+    }
+
+    /// Resolves averaging independently of whether extrusion is currently enabled.
+    pub fn extrusion_averaging_for(self, source: &RasterSource) -> bool {
+        self.extrusion_averaging().unwrap_or_else(|| source.is_extrusion_averaged())
     }
 
     pub fn extrusion(self) -> Option<(bool, f32)> {
@@ -276,6 +293,44 @@ mod tests {
         assert_eq!(style.with_unscaling(false).scale_for(&bands[0]), RasterScale::default());
         assert!(!style.unscaling_for(&bands[1]));
         assert_eq!(style.scale_for(&bands[1]), RasterScale::default());
+        Ok(())
+    }
+
+    #[test]
+    fn extrusion_averaging_defaults_to_each_band_and_supports_both_overrides() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let bands = sources(directory.path(), false)?;
+        let averaged = bands[1].with_extrusion_averaging(true)?;
+        let style = PlaybackStyle::default();
+        assert_eq!(style.extrusion_averaging(), None);
+        assert!(!style.extrusion_averaging_for(&bands[0]));
+        assert!(style.extrusion_averaging_for(&averaged));
+        for enabled in [true, false] {
+            let overridden = style.with_extrusion_averaging(enabled);
+            assert_eq!(overridden.extrusion_averaging(), Some(enabled));
+            assert_eq!(overridden.extrusion_averaging_for(&bands[0]), enabled);
+            assert_eq!(overridden.extrusion_averaging_for(&averaged), enabled);
+        }
+        assert!(!bands[0].is_extrusion_averaged());
+        assert!(averaged.is_extrusion_averaged());
+        Ok(())
+    }
+
+    #[test]
+    fn extrusion_averaging_override_survives_all_other_style_builders() -> Result<()> {
+        let style = PlaybackStyle::default().with_extrusion_averaging(true);
+        for restyled in [
+            style.with_palette(ColorMapPreset::Gray),
+            style.with_range((0.0, 100.0))?,
+            style.with_color_map_direction(ColorMapDirection::Reversed),
+            style.with_clamp_colors(false),
+            style.with_unscaling(false),
+            style.with_unscaling(true),
+            style.with_extrusion(false, 2.5),
+            style.with_extrusion(true, 7.0),
+        ] {
+            assert_eq!(restyled.extrusion_averaging(), Some(true));
+        }
         Ok(())
     }
 

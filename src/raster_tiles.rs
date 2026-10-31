@@ -1,5 +1,10 @@
 //! Numeric tile jobs and flat Web Mercator tile coverage, independent of style.
 
+#[path = "raster_extrusion_height.rs"]
+pub(crate) mod extrusion_height;
+#[path = "raster_extrusion_view.rs"]
+pub mod extrusion_view;
+
 #[cfg(test)]
 #[path = "raster_zoom_test_support.rs"]
 pub(crate) mod test_support;
@@ -229,7 +234,7 @@ mod tests {
 
     use super::*;
 
-    fn coverage_source(path: &Path, [west, south, east, north]: [f64; 4]) -> Result<Arc<RasterSource>> {
+    pub(super) fn coverage_source(path: &Path, [west, south, east, north]: [f64; 4]) -> Result<Arc<RasterSource>> {
         crate::raster_source::test_support::write_raster(path, 4326, 1)?;
         let mut dataset = gdal::Dataset::open_ex(
             path,
