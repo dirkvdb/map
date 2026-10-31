@@ -27,7 +27,7 @@ use gpui_kit::{
 use inf::colormap::{ColorMapDirection, ColorMapPreset, ProcessedColorMap};
 
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest, PlaybackStyle};
-use crate::raster_source::RasterSource;
+use crate::raster_source::{DEFAULT_EXTRUSION_HEIGHT, RasterSource};
 use crate::vector_source::{VectorLoadProgress, VectorSource};
 
 gpui_kit::actions!(raster, [OpenDataset, FitRaster, ClearRasters, ToggleRasterControls]);
@@ -1718,7 +1718,7 @@ impl RasterPanel {
                 .min(0.0)
                 .max(crate::raster_source::MAX_EXTRUSION_HEIGHT)
                 .step(0.2)
-                .default_value(1.0)
+                .default_value(DEFAULT_EXTRUSION_HEIGHT)
         });
         let subscription = cx.subscribe_in(&height, window, |this, _, event: &SliderEvent, _, cx| {
             if let SliderEvent::Change(value) = event
@@ -1731,7 +1731,8 @@ impl RasterPanel {
     }
 
     fn extrusion(&self) -> (bool, f32) {
-        self.active().map_or((false, 1.0), |source| self.playback_style().extrusion_for(source))
+        self.active()
+            .map_or((false, DEFAULT_EXTRUSION_HEIGHT), |source| self.playback_style().extrusion_for(source))
     }
 
     fn sync_extrusion_control(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3315,20 +3316,25 @@ mod tests {
             window.render_frame(cx);
             assert!(window.find("raster-visualization-card").bounds().top() >= window.find("raster-range-card").bounds().bottom());
             assert_eq!(window.find("raster-extrude-pixels").checked(), Some(false));
+            assert_eq!(
+                panel.read(cx).extrusion_height.read(cx).value().end(),
+                crate::raster_source::MAX_EXTRUSION_HEIGHT / 2.0
+            );
             window.click("raster-extrusion-height", cx);
-            assert_eq!(panel.read(cx).extrusion(), (false, 1.0));
+            assert_eq!(panel.read(cx).extrusion(), (false, DEFAULT_EXTRUSION_HEIGHT));
             window.click("raster-extrude-pixels", cx);
-            assert_eq!(panel.read(cx).extrusion(), (true, 1.0));
-            window.click("raster-extrusion-height", cx);
+            assert_eq!(panel.read(cx).extrusion(), (true, DEFAULT_EXTRUSION_HEIGHT));
+            let bounds = window.find("raster-extrusion-height").bounds();
+            window.click_at("raster-extrusion-height", point(bounds.size.width * 0.75, bounds.size.height * 0.5), cx);
         })
         .unwrap();
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             let height = panel.read(cx).extrusion().1;
-            assert!(height > 1.0);
+            assert!(height > DEFAULT_EXTRUSION_HEIGHT);
             window.click("next-raster-band", cx);
-            assert_eq!(panel.read(cx).extrusion(), (false, 1.0));
+            assert_eq!(panel.read(cx).extrusion(), (false, DEFAULT_EXTRUSION_HEIGHT));
             window.click("previous-raster-band", cx);
             assert_eq!(panel.read(cx).extrusion(), (true, height));
             assert_eq!(panel.read(cx).extrusion_height.read(cx).value().end(), height);
@@ -3573,9 +3579,9 @@ mod tests {
             let revision = panel.read(cx).playback.revision;
             window.click("raster-extrude-pixels", cx);
             assert_eq!(panel.read(cx).playback.revision, revision);
-            assert_eq!(panel.read(cx).playback_style().extrusion(), Some((true, 1.0)));
+            assert_eq!(panel.read(cx).playback_style().extrusion(), Some((true, DEFAULT_EXTRUSION_HEIGHT)));
             window.click("next-raster-band", cx);
-            assert_eq!(panel.read(cx).extrusion(), (true, 1.0));
+            assert_eq!(panel.read(cx).extrusion(), (true, DEFAULT_EXTRUSION_HEIGHT));
             panel.update(cx, |panel, cx| panel.clear(window, cx));
             window.render_frame(cx);
             assert!(window.try_find("raster-visualization-card").is_none());

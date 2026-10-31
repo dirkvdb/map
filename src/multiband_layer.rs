@@ -28,6 +28,7 @@ use geo::Tile;
 use inf::colormap::{ColorMapDirection, ColorMapPreset, ProcessedColorMap};
 use maplibre_native::{WgpuLayerParameters, texture_format_from_webgpu};
 
+use crate::raster_extrusion_animation::ExtrusionAnimation;
 use crate::raster_layer::geometry;
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest, PlaybackStyle, validate_bands};
 use crate::raster_source::RasterSource;
@@ -109,6 +110,7 @@ pub struct MultibandLayer {
     tile_size: u32,
     frame: u64,
     reduce_motion: bool,
+    extrusion_animation: ExtrusionAnimation,
     debug: bool,
     #[cfg(test)]
     requests: u64,
@@ -146,6 +148,7 @@ impl MultibandLayer {
             tile_size: 256,
             frame: 0,
             reduce_motion: false,
+            extrusion_animation: ExtrusionAnimation::default(),
             debug: false,
             #[cfg(test)]
             requests: 0,
@@ -181,6 +184,8 @@ impl MultibandLayer {
         if dataset_changed {
             self.clear_dataset();
             self.tile_size = request.bands().first().and_then(|source| source.metadata().tile_size).unwrap_or(256);
+        } else {
+            self.animate_extrusion(&request);
         }
         if command_changed {
             self.prepare_band_fade(&request);
@@ -193,6 +198,29 @@ impl MultibandLayer {
             let ready = self.frame_ready(self.clock.position());
             self.clock.resolve(self.clock.position(), ready);
         }
+    }
+
+    fn animate_extrusion(&mut self, request: &PlaybackRequest) {
+        if self.reduce_motion {
+            return;
+        }
+        let Some(previous) = &self.request else { return };
+        let Some(source) = previous.bands().get(self.endpoints(self.clock.position()).current) else {
+            return;
+        };
+        self.extrusion_animation
+            .retarget(previous.style().extrusion_for(source), request.style().extrusion_for(source), Instant::now());
+    }
+
+    fn extrusion_request(&mut self, now: Instant) -> Option<PlaybackRequest> {
+        self.extrusion_animation.advance(now);
+        let request = self.request.clone()?;
+        if !self.extrusion_animation.is_active() {
+            return Some(request);
+        }
+        let height = self.extrusion_animation.height(playback_height(&request));
+        let style = request.style().with_extrusion(height > 0.0, height);
+        Some(request.with_style(style))
     }
 
     fn prepare_band_fade(&mut self, request: &PlaybackRequest) {
@@ -215,6 +243,7 @@ impl MultibandLayer {
         self.reduce_motion = enabled;
         if enabled {
             self.band_fade = None;
+            self.extrusion_animation = ExtrusionAnimation::default();
         }
     }
 
@@ -258,7 +287,7 @@ impl MultibandLayer {
             self.cache.insert(result.key, CachedWindow { texture, used: self.frame });
             changed = true;
         }
-        changed || self.is_loading() || self.request.as_ref().is_some_and(PlaybackRequest::is_playing)
+        changed || self.is_loading() || self.extrusion_animation.is_active() || self.request.as_ref().is_some_and(PlaybackRequest::is_playing)
     }
 
     /// Loading/buffering and finite manual fades, never the perpetual fact of playing.
@@ -283,9 +312,9 @@ impl MultibandLayer {
 
     /// Paints the latest accepted frame. The surrounding host owns the render pass.
     pub fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
-        let Some(request) = self.request.clone() else { return };
-        let Some(source) = request.bands().first() else { return };
         let now = Instant::now();
+        let Some(request) = self.extrusion_request(now) else { return };
+        let Some(source) = request.bands().first() else { return };
         self.frame = self.frame.wrapping_add(1);
         let visible = self.update_coverage(self.view_tiles(parameters, &request, source), now);
         let current_ready = self.frame_ready(self.clock.position());
@@ -324,7 +353,7 @@ impl MultibandLayer {
     }
 
     fn view_tiles(&self, parameters: &WgpuLayerParameters, request: &PlaybackRequest, source: &RasterSource) -> Vec<VisibleTile> {
-        let height = playback_height(request);
+        let height = self.extrusion_animation.maximum_height(playback_height(request));
         if height <= 0.0 {
             return visible_tiles(parameters, source);
         }
@@ -360,6 +389,7 @@ impl MultibandLayer {
     }
 
     fn clear_dataset(&mut self) {
+        self.extrusion_animation = ExtrusionAnimation::default();
         self.band_fade = None;
         self.cancel_jobs();
         self.cache.clear();

@@ -18,6 +18,7 @@ use tiler::{DynamicTileProvider, LayerMetadata, LayerSourceType, TileFormat, Til
 const TILE_SIZE: u32 = 256;
 pub(crate) const EXTRUSION_HEIGHT_FACTOR: f32 = 10.0;
 pub(crate) const MAX_EXTRUSION_HEIGHT: f32 = 20.0;
+pub(crate) const DEFAULT_EXTRUSION_HEIGHT: f32 = MAX_EXTRUSION_HEIGHT / 2.0;
 const MAX_RANGE_SAMPLE_BANDS: usize = 8;
 const URL_PREFIX: &str = "raster://";
 static NEXT_STYLE_ID: AtomicU64 = AtomicU64::new(1);
@@ -54,7 +55,11 @@ pub struct RasterSource {
 
 /// Shared normalization for source snapshots and playback overrides.
 pub(crate) fn normalized_extrusion_height(height: f32) -> f32 {
-    if height.is_finite() { height.clamp(0.0, MAX_EXTRUSION_HEIGHT) } else { 1.0 }
+    if height.is_finite() {
+        height.clamp(0.0, MAX_EXTRUSION_HEIGHT)
+    } else {
+        DEFAULT_EXTRUSION_HEIGHT
+    }
 }
 
 impl RasterSource {
@@ -93,7 +98,7 @@ impl RasterSource {
             ColorMapDirection::Regular,
             range,
             unscaling_enabled,
-            (true, false, 1.0, false),
+            (true, false, DEFAULT_EXTRUSION_HEIGHT, false),
         )
     }
 

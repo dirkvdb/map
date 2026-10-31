@@ -1,7 +1,74 @@
+use std::time::Duration;
+
 use super::*;
 use crate::raster_layer::extrusion_tests::{paint_depth, sample_tile};
 use crate::raster_source::NumericTile;
 use crate::raster_tiles::test_support::device;
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_playback_toggle_animates_uniforms_without_seeking_or_reloading() -> Result<()> {
+    let (_directory, bands) = tiles::cog_fixture(3)?;
+    let (device, queue) = device()?;
+    let mut layer = MultibandLayer::new(device, queue)?;
+    let flat = tests::request(&bands, 0.5, 1).with_style(PlaybackStyle::default().with_extrusion(false, 4.0).with_extrusion_averaging(true));
+    let raised = flat.clone().with_style(flat.style().with_extrusion(true, 4.0));
+    layer.set_playback(flat.clone(), 1.0);
+    tests::load_until_idle(&mut layer)?;
+    let counts = (layer.requests, layer.uploads, layer.generation);
+    let frame = layer.playback_frame().expect("accepted frame");
+    let parameters = tests::parameters();
+    let tile = VisibleTile { z: 0, x: 0, y: 0 };
+    let endpoints = layer.endpoints(frame.position());
+
+    layer.set_playback(raised.clone(), 1.0);
+    assert_eq!(layer.extrusion_animation.height(4.0), 0.0);
+    assert!(layer.poll_tiles(), "Paused playback must repaint during an extrusion transition");
+    let now = Instant::now();
+    let growing = layer.extrusion_request(now + Duration::from_millis(90)).expect("render request");
+    let data = draw_uniform(&parameters, tile, [&bands[0], &bands[1]], endpoints, layer.window_size, 1.0, growing.style());
+    assert!(data.extrusion[2] > 0.0);
+    assert!(data.extrusion[3] > 0.0 && data.extrusion[3] < 4.0);
+    assert_eq!(data.geometry[3], 3, "Averaging must remain active while bars grow");
+    layer.extrusion_request(now + Duration::from_secs(1));
+
+    layer.set_playback(flat.clone(), 1.0);
+    assert_eq!(layer.extrusion_animation.height(0.0), 4.0);
+    let now = Instant::now();
+    let shrinking = layer.extrusion_request(now + Duration::from_millis(90)).expect("render request");
+    let data = draw_uniform(&parameters, tile, [&bands[0], &bands[1]], endpoints, layer.window_size, 1.0, shrinking.style());
+    assert!(data.extrusion[3] > 0.0 && data.extrusion[3] < 4.0);
+    assert_eq!(data.geometry[3], 3, "Averaging must remain active until bars reach ground");
+    assert_eq!(layer.extrusion_animation.maximum_height(0.0), 4.0);
+    let settled = layer.extrusion_request(now + Duration::from_secs(1)).expect("render request");
+    assert_eq!(settled.style().extrusion(), Some((false, 4.0)), "Keep the user's configured height");
+    assert!(!layer.poll_tiles());
+    assert_eq!((layer.requests, layer.uploads, layer.generation), counts);
+    let after = layer.playback_frame().expect("accepted frame");
+    assert_eq!((after.position(), after.revision()), (frame.position(), frame.revision()));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_playback_toggle_honors_reduced_motion_and_clearing() -> Result<()> {
+    let (_directory, bands) = tiles::cog_fixture(3)?;
+    let (device, queue) = device()?;
+    let mut layer = MultibandLayer::new(device, queue)?;
+    let flat = tests::request(&bands, 0.5, 1).with_style(PlaybackStyle::default().with_extrusion(false, 4.0));
+    let raised = flat.clone().with_style(flat.style().with_extrusion(true, 4.0));
+    layer.set_playback(flat.clone(), 1.0);
+    layer.set_playback(raised.clone(), 1.0);
+    layer.set_reduce_motion(true);
+    assert_eq!(layer.extrusion_request(Instant::now()).unwrap().style().extrusion(), Some((true, 4.0)));
+    layer.set_playback(flat, 1.0);
+    assert!(!layer.extrusion_animation.is_active());
+    layer.set_reduce_motion(false);
+    layer.set_playback(raised, 1.0);
+    layer.clear_dataset();
+    assert!(!layer.extrusion_animation.is_active());
+    Ok(())
+}
 
 #[test]
 #[ignore = "requires a native graphics device"]

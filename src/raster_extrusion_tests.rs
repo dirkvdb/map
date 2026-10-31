@@ -3,12 +3,76 @@ use crate::raster_playback::{PlaybackRequest, PlaybackStyle};
 use crate::raster_tiles::test_support::{device, parameters};
 
 #[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_static_toggle_animates_without_invalidating_raw_tiles() -> Result<()> {
+    let (_directory, bands) = crate::raster_source::test_support::cog_fixture(1)?;
+    let flat = bands[0].with_extrusion(false, 4.0)?.with_extrusion_averaging(true)?;
+    let raised = flat.with_extrusion(true, 4.0)?;
+    let (device, queue) = device()?;
+    let mut layer = RasterLayer::new(device, queue)?;
+    layer.set_source(Some(flat.clone()), 1.0, 1);
+    let root = Tile { z: 0, x: 0, y: 0 };
+    layer.cache.insert(root, CachedTile { texture: None, used: 0 });
+    let generation = layer.generation;
+
+    layer.set_source(Some(raised.clone()), 1.0, 1);
+    let now = Instant::now();
+    assert_eq!(layer.extrusion_animation.height(4.0), 0.0, "Enabling must start at ground level");
+    assert!(layer.poll_tiles(), "An otherwise idle map must keep pumping the height transition");
+    layer.extrusion_animation.advance(now + Duration::from_millis(90));
+    assert!((0.0..4.0).contains(&layer.extrusion_animation.height(4.0)));
+    layer.extrusion_animation.advance(now + Duration::from_secs(1));
+    assert_eq!(layer.extrusion_animation.height(4.0), 4.0);
+
+    layer.set_source(Some(flat.clone()), 1.0, 1);
+    let now = Instant::now();
+    assert_eq!(layer.extrusion_animation.height(0.0), 4.0, "Disabling must retain the visible height initially");
+    assert_eq!(layer.extrusion_animation.maximum_height(0.0), 4.0, "Shrinking bars still need volume coverage");
+    layer.extrusion_animation.advance(now + Duration::from_millis(90));
+    assert!((0.0..4.0).contains(&layer.extrusion_animation.height(0.0)));
+    layer.extrusion_animation.advance(now + Duration::from_secs(1));
+    assert_eq!(layer.extrusion_animation.height(0.0), 0.0);
+    assert!(!layer.poll_tiles(), "The transition must stop scheduling frames after reaching ground");
+    assert_eq!(layer.generation, generation);
+    assert!(layer.cache.contains_key(&root));
+    assert!(layer.previous.is_none());
+    assert_eq!(layer.tile_counts(), (0, 0));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_static_toggle_honors_reduced_motion_and_clearing() -> Result<()> {
+    let (_directory, bands) = crate::raster_source::test_support::cog_fixture(1)?;
+    let flat = bands[0].with_extrusion(false, 4.0)?;
+    let raised = flat.with_extrusion(true, 4.0)?;
+    let (device, queue) = device()?;
+    let mut layer = RasterLayer::new(device, queue)?;
+    layer.set_source(Some(flat.clone()), 1.0, 1);
+    layer.set_source(Some(raised.clone()), 1.0, 1);
+    layer.set_reduce_motion(true);
+    assert!(!layer.extrusion_animation.is_active());
+    assert_eq!(layer.extrusion_animation.height(4.0), 4.0);
+    layer.set_source(Some(flat), 1.0, 1);
+    assert_eq!(layer.extrusion_animation.height(0.0), 0.0);
+    layer.set_reduce_motion(false);
+    layer.set_source(Some(raised), 1.0, 1);
+    assert!(layer.extrusion_animation.is_active());
+    layer.set_source(None, 1.0, 1);
+    assert!(!layer.extrusion_animation.is_active());
+    Ok(())
+}
+
+#[test]
 fn extrusion_snapshots_preserve_style_and_raw_identity() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("extrusion.tif");
     crate::raster_source::test_support::write_byte_raster(&path)?;
     let source = RasterSource::open(&path)?.remove(0);
-    assert_eq!((source.is_extruded(), source.extrusion_height()), (false, 1.0));
+    assert_eq!(
+        (source.is_extruded(), source.extrusion_height()),
+        (false, crate::raster_source::MAX_EXTRUSION_HEIGHT / 2.0)
+    );
     let raised = source.with_extrusion(true, 3.0)?;
     let changed = raised
         .restyled(ColorMapPreset::Gray, (0.0, 255.0))?
@@ -31,7 +95,7 @@ fn extrusion_snapshots_preserve_style_and_raw_identity() -> Result<()> {
 #[test]
 fn extrusion_height_normalizes_and_sampling_grid_does_not_change_height() -> Result<()> {
     let (_directory, sources) = crate::raster_source::test_support::cog_fixture(1)?;
-    for (input, expected) in [(-1.0, 0.0), (11.0, 11.0), (20.0, 20.0), (21.0, 20.0), (f32::NAN, 1.0), (f32::INFINITY, 1.0)] {
+    for (input, expected) in [(-1.0, 0.0), (11.0, 11.0), (20.0, 20.0), (21.0, 20.0), (f32::NAN, 10.0), (f32::INFINITY, 10.0)] {
         assert_eq!(PlaybackStyle::default().with_extrusion(true, input).extrusion(), Some((true, expected)));
         assert_eq!(sources[0].with_extrusion(true, input)?.extrusion_height(), expected);
     }
