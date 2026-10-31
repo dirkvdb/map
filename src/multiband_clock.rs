@@ -6,12 +6,68 @@ use std::time::{Duration, Instant};
 pub(super) const DEFAULT_WINDOW: usize = 20;
 // A suspended render loop is a discontinuity, not a backlog to replay on resume.
 const MAX_FRAME_GAP: Duration = Duration::from_millis(250);
+const BAND_FADE: Duration = Duration::from_millis(180);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Endpoints {
     pub current: usize,
     pub next: usize,
     pub fraction: f32,
+}
+
+/// Manual band selections crossfade directly, without traversing intervening bands.
+pub(super) struct BandFade {
+    pub from: Endpoints,
+    pub to: usize,
+    last_frame: Option<Instant>,
+    elapsed: Duration,
+}
+
+impl BandFade {
+    pub fn new(from: usize, to: usize) -> Self {
+        Self::from_frame(
+            Endpoints {
+                current: from,
+                next: from,
+                fraction: 0.0,
+            },
+            to,
+        )
+    }
+
+    pub fn from_frame(from: Endpoints, to: usize) -> Self {
+        Self {
+            from,
+            to,
+            last_frame: None,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    pub fn retarget(&mut self, to: usize) {
+        // Keep an in-progress blend intact; the latest selection follows it.
+        if self.last_frame.is_none() {
+            self.to = to;
+        }
+    }
+
+    pub fn frame(&mut self, now: Instant, ready: bool) -> Endpoints {
+        if ready {
+            if let Some(last) = self.last_frame.replace(now) {
+                // Newly cached windows still need GPU upload/submission. Do not
+                // let one slow frame consume the whole fade without a blend.
+                self.elapsed += now.saturating_duration_since(last).min(BAND_FADE / 2);
+            }
+        } else if self.last_frame.is_some() {
+            self.last_frame = Some(now);
+        }
+        let fraction = (self.elapsed.as_secs_f32() / BAND_FADE.as_secs_f32()).min(1.0);
+        Endpoints {
+            current: self.from.current,
+            next: self.to,
+            fraction,
+        }
+    }
 }
 
 pub(super) fn endpoints(position: f64, count: usize, interpolate: bool) -> Endpoints {
@@ -124,6 +180,67 @@ impl PlaybackClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_band_fade_waits_for_data_then_blends_directly_to_the_selected_band() {
+        let now = Instant::now();
+        let mut fade = BandFade::new(2, 42);
+        assert_eq!(
+            fade.frame(now, false),
+            Endpoints {
+                current: 2,
+                next: 42,
+                fraction: 0.0
+            }
+        );
+        let start = now + Duration::from_secs(30);
+        assert_eq!(fade.frame(start, true).fraction, 0.0);
+        assert_eq!(fade.frame(start + BAND_FADE / 2, true).fraction, 0.5);
+        assert_eq!(fade.frame(start + BAND_FADE * 2, true).fraction, 1.0);
+    }
+
+    #[test]
+    fn manual_band_fade_retargets_loading_but_finishes_an_active_blend() {
+        let now = Instant::now();
+        let mut fade = BandFade::new(2, 3);
+        fade.retarget(42);
+        assert_eq!(
+            fade.frame(now, true),
+            Endpoints {
+                current: 2,
+                next: 42,
+                fraction: 0.0
+            }
+        );
+        fade.retarget(7);
+        assert_eq!(
+            fade.frame(now + BAND_FADE / 2, true),
+            Endpoints {
+                current: 2,
+                next: 42,
+                fraction: 0.5
+            }
+        );
+    }
+
+    #[test]
+    fn manual_band_fade_keeps_a_blended_frame_after_a_slow_upload() {
+        let now = Instant::now();
+        let mut fade = BandFade::new(0, 42);
+        assert_eq!(fade.frame(now, true).fraction, 0.0);
+        assert_eq!(fade.frame(now + Duration::from_secs(2), true).fraction, 0.5);
+        assert_eq!(fade.frame(now + Duration::from_secs(4), true).fraction, 1.0);
+    }
+
+    #[test]
+    fn manual_band_fade_does_not_advance_while_replacement_coverage_loads() {
+        let now = Instant::now();
+        let mut fade = BandFade::new(0, 42);
+        fade.frame(now, true);
+        assert_eq!(fade.frame(now + Duration::from_millis(45), true).fraction, 0.25);
+        assert_eq!(fade.frame(now + Duration::from_secs(10), false).fraction, 0.25);
+        assert_eq!(fade.frame(now + Duration::from_secs(10), true).fraction, 0.25);
+    }
 
     #[test]
     fn final_band_interpolates_back_to_first() {

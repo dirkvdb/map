@@ -7,6 +7,12 @@
 
 #[path = "multiband_clock.rs"]
 mod clock;
+#[cfg(test)]
+#[path = "multiband_extrusion_tests.rs"]
+mod extrusion_tests;
+#[cfg(test)]
+#[path = "multiband_layer_fade_tests.rs"]
+mod fade_tests;
 #[path = "multiband_tiles.rs"]
 mod tiles;
 #[cfg(test)]
@@ -22,10 +28,12 @@ use geo::Tile;
 use inf::colormap::{ColorMapDirection, ColorMapPreset, ProcessedColorMap};
 use maplibre_native::{WgpuLayerParameters, texture_format_from_webgpu};
 
+use crate::raster_extrusion_animation::ExtrusionAnimation;
+use crate::raster_layer::geometry;
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest, PlaybackStyle, validate_bands};
 use crate::raster_source::RasterSource;
-use crate::raster_tiles::{VisibleTile, tile_matrix, visible_tiles};
-use clock::{DEFAULT_WINDOW, Endpoints, PlaybackClock, endpoints, next_window, window_range, window_start};
+use crate::raster_tiles::{VisibleTile, extrusion_view, tile_matrix, visible_tiles};
+use clock::{BandFade, DEFAULT_WINDOW, Endpoints, PlaybackClock, endpoints, next_window, window_range, window_start};
 use tiles::{CachedWindow, MAX_CACHE_ENTRIES, MAX_GRID_BYTES, MAX_JOBS, MAX_VISIBLE_TILES, WindowKey, WindowTexture, WindowWorkers};
 
 #[repr(C)]
@@ -36,14 +44,21 @@ struct DrawUniform {
     next_scale: [f32; 2],
     range: [f32; 2],
     next_range: [f32; 2],
-    // blend, opacity, screen-space tile size, reserved
+    // blend, opacity, screen-space tile size, manual color crossfade
     parameters: [f32; 4],
     // current array layer, next array layer, clamp colors, debug status
     layers: [u32; 4],
+    extrusion: [f32; 4],
+    // X/Y strides, traversal flags, current/next averaging bits.
+    geometry: [u32; 4],
+    outgoing_scale: [f32; 2],
+    outgoing_range: [f32; 2],
+    // Outgoing temporal fraction, extra array layer, reserved, averaging bit.
+    outgoing: [f32; 4],
 }
 
 struct DrawTile {
-    sampled: [Option<WindowKey>; 2],
+    sampled: [Option<WindowKey>; 3],
     uniform: wgpu::Buffer,
     bindings: wgpu::BindGroup,
 }
@@ -54,15 +69,19 @@ struct RetainedFrame {
     draws: HashMap<VisibleTile, DrawTile>,
     frame: Endpoints,
     window_size: usize,
+    fade_from: Option<Endpoints>,
 }
 
 struct MultibandPipeline {
     formats: (u32, u32, bool),
     pipeline: wgpu::RenderPipeline,
+    extrusion_pipeline: wgpu::RenderPipeline,
+    extrusion_indices: wgpu::Buffer,
     layout: wgpu::BindGroupLayout,
     palette: wgpu::Texture,
     palette_view: wgpu::TextureView,
     palette_key: Option<(ColorMapPreset, ColorMapDirection)>,
+    palette_opaque: bool,
     empty: WindowTexture,
     #[cfg(test)]
     palette_uploads: u64,
@@ -75,6 +94,7 @@ pub struct MultibandLayer {
     request: Option<PlaybackRequest>,
     opacity: f32,
     clock: PlaybackClock,
+    band_fade: Option<BandFade>,
     workers: WindowWorkers,
     generation: u64,
     pending: HashSet<WindowKey>,
@@ -90,6 +110,7 @@ pub struct MultibandLayer {
     tile_size: u32,
     frame: u64,
     reduce_motion: bool,
+    extrusion_animation: ExtrusionAnimation,
     debug: bool,
     #[cfg(test)]
     requests: u64,
@@ -111,6 +132,7 @@ impl MultibandLayer {
             request: None,
             opacity: 1.0,
             clock: PlaybackClock::new(Instant::now()),
+            band_fade: None,
             workers: WindowWorkers::new()?,
             generation: 0,
             pending: HashSet::new(),
@@ -126,6 +148,7 @@ impl MultibandLayer {
             tile_size: 256,
             frame: 0,
             reduce_motion: false,
+            extrusion_animation: ExtrusionAnimation::default(),
             debug: false,
             #[cfg(test)]
             requests: 0,
@@ -161,8 +184,11 @@ impl MultibandLayer {
         if dataset_changed {
             self.clear_dataset();
             self.tile_size = request.bands().first().and_then(|source| source.metadata().tile_size).unwrap_or(256);
+        } else {
+            self.animate_extrusion(&request);
         }
         if command_changed {
+            self.prepare_band_fade(&request);
             self.retained = None;
             self.cancel_jobs();
             self.clock.seek(request.position(), request.bands().len(), Instant::now());
@@ -174,9 +200,51 @@ impl MultibandLayer {
         }
     }
 
+    fn animate_extrusion(&mut self, request: &PlaybackRequest) {
+        if self.reduce_motion {
+            return;
+        }
+        let Some(previous) = &self.request else { return };
+        let Some(source) = previous.bands().get(self.endpoints(self.clock.position()).current) else {
+            return;
+        };
+        self.extrusion_animation
+            .retarget(previous.style().extrusion_for(source), request.style().extrusion_for(source), Instant::now());
+    }
+
+    fn extrusion_request(&mut self, now: Instant) -> Option<PlaybackRequest> {
+        self.extrusion_animation.advance(now);
+        let request = self.request.clone()?;
+        if !self.extrusion_animation.is_active() {
+            return Some(request);
+        }
+        let height = self.extrusion_animation.height(playback_height(&request));
+        let style = request.style().with_extrusion(height > 0.0, height);
+        Some(request.with_style(style))
+    }
+
+    fn prepare_band_fade(&mut self, request: &PlaybackRequest) {
+        let position = request.position();
+        if self.reduce_motion || request.is_playing() || !position.is_finite() || position.fract() != 0.0 {
+            self.band_fade = None;
+            return;
+        }
+        let to = endpoints(position, request.bands().len(), false).current;
+        if let Some(fade) = &mut self.band_fade {
+            fade.retarget(to);
+        } else if !self.clock.is_buffering() {
+            let from = self.endpoints(self.clock.position());
+            self.band_fade = (from.current != to || from.fraction > 0.0).then(|| BandFade::from_frame(from, to));
+        }
+    }
+
     /// Turns off temporal interpolation, not user-requested playback.
     pub fn set_reduce_motion(&mut self, enabled: bool) {
         self.reduce_motion = enabled;
+        if enabled {
+            self.band_fade = None;
+            self.extrusion_animation = ExtrusionAnimation::default();
+        }
     }
 
     /// Shows tile boundaries, orange while the global readiness barrier is closed.
@@ -219,13 +287,16 @@ impl MultibandLayer {
             self.cache.insert(result.key, CachedWindow { texture, used: self.frame });
             changed = true;
         }
-        changed || self.is_loading() || self.request.as_ref().is_some_and(PlaybackRequest::is_playing)
+        changed || self.is_loading() || self.extrusion_animation.is_active() || self.request.as_ref().is_some_and(PlaybackRequest::is_playing)
     }
 
-    /// Loading/buffering only, never the perpetual fact of playing.
+    /// Loading/buffering and finite manual fades, never the perpetual fact of playing.
     pub fn is_loading(&self) -> bool {
         self.request.as_ref().is_some_and(|request| !request.bands().is_empty())
-            && (self.clock.is_buffering() || !self.pending.is_empty() || self.wanted.iter().any(|key| !self.cache.contains_key(key)))
+            && (self.band_fade.is_some()
+                || self.clock.is_buffering()
+                || !self.pending.is_empty()
+                || self.wanted.iter().any(|key| !self.cache.contains_key(key)))
     }
 
     /// Feedback carries the accepted position, never the speculative buffered frame.
@@ -241,11 +312,11 @@ impl MultibandLayer {
 
     /// Paints the latest accepted frame. The surrounding host owns the render pass.
     pub fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
-        let Some(request) = self.request.clone() else { return };
-        let Some(source) = request.bands().first() else { return };
         let now = Instant::now();
+        let Some(request) = self.extrusion_request(now) else { return };
+        let Some(source) = request.bands().first() else { return };
         self.frame = self.frame.wrapping_add(1);
-        let visible = self.update_coverage(visible_tiles(parameters, source), now);
+        let visible = self.update_coverage(self.view_tiles(parameters, &request, source), now);
         let current_ready = self.frame_ready(self.clock.position());
         if current_ready || visible.is_empty() {
             self.retained = None;
@@ -259,13 +330,38 @@ impl MultibandLayer {
         self.clock.resolve(proposed, ready);
         self.schedule_windows(&request, &visible);
         self.prepare_pipeline(parameters);
-        let frame = self.endpoints(self.clock.position());
+        let frame = self.display_frame(now);
         if self.retained.is_some() {
             self.draw_retained_frame(pass, parameters, &request);
         } else {
             self.draw_frame(pass, parameters, &request, &visible, frame);
         }
         self.make_room(0);
+    }
+
+    fn display_frame(&mut self, now: Instant) -> Endpoints {
+        let target = self.endpoints(self.clock.position());
+        let Some(mut fade) = self.band_fade.take() else { return target };
+        let ready = self.frame_ready(fade.from.current as f64) && self.frame_ready(fade.from.next as f64) && self.frame_ready(fade.to as f64);
+        let frame = fade.frame(now, ready);
+        if frame.fraction < 1.0 {
+            self.band_fade = Some(fade);
+        } else if fade.to != target.current {
+            self.band_fade = Some(BandFade::new(fade.to, target.current));
+        }
+        frame
+    }
+
+    fn view_tiles(&self, parameters: &WgpuLayerParameters, request: &PlaybackRequest, source: &RasterSource) -> Vec<VisibleTile> {
+        let height = self.extrusion_animation.maximum_height(playback_height(request));
+        if height <= 0.0 {
+            return visible_tiles(parameters, source);
+        }
+
+        let bytes_per_band = self.tile_size as usize * self.tile_size as usize * 5;
+        let limit = (MAX_GRID_BYTES / (3 * bytes_per_band)).clamp(1, MAX_VISIBLE_TILES);
+        // Cached/retained grid heights must not cap the replacement's request LOD.
+        extrusion_view::visible_tiles(parameters, &[(source, height)], limit)
     }
 
     fn validate_request(&mut self, request: &PlaybackRequest) -> Result<()> {
@@ -293,6 +389,8 @@ impl MultibandLayer {
     }
 
     fn clear_dataset(&mut self) {
+        self.extrusion_animation = ExtrusionAnimation::default();
+        self.band_fade = None;
         self.cancel_jobs();
         self.cache.clear();
         self.cache_bytes = 0;
@@ -318,10 +416,12 @@ impl MultibandLayer {
         let resized = size != self.window_size;
         let changed_zoom = self.coverage.iter().next().map(|tile| tile.z) != visible.first().map(|tile| tile.z);
         if (changed_zoom || resized) && self.retained.is_none() && self.draws.values().any(|draw| draw.sampled.iter().any(Option::is_some)) {
+            let frame = self.display_frame(now);
             self.retained = Some(RetainedFrame {
                 draws: std::mem::take(&mut self.draws),
-                frame: self.endpoints(self.clock.position()),
+                frame,
                 window_size: self.window_size,
+                fade_from: self.band_fade.as_ref().map(|fade| fade.from),
             });
         }
         if resized {
@@ -359,13 +459,24 @@ impl MultibandLayer {
         let current = self.endpoints(self.clock.position());
         let incoming = self.endpoints(proposed);
         let start = window_start(incoming.current, self.window_size);
-        let starts = [
+        let mut starts = [
             window_start(current.current, self.window_size),
             window_start(current.next, self.window_size),
             start,
             window_start(incoming.next, self.window_size),
             next_window(start, self.window_size, count),
         ];
+        if let Some(fade) = &self.band_fade {
+            // A fractional outgoing frame can span two windows. Reserve the
+            // third for this fade's target; queued selections wait their turn.
+            starts = [
+                window_start(fade.from.current, self.window_size),
+                window_start(fade.from.next, self.window_size),
+                window_start(fade.to, self.window_size),
+                window_start(fade.from.current, self.window_size),
+                window_start(fade.to, self.window_size),
+            ];
+        }
         self.wanted.clear();
         for tile in &self.coverage {
             for start in starts {
@@ -454,14 +565,28 @@ impl MultibandLayer {
         let Some(retained) = &self.retained else { return };
         let Some(source) = request.bands().get(retained.frame.current) else { return };
         let Some(next) = request.bands().get(retained.frame.next) else { return };
+        let debug_status = self.debug_status();
         let Some(pipeline) = &mut self.pipeline else { return };
         pipeline.update_palette(
             &self.queue,
             (request.style().palette_for(source), request.style().color_map_direction_for(source)),
         );
-        pass.set_pipeline(&pipeline.pipeline);
-        for (&tile, draw) in &retained.draws {
-            let data = draw_uniform(
+        pass.set_pipeline(if request.style().extrusion_for(source).0 && request.style().extrusion_for(source).1 > 0.0 {
+            &pipeline.extrusion_pipeline
+        } else {
+            &pipeline.pipeline
+        });
+        let mut tiles: Vec<_> = retained.draws.keys().copied().collect();
+        pipeline.sort_tiles(
+            parameters,
+            &mut tiles,
+            self.opacity,
+            retained.frame.fraction,
+            request.style().extrusion_for(source).0,
+        );
+        for tile in tiles {
+            let draw = &retained.draws[&tile];
+            let mut data = draw_uniform(
                 parameters,
                 tile,
                 [source, next],
@@ -470,7 +595,11 @@ impl MultibandLayer {
                 self.opacity,
                 request.style(),
             );
-            paint_draw(&self.queue, pass, draw, data, self.debug_status());
+            apply_band_fade(&mut data, retained.fade_from, request, retained.window_size);
+            if !extrusion_visible(parameters, tile, &data) {
+                continue;
+            }
+            paint_draw(&self.queue, pass, draw, data, debug_status, pipeline, parameters);
         }
     }
 
@@ -488,15 +617,22 @@ impl MultibandLayer {
     ) {
         let Some(source) = request.bands().get(frame.current) else { return };
         let Some(next) = request.bands().get(frame.next) else { return };
+        let fade_from = self.band_fade.as_ref().map(|fade| fade.from);
         let debug_status = self.debug_status();
         let Some(pipeline) = &mut self.pipeline else { return };
         pipeline.update_palette(
             &self.queue,
             (request.style().palette_for(source), request.style().color_map_direction_for(source)),
         );
-        pass.set_pipeline(&pipeline.pipeline);
-        for &tile in visible {
-            let keys = [frame.current, frame.next].map(|band| WindowKey {
+        pass.set_pipeline(if request.style().extrusion_for(source).0 && request.style().extrusion_for(source).1 > 0.0 {
+            &pipeline.extrusion_pipeline
+        } else {
+            &pipeline.pipeline
+        });
+        let mut tiles = visible.to_vec();
+        pipeline.sort_tiles(parameters, &mut tiles, self.opacity, frame.fraction, request.style().extrusion_for(source).0);
+        for tile in tiles {
+            let keys = [frame.current, frame.next, fade_from.map_or(frame.current, |from| from.next)].map(|band| WindowKey {
                 tile: tile.canonical(),
                 start: window_start(band, self.window_size),
             });
@@ -506,8 +642,9 @@ impl MultibandLayer {
             if draw.sampled != sampled {
                 *draw = pipeline.draw_tile(&self.device, sampled, textures);
             }
-            let data = draw_uniform(parameters, tile, [source, next], frame, self.window_size, self.opacity, request.style());
-            paint_draw(&self.queue, pass, draw, data, debug_status);
+            let mut data = draw_uniform(parameters, tile, [source, next], frame, self.window_size, self.opacity, request.style());
+            apply_band_fade(&mut data, fade_from, request, self.window_size);
+            paint_draw(&self.queue, pass, draw, data, debug_status, pipeline, parameters);
             #[cfg(test)]
             {
                 self.uniform_writes += 1;
@@ -516,14 +653,53 @@ impl MultibandLayer {
     }
 }
 
-fn paint_draw(queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'_>, draw: &DrawTile, mut data: DrawUniform, debug_status: u32) {
+fn extrusion_visible(parameters: &WgpuLayerParameters, tile: VisibleTile, data: &DrawUniform) -> bool {
+    data.extrusion[3] <= 0.0 || extrusion_view::tile_visible(parameters, tile, f64::from(data.extrusion[2]))
+}
+
+fn playback_height(request: &PlaybackRequest) -> f32 {
+    if let Some((enabled, height)) = request.style().extrusion() {
+        return if enabled { height } else { 0.0 };
+    }
+    request
+        .bands()
+        .iter()
+        .map(|source| {
+            let (enabled, height) = request.style().extrusion_for(source);
+            if enabled { height } else { 0.0 }
+        })
+        .fold(0.0, f32::max)
+}
+
+fn paint_draw(
+    queue: &wgpu::Queue,
+    pass: &mut wgpu::RenderPass<'_>,
+    draw: &DrawTile,
+    mut data: DrawUniform,
+    debug_status: u32,
+    pipeline: &MultibandPipeline,
+    parameters: &WgpuLayerParameters,
+) {
     for (layer, sampled) in data.layers[..2].iter_mut().zip(draw.sampled) {
         *layer = sampled.map_or(0, |_| *layer);
     }
+    if draw.sampled[2].is_none() {
+        data.outgoing[1] = 0.0;
+    }
     data.layers[3] = debug_status;
+    data.geometry = geometry::with_averaging(
+        geometry::plan(
+            &data.matrix,
+            [parameters.width, parameters.height],
+            data.extrusion,
+            pipeline.opaque(data.parameters[1], data.parameters[0]) && data.outgoing[0] <= 0.0,
+        ),
+        data.geometry[3],
+        data.parameters[0],
+    );
     queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&data));
     pass.set_bind_group(0, &draw.bindings, &[]);
-    pass.draw(0..6, 0..1);
+    crate::raster_layer::draw_pixels(pass, data.extrusion, data.geometry, &pipeline.extrusion_indices);
 }
 
 fn adaptive_window_size(current: usize, maximum: usize, bytes_per_band: usize, tile_count: usize) -> usize {
@@ -552,6 +728,14 @@ fn coarsen_coverage(visible: &mut Vec<VisibleTile>, limit: usize) {
     }
 }
 
+fn averaging_flags(style: PlaybackStyle, sources: [&RasterSource; 2], extruded: bool) -> u32 {
+    if !extruded {
+        return 0;
+    }
+    let enabled = sources.map(|source| style.extrusion_averaging_for(source));
+    u32::from(enabled[0]) | (u32::from(enabled[1]) << 1)
+}
+
 fn draw_uniform(
     parameters: &WgpuLayerParameters,
     tile: VisibleTile,
@@ -563,7 +747,11 @@ fn draw_uniform(
 ) -> DrawUniform {
     let scales = sources.map(|source| style.scale_for(source));
     let ranges = sources.map(|source| style.range_for(source));
+    let (enabled, height) = style.extrusion_for(sources[0]);
+    let pixels = sources[0].metadata().tile_size.unwrap_or(256);
     DrawUniform {
+        extrusion: crate::raster_layer::extrusion_uniform(parameters, sources[0], [pixels; 2], if enabled { height } else { 0.0 }),
+        geometry: geometry::with_averaging([0; 4], averaging_flags(style, sources, enabled), frame.fraction),
         matrix: tile_matrix(&parameters.projection, parameters.zoom, tile),
         scale: [scales[0].scale as f32, scales[0].offset as f32],
         next_scale: [scales[1].scale as f32, scales[1].offset as f32],
@@ -581,13 +769,38 @@ fn draw_uniform(
             u32::from(style.clamp_colors_for(sources[0])),
             0,
         ],
+        outgoing_scale: [0.0; 2],
+        outgoing_range: [0.0; 2],
+        outgoing: [0.0; 4],
     }
 }
 
+fn apply_band_fade(data: &mut DrawUniform, from: Option<Endpoints>, request: &PlaybackRequest, size: usize) {
+    let Some(from) = from else { return };
+    let Some(source) = request.bands().get(from.next) else { return };
+    let style = request.style();
+    let scale = style.scale_for(source);
+    let range = style.range_for(source);
+    data.parameters[3] = 1.0;
+    data.outgoing_scale = [scale.scale as f32, scale.offset as f32];
+    data.outgoing_range = [range.0, range.1];
+    data.outgoing = [from.fraction, (from.next % size) as f32, 0.0, f32::from(style.extrusion_averaging_for(source))];
+}
+
 impl MultibandPipeline {
+    fn sort_tiles(&self, parameters: &WgpuLayerParameters, tiles: &mut [VisibleTile], opacity: f32, blend: f32, extruded: bool) {
+        if extruded && self.opaque(opacity, blend) {
+            geometry::sort_tiles(parameters, tiles);
+        }
+    }
+
+    fn opaque(&self, opacity: f32, blend: f32) -> bool {
+        self.palette_opaque && opacity >= 1.0 && (blend <= 0.0 || blend >= 1.0)
+    }
+
     fn new(device: &wgpu::Device, formats: (u32, u32, bool)) -> Self {
         let layout = create_layout(device);
-        let pipeline = create_pipeline(device, formats, &layout);
+        let pipeline = create_pipeline(device, formats, &layout, false);
         let palette = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Multiband palette"),
             size: wgpu::Extent3d {
@@ -615,10 +828,13 @@ impl MultibandPipeline {
         Self {
             formats,
             pipeline,
+            extrusion_pipeline: create_pipeline(device, formats, &layout, true),
+            extrusion_indices: crate::raster_layer::create_extrusion_indices(device),
             layout,
             palette,
             palette_view,
             palette_key: None,
+            palette_opaque: false,
             empty,
             #[cfg(test)]
             palette_uploads: 0,
@@ -651,13 +867,14 @@ impl MultibandPipeline {
             },
         );
         self.palette_key = Some(key);
+        self.palette_opaque = rgba.as_chunks::<4>().0.iter().all(|color| color[3] == 255);
         #[cfg(test)]
         {
             self.palette_uploads += 1;
         }
     }
 
-    fn draw_tile(&self, device: &wgpu::Device, sampled: [Option<WindowKey>; 2], textures: [Option<&WindowTexture>; 2]) -> DrawTile {
+    fn draw_tile(&self, device: &wgpu::Device, sampled: [Option<WindowKey>; 3], textures: [Option<&WindowTexture>; 3]) -> DrawTile {
         let textures = textures.map(|texture| texture.unwrap_or(&self.empty));
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Multiband frame uniform"),
@@ -671,6 +888,8 @@ impl MultibandPipeline {
             &textures[1].values,
             &textures[1].mask,
             &self.palette_view,
+            &textures[2].values,
+            &textures[2].mask,
         ];
         let mut entries = vec![wgpu::BindGroupEntry {
             binding: 0,
@@ -700,9 +919,9 @@ fn create_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         },
         count: None,
     }];
-    entries.extend((1..=5).map(|binding| wgpu::BindGroupLayoutEntry {
+    entries.extend((1..=7).map(|binding| wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
+        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: false },
             view_dimension: if binding == 5 {
@@ -720,30 +939,42 @@ fn create_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wgpu::BindGroupLayout) -> wgpu::RenderPipeline {
+fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wgpu::BindGroupLayout, extruded: bool) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Multiband pipeline layout"),
         bind_group_layouts: &[Some(layout)],
         immediate_size: 0,
     });
+    let entry_points = if extruded {
+        concat!(include_str!("multiband_extrusion_sample.wgsl"), "\n", include_str!("raster_extrusion.wgsl"))
+    } else {
+        include_str!("multiband_layer.wgsl")
+    };
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Multiband shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("multiband_layer.wgsl").into()),
+        label: Some(if extruded { "Multiband extrusion shader" } else { "Multiband shader" }),
+        source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", include_str!("multiband_sample.wgsl"), entry_points).into()),
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Multiband raster"),
+        label: Some(if extruded { "Multiband raster extrusion" } else { "Multiband raster" }),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: Some("vertex"),
+            entry_point: Some(if extruded { "extruded_vertex" } else { "vertex" }),
             compilation_options: Default::default(),
             buffers: &[],
         },
-        primitive: Default::default(),
+        primitive: wgpu::PrimitiveState {
+            front_face: wgpu::FrontFace::Cw,
+            cull_mode: extruded.then_some(wgpu::Face::Back),
+            ..Default::default()
+        },
         depth_stencil: (formats.1 != 0).then(|| wgpu::DepthStencilState {
             format: texture_format_from_webgpu(formats.1),
-            depth_write_enabled: Some(false),
-            depth_compare: Some(if formats.2 {
+            depth_write_enabled: Some(extruded),
+            // Preserve the nearer surface when finite depth precision ties.
+            depth_compare: Some(if extruded {
+                wgpu::CompareFunction::Less
+            } else if formats.2 {
                 wgpu::CompareFunction::LessEqual
             } else {
                 wgpu::CompareFunction::Always
@@ -754,7 +985,7 @@ fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wg
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: Some("fragment"),
+            entry_point: Some(if extruded { "extruded_fragment" } else { "fragment" }),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: texture_format_from_webgpu(formats.0),
@@ -785,11 +1016,11 @@ mod tests {
         })
     }
 
-    fn request(bands: &[Arc<RasterSource>], position: f64, revision: u64) -> PlaybackRequest {
+    pub(super) fn request(bands: &[Arc<RasterSource>], position: f64, revision: u64) -> PlaybackRequest {
         PlaybackRequest::new(bands.to_vec(), position, revision, false, 10.0, true)
     }
 
-    fn parameters() -> WgpuLayerParameters {
+    pub(super) fn parameters() -> WgpuLayerParameters {
         WgpuLayerParameters {
             width: 256.0,
             height: 256.0,
@@ -825,7 +1056,7 @@ mod tests {
         layer.queue.submit([encoder.finish()]);
     }
 
-    fn load_until_idle(layer: &mut MultibandLayer) -> Result<()> {
+    pub(super) fn load_until_idle(layer: &mut MultibandLayer) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             paint_layer(layer);
@@ -1180,7 +1411,7 @@ mod tests {
                 }),
             ];
             let texture = tiles::upload_window(&device, &queue, bands, 2)?.expect("nonempty test bands");
-            let draw = pipeline.draw_tile(&device, [None, None], [Some(&texture), Some(&texture)]);
+            let draw = pipeline.draw_tile(&device, [None; 3], [Some(&texture), Some(&texture), None]);
             queue.write_buffer(
                 &draw.uniform,
                 0,
@@ -1192,6 +1423,9 @@ mod tests {
                     next_range: [0.0, next_max],
                     parameters: [0.25, 1.0, 2.0, 0.0],
                     layers: [0, 1, 1, 0],
+                    extrusion: [0.0; 4],
+                    geometry: [0; 4],
+                    ..DrawUniform::zeroed()
                 }),
             );
             let output = render_test_quad(&device, &queue, &pipeline.pipeline, &draw.bindings);
@@ -1317,7 +1551,7 @@ mod tests {
 
     #[test]
     fn uniform_layout_matches_wgsl_alignment() {
-        assert_eq!(std::mem::size_of::<DrawUniform>(), 128);
+        assert_eq!(std::mem::size_of::<DrawUniform>(), 192);
     }
 
     #[test]

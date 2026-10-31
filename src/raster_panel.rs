@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,12 +7,14 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 
+use gpui_kit::component::WindowExt;
 use gpui_kit::component::input::{InputEvent, InputState, NumberInput};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectDelegate, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IndexPath, Selectable, Sizable};
@@ -25,10 +27,13 @@ use gpui_kit::{
 use inf::colormap::{ColorMapDirection, ColorMapPreset, ProcessedColorMap};
 
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest, PlaybackStyle};
-use crate::raster_source::RasterSource;
+use crate::raster_source::{DEFAULT_EXTRUSION_HEIGHT, RasterSource};
 use crate::vector_source::{VectorLoadProgress, VectorSource};
 
 gpui_kit::actions!(raster, [OpenDataset, FitRaster, ClearRasters, ToggleRasterControls]);
+
+#[path = "raster_projection_prompt.rs"]
+mod projection_prompt;
 
 const PALETTES: [(&str, ColorMapPreset); 24] = [
     ("Blues", ColorMapPreset::Blues),
@@ -142,6 +147,12 @@ impl PaletteChoice {
     }
 }
 
+fn initial_palette(window: &mut Window, cx: &mut Context<SelectState<PaletteChoices>>) -> SelectState<PaletteChoices> {
+    let items = palette_choices(ColorMapDirection::Regular);
+    let selected = items.0.iter().position(|item| item.name == "Turbo").map(IndexPath::new);
+    SelectState::new(items, selected, window, cx)
+}
+
 fn color_strip(colors: impl IntoIterator<Item = inf::Color>) -> impl IntoElement {
     div().flex().size_full().children(colors.into_iter().map(|color| {
         // These colors encode data, not application chrome.
@@ -210,12 +221,31 @@ impl RasterDataset {
 
 #[derive(Default)]
 struct LoadedDatasets {
-    opened_paths: Vec<PathBuf>,
+    opened_paths: Vec<DatasetRequest>,
+    missing_projections: Vec<PathBuf>,
     sources: Vec<Arc<RasterSource>>,
     raster_datasets: Vec<RasterDataset>,
     vectors: Vec<Arc<VectorSource>>,
     errors: Vec<String>,
     selected: Option<SelectionId>,
+}
+
+struct DatasetRequest {
+    path: PathBuf,
+    epsg: Option<u32>,
+}
+
+#[derive(Default)]
+struct ProjectionPrompts {
+    paths: VecDeque<PathBuf>,
+    open: bool,
+    errors: Vec<String>,
+}
+
+impl From<PathBuf> for DatasetRequest {
+    fn from(path: PathBuf) -> Self {
+        Self { path, epsg: None }
+    }
 }
 
 pub struct RasterEvent {
@@ -309,6 +339,7 @@ pub struct RasterPanel {
     band_slider: Entity<SliderState>,
     playback: PlaybackState,
 
+    extrusion_height: Entity<SliderState>,
     range_slider: Entity<SliderState>,
     range_domain: (f64, f64),
     min: Entity<InputState>,
@@ -316,6 +347,7 @@ pub struct RasterPanel {
     error: Option<SharedString>,
     load_error: Option<SharedString>,
     loading: bool,
+    projection_prompts: ProjectionPrompts,
     load_progress: Option<LoadProgress>,
     load_generation: u64,
     load_started: Option<Instant>,
@@ -332,15 +364,11 @@ impl EventEmitter<RasterEvent> for RasterPanel {}
 impl RasterPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let bands = cx.new(|cx| SelectState::new(Vec::<BandChoice>::new(), None, window, cx));
-        let palette = cx.new(|cx| {
-            let items = palette_choices(ColorMapDirection::Regular);
-            let selected = items.0.iter().position(|item| item.name == "Turbo").map(IndexPath::new);
-            SelectState::new(items, selected, window, cx)
-        });
+        let palette = cx.new(|cx| initial_palette(window, cx));
+        let (extrusion_height, extrusion_subscription) = Self::extrusion_control(window, cx);
         let property = cx.new(|cx| SelectState::new(SearchableVec::new(Vec::<SharedString>::new()), None, window, cx).searchable(true));
         let opacity = cx.new(|_| SliderState::new().min(0.0).max(100.0).step(1.0).default_value(100.0));
         let band_slider = cx.new(|_| SliderState::new().min(1.0).max(1.0).step(1.0).default_value(1.0));
-        let playback = PlaybackState::default();
 
         // A normalized domain keeps slider stepping useful for tiny or very
         // large data ranges without replacing retained component state.
@@ -348,6 +376,7 @@ impl RasterPanel {
         let min = cx.new(|cx| InputState::new(window, cx).placeholder("Minimum"));
         let max = cx.new(|cx| InputState::new(window, cx).placeholder("Maximum"));
         let subscriptions = vec![
+            extrusion_subscription,
             cx.subscribe_in(&bands, window, |this, _, event, window, cx| {
                 let SelectEvent::Confirm(id) = event;
                 this.select_layer(*id, window, cx);
@@ -394,8 +423,9 @@ impl RasterPanel {
             property,
             opacity,
             band_slider,
-            playback,
+            playback: PlaybackState::default(),
 
+            extrusion_height,
             range_slider,
             range_domain: (0.0, 1.0),
             min,
@@ -403,6 +433,7 @@ impl RasterPanel {
             error: None,
             load_error: None,
             loading: false,
+            projection_prompts: ProjectionPrompts::default(),
             load_progress: None,
             load_generation: 0,
             load_started: None,
@@ -655,7 +686,7 @@ impl RasterPanel {
 
     pub(crate) fn open_recent_files(&self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.loading {
-            crate::recent_files_picker::open(self.recent_files.paths().to_vec(), cx.weak_entity(), window, cx);
+            crate::recent_files_picker::open(self.recent_files.paths(), cx.weak_entity(), window, cx);
         }
     }
 
@@ -703,12 +734,24 @@ impl RasterPanel {
         if self.loading || paths.is_empty() {
             return;
         }
+        self.projection_prompts = ProjectionPrompts::default();
+        let requests = paths
+            .into_iter()
+            .map(|path| DatasetRequest {
+                epsg: self.recent_files.epsg(&path),
+                path,
+            })
+            .collect();
+        self.open_requests(requests, cx);
+    }
+
+    fn open_requests(&mut self, requests: Vec<DatasetRequest>, cx: &mut Context<Self>) {
         let enqueued = Instant::now();
-        log::info!(target: "map::vector_load", "stage=open-request paths={paths:?}");
+        log::info!(target: "map::vector_load", "stage=open-request paths={:?}", requests.iter().map(|request| &request.path).collect::<Vec<_>>());
         let (progress_tx, progress_rx) = async_channel::bounded(1);
         let work = cx.background_spawn(async move {
             log::info!(target: "map::vector_load", "stage=loader-worker-start queue_delay={:?}", enqueued.elapsed());
-            load_paths(paths, progress_tx)
+            load_paths(requests, progress_tx)
         });
         self.start_load(work, progress_rx, cx);
     }
@@ -741,8 +784,8 @@ impl RasterPanel {
         self.loading = false;
         self.load_progress = None;
         let installed = Instant::now();
-        for path in &loaded.opened_paths {
-            if let Err(error) = self.recent_files.record(path) {
+        for request in &loaded.opened_paths {
+            if let Err(error) = self.recent_files.record(&request.path, request.epsg) {
                 log::warn!("Could not save recent files: {error:#}");
             }
         }
@@ -758,9 +801,35 @@ impl RasterPanel {
             Some(SelectionId::Vector(source)) => Some(LoadProgress::Rendering(source)),
             _ => None,
         };
-        self.load_error = (!loaded.errors.is_empty()).then(|| loaded.errors.join("\n").into());
+        self.projection_prompts.errors.extend(loaded.errors);
+        self.load_error = (!self.projection_prompts.errors.is_empty()).then(|| self.projection_prompts.errors.join("\n").into());
+        self.projection_prompts.paths.extend(loaded.missing_projections);
+        self.prompt_next_projection(window, cx);
         log::info!(target: "map::vector_load", "load={generation} stage=ui-install-loaded-layers elapsed={:?} since_request={:?} awaiting_vector_frame={}", installed.elapsed(), started.elapsed(), self.load_progress.is_some());
         cx.notify();
+    }
+
+    fn prompt_next_projection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.projection_prompts.paths.front() else { return };
+        self.loading = true;
+        self.load_progress = None;
+        self.projection_prompts.open = true;
+        projection_prompt::open(path, self.load_generation, cx.weak_entity(), window, cx);
+    }
+
+    fn complete_projection_prompt(&mut self, generation: u64, epsg: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.load_generation != generation || !self.projection_prompts.open {
+            return;
+        }
+        self.projection_prompts.open = false;
+        self.loading = false;
+        let Some(path) = self.projection_prompts.paths.pop_front() else { return };
+        if epsg.is_some() {
+            self.open_requests(vec![DatasetRequest { path, epsg }], cx);
+        } else {
+            self.prompt_next_projection(window, cx);
+            cx.notify();
+        }
     }
 
     fn update_load_progress(&mut self, generation: u64, progress: LoadProgress, cx: &mut Context<Self>) {
@@ -951,6 +1020,7 @@ impl RasterPanel {
         }
         self.sync_palette(window, cx);
         self.sync_range_slider(window, cx);
+        self.sync_extrusion_control(window, cx);
     }
 
     fn select_property(&mut self, property: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
@@ -1103,6 +1173,11 @@ impl RasterPanel {
         self.reset_playback(0.0);
         self.load_generation += 1;
         self.load_task = None;
+        self.projection_prompts.paths.clear();
+        if self.projection_prompts.open {
+            self.projection_prompts.open = false;
+            window.close_dialog(cx);
+        }
         self.tile_errors_task = None;
         self.tile_errors_source = None;
         self.loading = false;
@@ -1248,6 +1323,7 @@ impl RasterPanel {
             self.set_range_inputs((f64::from(range.0), f64::from(range.1)), window, cx);
         }
         self.sync_range_slider(window, cx);
+        self.sync_extrusion_control(window, cx);
     }
 
     /// Accept renderer feedback without emitting a new command or changing its revision.
@@ -1617,7 +1693,7 @@ impl Render for RasterPanel {
             .min_h_0()
             .child(self.render_layers_card(window, cx));
         if !self.collapsed && self.color_range().is_some() {
-            panel = panel.child(self.render_value_range(cx));
+            panel = panel.child(self.render_value_range(cx)).children(self.render_visualization(cx));
         }
         panel = panel.children(self.render_band_selector(cx));
         div()
@@ -1635,6 +1711,149 @@ impl Render for RasterPanel {
 }
 
 impl RasterPanel {
+    fn extrusion_control(window: &mut Window, cx: &mut Context<Self>) -> (Entity<SliderState>, Subscription) {
+        let height = cx.new(|_| {
+            SliderState::new()
+                .min(0.0)
+                .max(crate::raster_source::MAX_EXTRUSION_HEIGHT)
+                .step(0.2)
+                .default_value(DEFAULT_EXTRUSION_HEIGHT)
+        });
+        let subscription = cx.subscribe_in(&height, window, |this, _, event: &SliderEvent, _, cx| {
+            if let SliderEvent::Change(value) = event
+                && this.extrusion().0
+            {
+                this.set_extrusion(true, value.end(), cx);
+            }
+        });
+        (height, subscription)
+    }
+
+    fn extrusion(&self) -> (bool, f32) {
+        self.active()
+            .map_or((false, DEFAULT_EXTRUSION_HEIGHT), |source| self.playback_style().extrusion_for(source))
+    }
+
+    fn sync_extrusion_control(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let (_, height) = self.extrusion();
+        self.extrusion_height.update(cx, |slider, cx| slider.set_value(height, window, cx));
+    }
+
+    fn set_extrusion(&mut self, enabled: bool, height: f32, cx: &mut Context<Self>) {
+        let Some(source) = self.active().filter(|source| source.is_numeric()) else {
+            return;
+        };
+        if self.extrusion() == (enabled, height) {
+            return;
+        }
+        let result = if self.playback_dataset().is_some() {
+            self.set_playback_style(self.playback_style().with_extrusion(enabled, height));
+            Ok(())
+        } else {
+            source.with_extrusion(enabled, height).map(|source| self.replace_raster(source))
+        };
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.watch_tile_errors(cx);
+                self.emit(false, cx);
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not change pixel extrusion: {error}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn set_extrusion_averaging(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let Some(source) = self.active().filter(|source| source.is_numeric()) else {
+            return;
+        };
+        if self.playback_style().extrusion_averaging_for(source) == enabled {
+            return;
+        }
+        let result = if self.playback_dataset().is_some() {
+            self.set_playback_style(self.playback_style().with_extrusion_averaging(enabled));
+            Ok(())
+        } else {
+            source.with_extrusion_averaging(enabled).map(|source| self.replace_raster(source))
+        };
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.watch_tile_errors(cx);
+                self.emit(false, cx);
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not change extrusion averaging: {error}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn render_extrusion_averaging(&self, extrusion_enabled: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let averaged = self.active().is_some_and(|source| self.playback_style().extrusion_averaging_for(source));
+        let description = "Reduce resolution";
+        Button::new("raster-average-extrusion-pixels")
+            .small()
+            .ghost()
+            .icon(IconName::Grid2x2)
+            .selected(averaged)
+            .toggled(averaged)
+            .disabled(!extrusion_enabled)
+            .tooltip(description)
+            .accessibility_label(description)
+            .on_click(cx.listener(move |this, _, _, cx| this.set_extrusion_averaging(!averaged, cx)))
+    }
+
+    fn render_visualization(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        self.active().filter(|source| source.is_numeric())?;
+        let (enabled, height) = self.extrusion();
+        Some(
+            overlay_card("raster-visualization-card", cx)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Icon::new(IconName::ChartNoAxesColumn).small())
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Visualization")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            Switch::new("raster-extrude-pixels")
+                                .small()
+                                .label("Extrude pixels")
+                                .checked(enabled)
+                                .on_change(cx.listener(|this, enabled, _, cx| {
+                                    this.set_extrusion(*enabled, this.extrusion().1, cx);
+                                })),
+                        )
+                        .child(self.render_extrusion_averaging(enabled, cx)),
+                )
+                .child(
+                    div().flex().justify_between().child(field_label("Maximum height", cx)).child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{:.1} × pixel width", height * crate::raster_source::EXTRUSION_HEIGHT_FACTOR)),
+                    ),
+                )
+                .child(
+                    div().id("raster-extrusion-height").test_support().px_2().child(
+                        Slider::new(&self.extrusion_height)
+                            .disabled(!enabled)
+                            .accessibility_label("Maximum extrusion height"),
+                    ),
+                ),
+        )
+    }
+
     fn render_legend(&self, cx: &App) -> impl IntoElement {
         let mut legend = div().id("raster-legend").test_support().flex().flex_col().gap_1();
         if let Some(((min, max), _)) = self.color_range().zip(self.color_palette()) {
@@ -1760,7 +1979,7 @@ fn initial_recent_files() -> crate::recent_files::RecentFiles {
     }
 }
 
-fn load_paths(paths: Vec<PathBuf>, progress: async_channel::Sender<LoadProgress>) -> LoadedDatasets {
+fn load_paths(paths: Vec<DatasetRequest>, progress: async_channel::Sender<LoadProgress>) -> LoadedDatasets {
     let mut loaded = LoadedDatasets::default();
     let path_count = paths.len() as f64;
 
@@ -1773,7 +1992,8 @@ fn load_paths(paths: Vec<PathBuf>, progress: async_channel::Sender<LoadProgress>
     loaded
 }
 
-fn load_path(path: PathBuf, index: usize, path_count: f64, progress: &async_channel::Sender<LoadProgress>, loaded: &mut LoadedDatasets) {
+fn load_path(request: DatasetRequest, index: usize, path_count: f64, progress: &async_channel::Sender<LoadProgress>, loaded: &mut LoadedDatasets) {
+    let DatasetRequest { path, epsg } = request;
     let opened = Instant::now();
     let _ = progress.force_send(LoadProgress::Opening);
     let mut progress_bucket = None;
@@ -1798,27 +2018,39 @@ fn load_path(path: PathBuf, index: usize, path_count: f64, progress: &async_chan
         Ok(Some(opened)) => {
             loaded.selected = opened.first().map(|source| SelectionId::Vector(source.id()));
             loaded.vectors.extend(opened);
-            loaded.opened_paths.push(path.clone());
+            loaded.opened_paths.push(path.clone().into());
         }
-        Ok(None) => match RasterSource::open(&path) {
-            Ok(opened) => {
-                if let Some(first) = opened.first() {
-                    loaded.raster_datasets.push(RasterDataset {
-                        path: path.canonicalize().unwrap_or_else(|_| path.clone()),
-                        bands: opened.iter().map(|source| source.metadata().id).collect(),
-                        selected: first.metadata().id,
-                        playback: PlaybackRequest::for_dataset(&opened),
-                    });
-                    loaded.selected = Some(SelectionId::Raster(first.metadata().id));
-                }
-                loaded.sources.extend(opened);
-                loaded.opened_paths.push(path.clone());
-            }
-            Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
-        },
+        Ok(None) => load_raster_path(&path, epsg, loaded),
         Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
     }
     log::info!(target: "map::vector_load", "path={path:?} stage=path-loaded elapsed={:?}", opened.elapsed());
+}
+
+fn load_raster_path(path: &std::path::Path, epsg: Option<u32>, loaded: &mut LoadedDatasets) {
+    let result = match epsg {
+        Some(code) => RasterSource::open_with_epsg(path, Some(code)),
+        None => RasterSource::open(path),
+    };
+    match result {
+        Ok(opened) => {
+            if let Some(first) = opened.first() {
+                loaded.raster_datasets.push(RasterDataset {
+                    path: path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
+                    bands: opened.iter().map(|source| source.metadata().id).collect(),
+                    selected: first.metadata().id,
+                    playback: PlaybackRequest::for_dataset(&opened),
+                });
+                loaded.selected = Some(SelectionId::Raster(first.metadata().id));
+            }
+            loaded.sources.extend(opened);
+            loaded.opened_paths.push(DatasetRequest {
+                path: path.to_path_buf(),
+                epsg,
+            });
+        }
+        Err(error) if error.is::<crate::raster_source::MissingProjection>() => loaded.missing_projections.push(path.to_path_buf()),
+        Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
+    }
 }
 
 pub(crate) fn scroll_index(event: &ScrollEvent, scroll: &mut f32, ix: usize, count: usize, cx: &mut App) -> usize {
@@ -2165,7 +2397,7 @@ mod tests {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![per_band_style_test_path(&dir, 2)];
-        let (panel, handle) = open_test_panel(cx, 760.0);
+        let (panel, handle) = open_test_panel(cx, 1000.0);
         load_test_paths(&panel, handle, paths, cx);
         let events = record_events(&panel, cx);
         let original = cx.update(|cx| panel.read(cx).active().unwrap().clone());
@@ -2505,7 +2737,7 @@ mod tests {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
         let paths = raster_test_paths(&dir, &[5]);
-        let (panel, handle) = open_test_panel(cx, 760.0);
+        let (panel, handle) = open_test_panel(cx, 1000.0);
         let events = record_events(&panel, cx);
         load_test_paths(&panel, handle, paths, cx);
         let original_source = cx.update(|cx| panel.read(cx).active().unwrap().id());
@@ -2559,12 +2791,14 @@ mod tests {
         let card = window.find("raster-band-controls").bounds();
         let slider = window.find("raster-band-slider");
         let mut previous = window.find("raster-layers-card").bounds();
-        if let Some(range) = window.try_find("raster-range-card") {
-            assert!((range.bounds().top() - previous.bottom() - window.rem_size() * 0.75).abs() <= px(1.0));
-            previous = range.bounds();
+        for id in ["raster-range-card", "raster-visualization-card"] {
+            if let Some(peer) = window.try_find(id) {
+                assert!((peer.bounds().top() - previous.bottom() - window.rem_size() * 0.75).abs() <= px(1.0));
+                previous = peer.bounds();
+            }
         }
         assert!((card.top() - previous.bottom() - window.rem_size() * 0.75).abs() <= px(1.0));
-        for id in ["raster-layers-card", "raster-range-card"] {
+        for id in ["raster-layers-card", "raster-range-card", "raster-visualization-card"] {
             if let Some(peer) = window.try_find(id) {
                 assert!((card.left() - peer.bounds().left()).abs() <= px(1.0), "{id} must share the band's left edge");
                 assert!((card.right() - peer.bounds().right()).abs() <= px(1.0), "{id} must share the band's right edge");
@@ -2605,7 +2839,7 @@ mod tests {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![per_band_style_test_path(&dir, 3)];
-        let (panel, handle) = open_test_panel(cx, 760.0);
+        let (panel, handle) = open_test_panel(cx, 1000.0);
         load_test_paths(&panel, handle, paths, cx);
         let first = style_active_band(&panel, handle, 1, (25.0, 45.0), cx);
         assert_eq!(first.palette(), ColorMapPreset::YlGnBu);
@@ -3071,6 +3305,290 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn extrusion_controls_preserve_per_band_style_and_support_keyboard(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![per_band_style_test_path(&dir, 2)];
+        let (panel, handle) = open_test_panel(cx, 1200.0);
+        load_test_paths(&panel, handle, paths, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("raster-visualization-card").bounds().top() >= window.find("raster-range-card").bounds().bottom());
+            assert_eq!(window.find("raster-extrude-pixels").checked(), Some(false));
+            assert_eq!(
+                panel.read(cx).extrusion_height.read(cx).value().end(),
+                crate::raster_source::MAX_EXTRUSION_HEIGHT / 2.0
+            );
+            window.click("raster-extrusion-height", cx);
+            assert_eq!(panel.read(cx).extrusion(), (false, DEFAULT_EXTRUSION_HEIGHT));
+            window.click("raster-extrude-pixels", cx);
+            assert_eq!(panel.read(cx).extrusion(), (true, DEFAULT_EXTRUSION_HEIGHT));
+            let bounds = window.find("raster-extrusion-height").bounds();
+            window.click_at("raster-extrusion-height", point(bounds.size.width * 0.75, bounds.size.height * 0.5), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let height = panel.read(cx).extrusion().1;
+            assert!(height > DEFAULT_EXTRUSION_HEIGHT);
+            window.click("next-raster-band", cx);
+            assert_eq!(panel.read(cx).extrusion(), (false, DEFAULT_EXTRUSION_HEIGHT));
+            window.click("previous-raster-band", cx);
+            assert_eq!(panel.read(cx).extrusion(), (true, height));
+            assert_eq!(panel.read(cx).extrusion_height.read(cx).value().end(), height);
+            window.click("raster-extrude-pixels", cx);
+            assert_eq!(panel.read(cx).extrusion(), (false, height));
+            window.press("space", cx);
+            assert_eq!(panel.read(cx).extrusion(), (true, height));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn extrusion_height_slider_can_exceed_the_previous_maximum(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![per_band_style_test_path(&dir, 2)];
+        let (panel, handle) = open_test_panel(cx, 1200.0);
+        load_test_paths(&panel, handle, paths, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("raster-extrude-pixels", cx);
+            let bounds = window.find("raster-extrusion-height").bounds();
+            window.click_at("raster-extrusion-height", point(bounds.size.width * 0.9, bounds.size.height * 0.5), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let height = panel.read(cx).extrusion().1;
+            assert!(height > 10.0 && height <= crate::raster_source::MAX_EXTRUSION_HEIGHT, "height={height}");
+            assert_eq!(panel.read(cx).active().unwrap().extrusion_height(), height);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn extrusion_averaging_is_controlled_disabled_and_retained_per_band(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![per_band_style_test_path(&dir, 2)];
+        let (panel, handle) = open_test_panel(cx, 1200.0);
+        load_test_paths(&panel, handle, paths, cx);
+        let events = record_events(&panel, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let original = panel.read(cx).active().unwrap().clone();
+            let control = window.find("raster-average-extrusion-pixels");
+            assert_eq!(control.role(), Some(gpui_kit::Role::Button));
+            assert_eq!(control.label(), Some("Reduce resolution"));
+            assert!(!extrusion_averaging_pressed(window));
+            assert_eq!(control.disabled(), Some(true));
+            assert!(control.bounds().left() >= window.find("raster-extrude-pixels").bounds().right());
+            assert!(control.bounds().bottom() <= window.find("raster-extrusion-height").bounds().top());
+            window.click("raster-average-extrusion-pixels", cx);
+            assert!(Arc::ptr_eq(panel.read(cx).active().unwrap(), &original));
+            window.click("raster-extrude-pixels", cx);
+            window.click("raster-average-extrusion-pixels", cx);
+            assert!(extrusion_averaging_pressed(window));
+            assert!(panel.read(cx).active().unwrap().is_extrusion_averaged());
+            toggle_extrusion_averaging_with_keyboard(window, cx);
+            assert!(!panel.read(cx).active().unwrap().is_extrusion_averaged());
+            window.press("enter", cx);
+            assert!(extrusion_averaging_pressed(window));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("next-raster-band", cx);
+            assert!(!extrusion_averaging_pressed(window));
+            assert_eq!(window.find("raster-average-extrusion-pixels").disabled(), Some(true));
+            window.click("previous-raster-band", cx);
+            assert!(extrusion_averaging_pressed(window));
+            window.click("raster-extrude-pixels", cx);
+            assert!(extrusion_averaging_pressed(window));
+            assert_eq!(window.find("raster-average-extrusion-pixels").disabled(), Some(true));
+            window.click("raster-average-extrusion-pixels", cx);
+            assert!(panel.read(cx).active().unwrap().is_extrusion_averaged());
+            window.click("raster-extrude-pixels", cx);
+            assert!(extrusion_averaging_pressed(window));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let events = events.read(cx);
+            assert!(events.iter().all(|event| !event.should_fit()));
+            assert!(events.last().unwrap().source().unwrap().is_extrusion_averaged());
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            panel.update(cx, |panel, cx| panel.clear(window, cx));
+            window.render_frame(cx);
+            assert!(window.try_find("raster-average-extrusion-pixels").is_none());
+            assert!(window.try_find("raster-extrusion-averaging-description").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn extrusion_averaging_icon_aligns_without_overflow_at_larger_font_sizes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[1]);
+        let (panel, handle) = open_test_panel(cx, 1200.0);
+        load_test_paths(&panel, handle, paths, cx);
+        for font_size in [16.0, 20.0] {
+            cx.update(|cx| gpui_kit::component::Theme::update(cx, |theme| theme.font_size = px(font_size)));
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let card = window.find("raster-visualization-card").bounds();
+                let toggle = window.find("raster-extrude-pixels").bounds();
+                let control = window.find("raster-average-extrusion-pixels").bounds();
+                let height = window.find("raster-extrusion-height").bounds();
+                assert!(window.find("raster-average-extrusion-pixels").visible());
+                assert!(window.try_find("raster-extrusion-averaging-description").is_none());
+                assert!(control.left() >= toggle.right());
+                assert_eq!(control.center().y, toggle.center().y);
+                assert!(height.top() >= control.bottom());
+                assert!(height.bottom() <= card.bottom());
+                assert_eq!(control.right(), card.right() - (toggle.left() - card.left()));
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn extrusion_averaging_and_range_controls_remain_reachable_in_short_windows(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[1]);
+        let (panel, handle) = open_test_panel(cx, 400.0);
+        load_test_paths(&panel, handle, paths, cx);
+        cx.update(|cx| gpui_kit::component::Theme::update(cx, |theme| theme.font_size = px(18.0)));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let before = window.find("raster-visualization-card").bounds();
+            window.scroll("raster-layers-card", ScrollDelta::Lines(point(0.0, -30.0)), cx);
+            assert!(window.find("raster-visualization-card").bounds().top() < before.top());
+            assert!(window.find("raster-average-extrusion-pixels").visible());
+            assert!(window.find("raster-extrusion-height").visible());
+            window.click("raster-extrude-pixels", cx);
+            window.click("raster-average-extrusion-pixels", cx);
+            assert!(panel.read(cx).active().unwrap().is_extrusion_averaged());
+            window.scroll("raster-visualization-card", ScrollDelta::Lines(point(0.0, 5.0)), cx);
+            assert!(window.find("raster-max").visible());
+        })
+        .unwrap();
+    }
+
+    fn extrusion_averaging_pressed(window: &Window) -> bool {
+        // Kit exposes AccessKit's native toggle-button pressed state through checked().
+        window.find("raster-average-extrusion-pixels").checked().expect("Native button pressed state")
+    }
+
+    fn toggle_extrusion_averaging_with_keyboard(window: &mut Window, cx: &mut App) {
+        window.click("raster-min", cx);
+        for _ in 0..30 {
+            if window.find("raster-average-extrusion-pixels").focused() == Some(true) {
+                break;
+            }
+            window.press("tab", cx);
+        }
+        assert_eq!(window.find("raster-average-extrusion-pixels").focused(), Some(true));
+        window.press("space", cx);
+        assert!(!extrusion_averaging_pressed(window));
+    }
+
+    #[gpui_kit::test]
+    fn extrusion_averaging_updates_shared_playback_without_seeking_or_rebuilding_bands(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[3]);
+        let (panel, handle) = open_test_panel(cx, 1200.0);
+        load_test_paths(&panel, handle, paths, cx);
+        let events = record_events(&panel, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("raster-extrude-pixels", cx);
+            window.click("toggle-raster-playback", cx);
+            let playing = panel.read(cx).playback_request().unwrap();
+            panel.update(cx, |panel, cx| {
+                panel.apply_playback_frame(PlaybackFrame::new(playing.dataset_id().unwrap(), playing.revision(), 1.25, true), window, cx);
+            });
+            window.render_frame(cx);
+            let before = panel.read(cx).playback_request().unwrap();
+            assert!(before.is_playing());
+            assert_eq!(before.style().extrusion_averaging(), None);
+            window.click("raster-average-extrusion-pixels", cx);
+            let averaged = panel.read(cx).playback_request().unwrap();
+            assert_averaging_playback_controls_unchanged(&before, &averaged);
+            assert_eq!(averaged.style().extrusion_averaging(), Some(true));
+            assert!(averaged.bands().iter().all(|source| averaged.style().extrusion_averaging_for(source)));
+            assert!(panel.read(cx).playback.buffering);
+            window.click("raster-extrude-pixels", cx);
+            assert!(extrusion_averaging_pressed(window));
+            assert_eq!(window.find("raster-average-extrusion-pixels").disabled(), Some(true));
+            window.click("raster-extrude-pixels", cx);
+            window.click("raster-extrusion-height", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let before = panel.read(cx).playback_request().unwrap();
+            assert!(before.style().extrusion().unwrap().1 > 1.0);
+            assert!(extrusion_averaging_pressed(window));
+            toggle_extrusion_averaging_with_keyboard(window, cx);
+            let unaveraged = panel.read(cx).playback_request().unwrap();
+            assert_averaging_playback_controls_unchanged(&before, &unaveraged);
+            assert_eq!(unaveraged.style().extrusion_averaging(), Some(false));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let events = events.read(cx);
+            assert!(events.iter().all(|event| !event.should_fit()));
+            let last = events.last().unwrap().playback().unwrap();
+            assert_eq!(last.style().extrusion_averaging(), Some(false));
+            assert_eq!(last.position(), 1.25);
+        });
+    }
+
+    fn assert_averaging_playback_controls_unchanged(before: &PlaybackRequest, after: &PlaybackRequest) {
+        assert!(after.shares_bands(before));
+        assert_eq!(after.revision(), before.revision());
+        assert_eq!(after.position(), before.position());
+        assert_eq!(after.is_playing(), before.is_playing());
+        assert_eq!(after.bands_per_second(), before.bands_per_second());
+        assert_eq!(after.interpolation(), before.interpolation());
+        for (before, after) in before.bands().iter().zip(after.bands()) {
+            assert!(Arc::ptr_eq(before, after));
+            assert!(!after.is_extrusion_averaged(), "Shared overrides cannot restyle the raw bands");
+        }
+    }
+
+    #[gpui_kit::test]
+    fn extrusion_playback_style_is_shared_without_revising_playback(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = raster_test_paths(&dir, &[2]);
+        let (panel, handle) = open_test_panel(cx, 1200.0);
+        load_test_paths(&panel, handle, paths, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let revision = panel.read(cx).playback.revision;
+            window.click("raster-extrude-pixels", cx);
+            assert_eq!(panel.read(cx).playback.revision, revision);
+            assert_eq!(panel.read(cx).playback_style().extrusion(), Some((true, DEFAULT_EXTRUSION_HEIGHT)));
+            window.click("next-raster-band", cx);
+            assert_eq!(panel.read(cx).extrusion(), (true, DEFAULT_EXTRUSION_HEIGHT));
+            panel.update(cx, |panel, cx| panel.clear(window, cx));
+            window.render_frame(cx);
+            assert!(window.try_find("raster-visualization-card").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn clamp_colors_checkbox_updates_style_and_retains_per_band_state_through_the_ui(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
@@ -3393,7 +3911,7 @@ mod tests {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
         let path = per_band_style_test_path(&dir, 2);
-        let (panel, handle) = open_test_panel(cx, 760.0);
+        let (panel, handle) = open_test_panel(cx, 1000.0);
         verify_picker_cancel_and_open(&panel, handle, path, cx);
         let original_band = cx.update(|cx| panel.read(cx).selected);
         verify_band_navigation(&panel, handle, original_band, cx);

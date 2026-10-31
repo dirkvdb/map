@@ -222,37 +222,7 @@ fn write_layer(queue: &wgpu::Queue, texture: &wgpu::Texture, layer: u32, bytes: 
 }
 
 #[cfg(test)]
-pub(super) fn cog_fixture(bands: usize) -> Result<(tempfile::TempDir, Vec<Arc<RasterSource>>)> {
-    let directory = tempfile::tempdir()?;
-    let input_path = directory.path().join("input.tif");
-    crate::raster_source::test_support::write_raster(&input_path, 3857, bands)?;
-    let path = directory.path().join("playback.tif");
-    write_test_cog(&input_path, &path)?;
-    let sources = RasterSource::open(&path)?;
-    ensure!(sources.len() == bands, "COG fixture did not preserve band count");
-    Ok((directory, sources))
-}
-
-#[cfg(test)]
-fn write_test_cog(input_path: &std::path::Path, path: &std::path::Path) -> Result<()> {
-    let input = gdal::Dataset::open(input_path)?;
-    let options = gdal::raster::RasterCreationOptions::from_iter([
-        "TILING_SCHEME=GoogleMapsCompatible",
-        "ZOOM_LEVEL=3",
-        "BLOCKSIZE=256",
-        "OVERVIEWS=NONE",
-        "COMPRESS=DEFLATE",
-        "INTERLEAVE=BAND",
-        "ADD_ALPHA=NO",
-    ]);
-    input.create_copy(&gdal::DriverManager::get_driver_by_name("COG")?, path, &options)?.close()?;
-    // The native COG probe reads a complete 16-KiB header even for tiny fixtures.
-    let file = std::fs::OpenOptions::new().write(true).open(path)?;
-    file.set_len(file.metadata()?.len().max(16 * 1024))?;
-    let metadata = geo::geotiff::GeoTiffMetadata::from_file(path)?;
-    geo::cog::WebTilesReader::new(metadata).context("COG fixture is not readable by the native tile reader")?;
-    Ok(())
-}
+pub(super) use crate::raster_source::test_support::cog_fixture;
 
 #[cfg(test)]
 mod tests {

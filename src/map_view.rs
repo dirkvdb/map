@@ -69,6 +69,7 @@ const MAX_COAST_SPEED: f64 = 3_000.0;
 const COAST_DECELERATION: f64 = 2_500.0;
 
 struct MapDrag {
+    button: MouseButton,
     position: Point<Pixels>,
     samples: VecDeque<(Instant, Point<Pixels>)>,
 }
@@ -78,6 +79,7 @@ impl MapDrag {
         Self {
             position,
             samples: VecDeque::from([(now, position)]),
+            button: MouseButton::Left,
         }
     }
 
@@ -94,6 +96,9 @@ impl MapDrag {
     }
 
     fn release(mut self, now: Instant) -> Option<MapCoast> {
+        if self.button != MouseButton::Left {
+            return None;
+        }
         self.prune(now);
         let (first_time, first) = self.samples.front()?;
         let (last_time, last) = self.samples.back()?;
@@ -136,7 +141,7 @@ impl MapCoast {
 }
 
 fn basemap_style(cx: &App) -> BasemapStyle {
-    if cx.theme().mode.is_dark() { BasemapStyle::Dark } else { BasemapStyle::Light }
+    BasemapStyle::default_for_theme(cx)
 }
 
 #[derive(PartialEq)]
@@ -313,7 +318,7 @@ impl MapView {
     fn source_bounds(&self) -> Option<[f64; 4]> {
         self.raster
             .as_ref()
-            .map(|source| source.metadata().bounds)
+            .map(|source| source.viewport_bounds())
             .or_else(|| self.vector.as_ref().map(|source| source.bounds()))
     }
 
@@ -501,6 +506,15 @@ impl MapView {
         self.request_render(cx);
     }
 
+    /// Extent previews render on a worker of their own, so the main map keeps
+    /// its request and camera. Fixtures without a renderer get no preview worker.
+    fn preview_renderer(&self) -> Option<MapRenderer> {
+        self.renderer.as_ref()?;
+        MapRenderer::new()
+            .map_err(|error| log::warn!("Could not start the extent preview renderer: {error:#}"))
+            .ok()
+    }
+
     fn selected_basemap(&self, cx: &App) -> BasemapStyle {
         self.background
             .read(cx)
@@ -576,16 +590,40 @@ impl MapView {
         self.request_render(cx);
     }
 
+    fn begin_drag(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.drag.is_some() {
+            return;
+        }
+        window.focus(&self.focus, cx);
+        self.coast = None;
+        let mut drag = MapDrag::new(event.position, Instant::now());
+        drag.button = event.button;
+        self.drag = Some(drag);
+        cx.notify();
+    }
+
     fn drag_map(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !event.dragging() {
+        if self.drag.as_ref().is_some_and(|drag| event.pressed_button != Some(drag.button)) {
             self.end_drag(window, cx);
             return;
         }
         // A drag begun outside this map must not start map navigation.
-        if let Some(drag) = &mut self.drag {
-            let delta = event.position - drag.position;
-            drag.record(event.position, Instant::now());
-            self.pan(f64::from(f32::from(delta.x)), f64::from(f32::from(delta.y)), cx);
+        let Some(drag) = &mut self.drag else { return };
+        let previous = drag.position;
+        let delta = event.position - previous;
+        drag.record(event.position, Instant::now());
+        if drag.button == MouseButton::Right {
+            self.camera.rotate(f64::from(f32::from(delta.x)));
+            self.camera.tilt(f64::from(f32::from(delta.y)));
+            self.request_render(cx);
+        } else if let Some(bounds) = self.bounds {
+            let offset = |position: Point<Pixels>| {
+                let point = position - bounds.center();
+                (f64::from(f32::from(point.x)), f64::from(f32::from(point.y)))
+            };
+            self.camera.pan_between(offset(previous), offset(event.position));
+            self.coast = None;
+            self.request_render(cx);
         }
     }
 
@@ -652,7 +690,7 @@ impl MapView {
         let previous_viewport = self.viewport;
         let drag_move = cx.listener(|view, event: &MouseMoveEvent, window, cx| view.drag_map(event, window, cx));
         let drag_end = cx.listener(|view, event: &MouseUpEvent, window, cx| {
-            if event.button == MouseButton::Left {
+            if view.drag.as_ref().is_some_and(|drag| drag.button == event.button) {
                 view.end_drag(window, cx)
             }
         });
@@ -740,15 +778,8 @@ impl MapView {
             .border_color(cx.theme().border)
             .focus_visible(move |style| style.border_color(focus_ring))
             .cursor(if self.drag.is_some() { CursorStyle::ClosedHand } else { CursorStyle::Arrow })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|view, event: &MouseDownEvent, window, cx| {
-                    window.focus(&view.focus, cx);
-                    view.coast = None;
-                    view.drag = Some(MapDrag::new(event.position, Instant::now()));
-                    cx.notify();
-                }),
-            )
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_drag))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::begin_drag))
             .on_scroll(cx.listener(|view, event: &ScrollEvent, _, cx| {
                 let Some(bounds) = view.bounds else { return };
                 let offset = event.position - bounds.center();
@@ -915,6 +946,29 @@ impl MapView {
                     .on_click(cx.listener(|view, _, _, cx| view.toggle_tile_boundaries(cx))),
             )
             .child(
+                Button::new("fit-dataset-extent")
+                    .small()
+                    .ghost()
+                    .icon(IconName::SquareDimensions)
+                    .accessibility_label("Fit dataset extent")
+                    .tooltip_with_action("Fit dataset extent", &FitRaster, Some("RasterWorkspace"))
+                    .disabled(self.source_bounds().is_none())
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(FitRaster), cx)),
+            )
+            .child(
+                Button::new("open-dataset-properties")
+                    .small()
+                    .ghost()
+                    .icon(IconName::Info)
+                    .accessibility_label("Dataset properties")
+                    .tooltip_with_action(
+                        "Dataset properties…",
+                        &crate::dataset_properties::OpenDatasetProperties,
+                        Some("RasterWorkspace"),
+                    )
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::dataset_properties::OpenDatasetProperties), cx)),
+            )
+            .child(
                 Button::new("open-settings")
                     .small()
                     .ghost()
@@ -1012,7 +1066,7 @@ impl Render for MapView {
                 view.coast = None;
                 view.drag = None;
                 let properties = view.raster_panel.read(cx).properties();
-                properties.open(window, cx);
+                properties.open(view.preview_renderer(), window, cx);
             }))
             .on_action(cx.listener(|view, _: &OpenDataset, _, cx| view.raster_panel.update(cx, |panel, cx| panel.prompt(cx))))
             .on_action(cx.listener(|view, _: &crate::recent_files_picker::OpenRecentFiles, window, cx| {
@@ -1040,6 +1094,10 @@ impl Render for MapView {
             .child(alerts)
     }
 }
+
+#[cfg(test)]
+#[path = "map_view_camera_tests.rs"]
+mod camera_tests;
 
 #[cfg(test)]
 #[path = "map_view_playback_tests.rs"]
@@ -1093,6 +1151,7 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.find("dataset-properties").visible());
+            assert!(window.try_find("dataset-extent-map").is_none(), "No dataset must not imply a geographic extent");
             assert!(!view.read(cx).focus.is_focused(window));
             window.press("escape", cx);
         })
@@ -1104,6 +1163,133 @@ mod tests {
             assert!(view.read(cx).focus.is_focused(window));
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn title_bar_extent_info_and_settings_buttons_follow_the_requested_order(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx).unwrap();
+            cx.set_reduce_motion(true);
+        });
+        let (_view, handle) = open_test_map(size(px(800.), px(600.)), cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let button = window.find("open-dataset-properties");
+            assert_eq!(button.label(), Some("Dataset properties"));
+            let fit = window.find("fit-dataset-extent");
+            assert_eq!(fit.label(), Some("Fit dataset extent"));
+            assert_eq!(fit.disabled(), Some(true));
+            assert!(fit.bounds().right() < button.bounds().left());
+            assert!(button.bounds().right() < window.find("open-settings").bounds().left());
+            assert!(window.try_find("dataset-properties").is_none());
+            window.click("open-dataset-properties", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("dataset-properties").visible());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn cog_properties_scroll_in_short_windows_and_at_larger_font_sizes(cx: &mut TestAppContext) {
+        use gpui_kit::component::Theme;
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx).unwrap();
+            cx.set_reduce_motion(true);
+        });
+        let (_directory, sources) = crate::raster_source::test_support::cog_fixture(2).unwrap();
+        for (viewport, font_size, mode) in [
+            (size(px(800.), px(600.)), px(14.), ThemeMode::Light),
+            (size(px(640.), px(400.)), px(20.), ThemeMode::Dark),
+        ] {
+            cx.update(|cx| {
+                Theme::change(mode, None, cx);
+                Theme::update(cx, |theme| theme.font_size = font_size);
+            });
+            let (view, handle) = open_test_map(viewport, cx);
+            cx.update_window(handle.into(), |_, window, cx| {
+                crate::dataset_properties::DatasetProperties::raster(&sources[1], &sources[1].metadata().path, sources.len()).open(None, window, cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let surface = window.within("dialog").find("surface").bounds();
+                let content = window.find("dataset-properties").bounds();
+                let preview = window.find("dataset-extent-map");
+                let map_bounds = preview.bounds();
+                assert!(preview.visible());
+                assert!(preview.label().unwrap().starts_with("Map showing dataset extent:"));
+                assert_eq!(map_bounds.size.width, map_bounds.size.height * 2.);
+                assert!(map_bounds.left() >= content.left() && map_bounds.right() <= content.right());
+                assert_extent_corner_annotations(map_bounds, window);
+                assert_cog_grid_annotations(map_bounds, window);
+                assert_eq!(window.rem_size(), font_size);
+                assert!(surface.left() >= px(0.) && surface.right() <= viewport.width);
+                assert!(surface.top() >= px(0.) && surface.bottom() <= viewport.height);
+                assert!(content.left() >= surface.left() && content.right() <= surface.right());
+                assert!(content.bottom() > surface.bottom(), "The expanded COG metadata should scroll");
+                window.scroll("dataset-extent-map", ScrollDelta::Lines(point(0., -100.)), cx);
+                let scrolled = window.find("dataset-properties").bounds();
+                assert!(scrolled.top() < content.top(), "The dialog body must own scrolling");
+                assert!(scrolled.bottom() <= surface.bottom(), "The last metadata section must remain reachable");
+                assert!(!view.read(cx).focus.is_focused(window));
+                window.press("escape", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.try_find("dataset-properties").is_none());
+                assert!(view.read(cx).focus.is_focused(window));
+            })
+            .unwrap();
+        }
+    }
+
+    fn assert_extent_corner_annotations(map: Bounds<Pixels>, window: &mut Window) {
+        let northwest = window.find("dataset-extent-nw");
+        let northeast = window.find("dataset-extent-ne");
+        let southwest = window.find("dataset-extent-sw");
+        let southeast = window.find("dataset-extent-se");
+        assert!(northwest.label().unwrap().starts_with("NW "));
+        assert!(northeast.label().unwrap().starts_with("NE "));
+        assert!(southwest.label().unwrap().starts_with("SW "));
+        assert!(southeast.label().unwrap().starts_with("SE "));
+        assert!(northwest.bounds().bottom() <= map.top() && northeast.bounds().bottom() <= map.top());
+        assert!(southwest.bounds().top() >= map.bottom() && southeast.bounds().top() >= map.bottom());
+        assert!(northwest.bounds().right() <= northeast.bounds().left());
+        assert!(southwest.bounds().right() <= southeast.bounds().left());
+    }
+
+    fn assert_cog_grid_annotations(map: Bounds<Pixels>, window: &mut Window) {
+        let dimensions = window.find("dataset-extent-dimensions");
+        assert_eq!(dimensions.label(), Some("512x512"));
+        let summary = dimensions.bounds();
+        let tolerance = px(0.5) / window.scale_factor();
+        assert!(summary.left() >= map.left() && summary.right() <= map.right());
+        assert!(summary.top() >= map.top() && summary.bottom() <= map.bottom());
+        let cell_size = window.find("dataset-extent-cell-size");
+        assert!(cell_size.label().unwrap().ends_with(" m"));
+        assert!(!cell_size.label().unwrap().contains("EPSG"));
+        let cell = cell_size.bounds();
+        assert!(cell.right() < map.right());
+        assert!((summary.left() - cell.left()).abs() <= tolerance, "Grid tags must share a left edge");
+        assert!((cell.top() - summary.bottom() - window.rem_size() * 0.5).abs() <= tolerance);
+        assert!((cell.left() - map.left() - window.rem_size()).abs() <= tolerance);
+        assert!((map.bottom() - cell.bottom() - window.rem_size()).abs() <= tolerance);
+        let crs = window.find("dataset-extent-crs");
+        assert_eq!(crs.label(), Some("EPSG:3857"));
+        let tag = crs.bounds();
+        assert!((tag.left() - map.left() - window.rem_size()).abs() <= tolerance);
+        assert!((tag.top() - map.top() - window.rem_size()).abs() <= tolerance);
+        assert!(tag.right() <= map.right() && tag.bottom() <= map.bottom());
     }
 
     #[gpui_kit::test]
@@ -1297,7 +1483,7 @@ mod tests {
         cx.update(gpui_kit::init);
         let directory = tempfile::tempdir().unwrap();
         let paths = write_separated_rasters(directory.path());
-        let (view, handle) = open_test_map(size(px(900.), px(760.)), cx);
+        let (view, handle) = open_test_map(size(px(900.), px(1100.)), cx);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             view.update(cx, |map, cx| map.open_paths(paths, cx));
@@ -2159,6 +2345,7 @@ mod tests {
                 assert_ne!(navigated, fitted);
                 let band = view.read(cx).raster.as_ref().unwrap().metadata().id;
                 assert_eq!(shown_band(view.read(cx)), Some(1));
+                reveal_right_band_controls(window, cx);
                 window.click("next-raster-band", cx);
                 (fitted, navigated, band)
             })
@@ -2182,6 +2369,16 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         cx.update(|cx| assert_eq!(view.read(cx).camera, fitted, "The explicit fit command must still fit the active band"));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.press("right", cx);
+            assert_ne!(view.read(cx).camera, fitted);
+            let button = window.find("fit-dataset-extent");
+            assert_ne!(button.disabled(), Some(true));
+            window.click("fit-dataset-extent", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(view.read(cx).camera, fitted, "The title-bar fit button must restore the active extent"));
     }
 
     #[gpui_kit::test]
@@ -2409,7 +2606,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("raster.tif");
         crate::raster_source::test_support::write_raster(&path, 4326, 2).unwrap();
-        let (view, handle) = open_test_map(size(px(1200.0), px(760.0)), cx);
+        let (view, handle) = open_test_map(size(px(1200.0), px(1100.0)), cx);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.hover("map-surface", cx);
@@ -2591,12 +2788,13 @@ mod tests {
     fn assert_right_band_pane_layout(window: &Window) {
         let layers = window.find("raster-layers-card").bounds();
         let range = window.find("raster-range-card").bounds();
+        let visualization = window.find("raster-visualization-card").bounds();
         let card = window.find("raster-band-controls").bounds();
         let controls = window.find("raster-controls").bounds();
         let map = window.find("map-surface").bounds();
         let gap = window.rem_size() * 0.75;
         // Layout order is meaningful even when upper cards have scrolled out of view.
-        for (above, below) in [(layers, range), (range, card)] {
+        for (above, below) in [(layers, range), (range, visualization), (visualization, card)] {
             assert!(
                 (below.top() - above.bottom() - gap).abs() <= px(1.0),
                 "Peer panes must share gap_3: {above:?}, {below:?}"
@@ -2669,13 +2867,16 @@ mod tests {
     fn check_band_card_scroll(window: &mut Window, cx: &mut App) {
         let layers = window.find("raster-layers-card").bounds();
         let card = window.find("raster-band-controls").bounds();
-        let clipped_above = layers.top() < window.find("raster-controls").bounds().top();
+        let visualization = window.find("raster-visualization-card").bounds();
+        assert!(
+            layers.top() < window.find("raster-controls").bounds().top(),
+            "The expanded pane must require scrolling"
+        );
         window.scroll("raster-band-controls", ScrollDelta::Lines(point(0.0, 1.0)), cx);
-        if clipped_above {
-            let shift = window.find("raster-band-controls").bounds().top() - card.top();
-            assert!(shift > px(0.0), "Wheel input over the band card must scroll the shared panel");
-            assert!((window.find("raster-layers-card").bounds().top() - layers.top() - shift).abs() <= px(1.0));
-        }
+        let shift = window.find("raster-band-controls").bounds().top() - card.top();
+        assert!(shift > px(0.0), "Wheel input over the band card must scroll the shared panel");
+        assert!((window.find("raster-layers-card").bounds().top() - layers.top() - shift).abs() <= px(1.0));
+        assert!((window.find("raster-visualization-card").bounds().top() - visualization.top() - shift).abs() <= px(1.0));
         // Restore the bottom before dragging or clicking, including in the short window.
         reveal_right_band_controls(window, cx);
         assert_right_band_controls_contained(window);
@@ -2735,14 +2936,14 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             let map = window.find("map-surface").bounds();
-            let range = window.find("raster-range-card").bounds();
+            let controls = window.find("raster-controls").bounds();
             let before = view.read(cx).camera;
             window.scroll("raster-layers-card", ScrollDelta::Lines(point(0.0, 1.0)), cx);
             let layers = window.find("raster-layers-card").bounds();
             let from = layers.origin + point(px(20.0), px(20.0));
             window.drag(from, from + point(px(20.0), px(20.0)), cx);
             assert_eq!(view.read(cx).camera, before, "The cards must own their input");
-            let below = point(range.center().x, (range.bottom() + map.bottom()) * 0.5);
+            let below = point(controls.center().x, (controls.bottom() + map.bottom()) * 0.5);
             assert!(below.y > window.find("raster-controls").bounds().bottom());
             window.dispatch_event(
                 ScrollEvent {
@@ -2859,7 +3060,7 @@ mod tests {
         let path = dir.path().join("variables.nc");
         crate::raster_source::test_support::write_multivariable_netcdf(&path, 4326, 2).unwrap();
         let mut view = None;
-        let handle = cx.open_window(size(px(900.0), px(760.0)), |window, cx| {
+        let handle = cx.open_window(size(px(900.0), px(1100.0)), |window, cx| {
             let map = cx.new(|cx| {
                 let map = new_test_map(window, cx);
                 map.open_paths(vec![path], cx);

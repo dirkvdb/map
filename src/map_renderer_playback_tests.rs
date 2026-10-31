@@ -152,6 +152,66 @@ fn freeze_native_callbacks(map: &mut NativeMap) {
 }
 
 #[test]
+#[ignore = "requires a wgpu-compatible graphics device; local COG and style, no network"]
+fn manual_band_changes_publish_intermediate_fades_and_settle_at_the_selected_band() -> Result<()> {
+    let fixture = Fixture::new()?;
+    for position in [0.0, 0.25, 19.25] {
+        assert_cold_band_fade(&fixture, position)?;
+    }
+    Ok(())
+}
+
+fn assert_cold_band_fade(fixture: &Fixture, position: f64) -> Result<()> {
+    let (mut map, mut request, outgoing) = settled_native_request(fixture.render_request(fixture.command(position, 1, false)))?;
+    request.reduce_motion = true;
+    request.playback = Some(fixture.command(42.0, 2, false));
+    let (_, _, incoming) = settled_native_request(request.clone())?;
+    assert_ne!(outgoing, incoming);
+    request.reduce_motion = false;
+    request.playback = Some(fixture.command(42.0, 4, false));
+    map.apply_render_request(&request)?;
+    assert!(
+        map.numeric.borrow().playback_frame().unwrap().is_buffering(),
+        "The selected window must not already be cached"
+    );
+    assert_native_band_fade(&mut map, &outgoing, &incoming)?;
+    assert_eq!(map.numeric.borrow().playback_frame().unwrap().position(), 42.0);
+    Ok(())
+}
+
+fn assert_native_band_fade(map: &mut NativeMap, outgoing: &RgbaImage, incoming: &RgbaImage) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut blended = false;
+    let mut final_image = None;
+    while !map.is_settled() {
+        ensure!(Instant::now() < deadline, "Manual band fade did not settle");
+        if let Some(texture) = map.poll_frame()? {
+            let image = map.read_frame(&texture)?;
+            assert_fade_pixel_bounds(&image, outgoing, incoming);
+            blended |= &image != outgoing && &image != incoming;
+            final_image = Some(image);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(blended, "The native frame pump must publish the fade, not just its final band");
+    assert!(final_image.as_ref() == Some(incoming));
+    Ok(())
+}
+
+fn assert_fade_pixel_bounds(image: &RgbaImage, outgoing: &RgbaImage, incoming: &RgbaImage) {
+    for ((pixel, from), to) in image.pixels().zip(outgoing.pixels()).zip(incoming.pixels()) {
+        for channel in 0..4 {
+            let lower = from[channel].min(to[channel]).saturating_sub(1);
+            let upper = from[channel].max(to[channel]).saturating_add(1);
+            assert!(
+                (lower..=upper).contains(&pixel[channel]),
+                "Fade pixel {pixel:?} must stay between {from:?} and {to:?}, never disappear"
+            );
+        }
+    }
+}
+
+#[test]
 fn renderer_failure_fallback_preserves_command_identity_position_and_buffering() -> Result<()> {
     let fixture = Fixture::new()?;
     let request = fixture.render_request(fixture.command(25.5, 9, true));

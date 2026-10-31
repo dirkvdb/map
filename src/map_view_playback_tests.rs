@@ -24,7 +24,7 @@ impl Harness {
             cx.set_reduce_motion(true);
         });
         let mut view = None;
-        let window = cx.open_window(size(px(1000.0), px(900.0)), |window, cx| {
+        let window = cx.open_window(size(px(1000.0), px(1100.0)), |window, cx| {
             let map = cx.new(|cx| MapView::with_renderer(None, window, cx));
             view = Some(map.clone());
             Root::new(map, window, cx)
@@ -221,6 +221,38 @@ fn pause_and_seek_revisions_reject_stale_images_feedback_and_errors(cx: &mut Tes
     harness.apply(missing_identity, cx);
     assert_eq!(harness.command(cx).position(), 4.0);
     cx.update(|cx| assert!(harness.view.read(cx).playback_frame.is_none()));
+}
+
+#[gpui_kit::test]
+fn timeline_click_from_fractional_playback_keeps_the_image_and_emits_a_paused_seek(cx: &mut TestAppContext) {
+    let harness = Harness::new(cx, 1);
+    cx.update(|cx| cx.set_reduce_motion(false));
+    harness.click("toggle-raster-playback", cx);
+    let playing = harness.command(cx);
+    let frame = harness.frame(Some(feedback(&playing, 1.25, false)), cx);
+    let outgoing = frame.image.as_ref().unwrap().clone();
+    harness.apply(frame, cx);
+    let before = cx.update(|cx| *harness.events.read(cx));
+    cx.update_window(harness.window, |_, window, cx| {
+        window.render_frame(cx);
+        let slider = window.find("raster-band-slider").bounds();
+        window.click_at("raster-band-slider", point(slider.size.width * 0.5, slider.size.height * 0.5), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let seek = harness.command(cx);
+    assert_eq!(seek.position(), 2.0);
+    assert!(!seek.is_playing());
+    assert!(seek.revision() > playing.revision() && seek.shares_bands(&playing));
+    cx.update(|cx| {
+        let view = harness.view.read(cx);
+        assert!(
+            Arc::ptr_eq(view.image.as_ref().unwrap(), &outgoing),
+            "A timeline click must not clear the displayed image"
+        );
+        assert_eq!(view.raster.as_ref().unwrap().metadata().id, playing.dataset_id().unwrap());
+        assert_eq!(*harness.events.read(cx), before + 1, "A timeline click must issue one coherent seek");
+    });
 }
 
 #[gpui_kit::test]

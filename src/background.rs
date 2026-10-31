@@ -1,5 +1,6 @@
-use gpui_kit::SharedString;
+use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::select::SelectItem;
+use gpui_kit::{App, SharedString};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +13,10 @@ pub enum BasemapStyle {
 }
 
 impl BasemapStyle {
+    /// The "Default" background choice: the vector style matching the appearance mode.
+    pub fn default_for_theme(cx: &App) -> Self {
+        if cx.theme().mode.is_dark() { Self::Dark } else { Self::Light }
+    }
     pub fn style_url(self) -> Option<&'static str> {
         match self {
             Self::Light => Some("https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"),

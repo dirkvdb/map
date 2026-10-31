@@ -17,6 +17,8 @@ pub struct PlaybackStyle {
     color_map_direction: Option<ColorMapDirection>,
     clamp_colors: Option<bool>,
     unscaling: Option<bool>,
+    extrusion: Option<(bool, f32)>,
+    extrusion_averaging: Option<bool>,
 }
 
 impl PlaybackStyle {
@@ -47,6 +49,35 @@ impl PlaybackStyle {
     pub fn with_unscaling(mut self, enabled: bool) -> Self {
         self.unscaling = Some(enabled);
         self
+    }
+
+    pub fn with_extrusion(mut self, enabled: bool, height: f32) -> Self {
+        self.extrusion = Some((enabled, crate::raster_source::normalized_extrusion_height(height)));
+        self
+    }
+
+    /// Overrides averaging for all playback bands without rebuilding their sources.
+    pub fn with_extrusion_averaging(mut self, enabled: bool) -> Self {
+        self.extrusion_averaging = Some(enabled);
+        self
+    }
+
+    /// The shared override, or None to retain each band's averaging setting.
+    pub fn extrusion_averaging(self) -> Option<bool> {
+        self.extrusion_averaging
+    }
+
+    /// Resolves averaging independently of whether extrusion is currently enabled.
+    pub fn extrusion_averaging_for(self, source: &RasterSource) -> bool {
+        self.extrusion_averaging().unwrap_or_else(|| source.is_extrusion_averaged())
+    }
+
+    pub fn extrusion(self) -> Option<(bool, f32)> {
+        self.extrusion
+    }
+
+    pub fn extrusion_for(self, source: &RasterSource) -> (bool, f32) {
+        self.extrusion().unwrap_or((source.is_extruded(), source.extrusion_height()))
     }
 
     pub fn range(self) -> Option<(f32, f32)> {
@@ -140,9 +171,14 @@ impl PlaybackRequest {
         }
     }
 
-    /// The paused initial command for a dataset with several playable bands.
+    /// The paused initial command, with a shared display range covering all playable bands.
     pub fn for_dataset(bands: &[Arc<RasterSource>]) -> Option<Self> {
-        (bands.len() > 1 && validate_bands(bands).is_ok()).then(|| Self::new(bands.to_vec(), 0.0, 0, false, 3.0, true))
+        if bands.len() < 2 || validate_bands(bands).is_err() {
+            return None;
+        }
+        let mut request = Self::new(bands.to_vec(), 0.0, 0, false, 3.0, true);
+        request.style = request.style.with_range(request.data_range()?).ok()?;
+        Some(request)
     }
 
     pub fn style(&self) -> PlaybackStyle {
@@ -288,6 +324,7 @@ mod tests {
     }
 
     #[test]
+
     fn dataset_bounds_include_every_band_in_the_selected_units() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let bands = sources(directory.path(), true)?;
@@ -308,6 +345,78 @@ mod tests {
         let edited = raw.clone().with_style(raw.style().with_range((10.0, 30.0))?);
         assert_eq!(edited.data_range(), raw.data_range());
         assert_eq!(edited.style().range(), Some((10.0, 30.0)));
+        Ok(())
+    }
+
+    #[test]
+    fn extrusion_averaging_defaults_to_each_band_and_supports_both_overrides() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let bands = sources(directory.path(), false)?;
+        let averaged = bands[1].with_extrusion_averaging(true)?;
+        let style = PlaybackStyle::default();
+        assert_eq!(style.extrusion_averaging(), None);
+        assert!(!style.extrusion_averaging_for(&bands[0]));
+        assert!(style.extrusion_averaging_for(&averaged));
+        for enabled in [true, false] {
+            let overridden = style.with_extrusion_averaging(enabled);
+            assert_eq!(overridden.extrusion_averaging(), Some(enabled));
+            assert_eq!(overridden.extrusion_averaging_for(&bands[0]), enabled);
+            assert_eq!(overridden.extrusion_averaging_for(&averaged), enabled);
+        }
+        assert!(!bands[0].is_extrusion_averaged());
+        assert!(averaged.is_extrusion_averaged());
+        Ok(())
+    }
+
+    #[test]
+    fn extrusion_averaging_override_survives_all_other_style_builders() -> Result<()> {
+        let style = PlaybackStyle::default().with_extrusion_averaging(true);
+        for restyled in [
+            style.with_palette(ColorMapPreset::Gray),
+            style.with_range((0.0, 100.0))?,
+            style.with_color_map_direction(ColorMapDirection::Reversed),
+            style.with_clamp_colors(false),
+            style.with_unscaling(false),
+            style.with_unscaling(true),
+            style.with_extrusion(false, 2.5),
+            style.with_extrusion(true, 7.0),
+        ] {
+            assert_eq!(restyled.extrusion_averaging(), Some(true));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_commands_share_all_band_bounds_without_modifying_sources() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut bands = sources(directory.path(), true)?;
+        bands[1] = bands[1].restyled(ColorMapPreset::Gray, (-1000.0, 2000.0))?;
+        let first = bands[0].data_range();
+        let second = bands[1].data_range();
+        let expected = (first.0.min(second.0), first.1.max(second.1));
+        let request = PlaybackRequest::for_dataset(&bands).unwrap();
+        assert_eq!(request.data_range(), Some(expected));
+        assert_eq!(request.style().range(), Some(expected));
+        for (original, band) in bands.iter().zip(request.bands()) {
+            assert!(Arc::ptr_eq(original, band));
+            assert_eq!(request.style().range_for(band), expected);
+        }
+        assert_eq!(bands[1].range(), (-1000.0, 2000.0));
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_bounds_follow_each_bands_units_but_not_style_ranges_or_position() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let bands = sources(directory.path(), true)?;
+        let first = bands[0].data_range_with_scale(RasterScale::default());
+        let second = bands[1].data_range_with_scale(RasterScale::default());
+        let expected = (first.0.min(second.0), first.1.max(second.1));
+        let request = PlaybackRequest::for_dataset(&bands).unwrap();
+        let style = request.style().with_unscaling(false).with_range((0.0, 1.0))?;
+        let request = request.with_style(style).with_controls(1.5, 1, true, 3.0);
+        assert_eq!(request.data_range(), Some(expected));
+
         Ok(())
     }
 
