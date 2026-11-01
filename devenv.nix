@@ -2,10 +2,10 @@
   pkgs,
   lib,
   inputs,
-  config,
   ...
 }:
 let
+  maplibreNative = import ./dist/maplibre-native.nix { inherit pkgs; };
   linuxHostLinker = pkgs.writeShellScript "map-linux-host-linker" ''
     # Override rustc's x86_64 LLD default: the bundled Nix wrapper contains
     # unresolved @mktemp@/@rm@ placeholders. Keep host code on Nix's binutils.
@@ -36,6 +36,7 @@ in
   cachix.pull = [ "geo-overlay" ];
 
   overlays = [
+    inputs.rust-overlay.overlays.default
     (inputs.pkgs-mod.lib.mkOverlay {
       static = true;
     })
@@ -102,15 +103,7 @@ in
       cores = 0
     '';
     RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
-    MAPLIBRE_NATIVE_FFI_LOCAL_BUILD =
-      "${config.devenv.root}/.devenv/maplibre-native-ffi-build/"
-      + (
-        if pkgs.stdenv.isDarwin then
-          (if pkgs.stdenv.hostPlatform.isAarch64 then "macos-arm64-metal" else "macos-x64-metal")
-        else
-          (if pkgs.stdenv.hostPlatform.isAarch64 then "linux-gnu-arm64-vulkan" else "linux-gnu-x64-vulkan")
-      )
-      + "/install";
+    MAPLIBRE_NATIVE_FFI_LOCAL_BUILD = "${maplibreNative}";
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     CC = "${pkgs.llvmPackages.clang}/bin/clang";
     CXX = "${pkgs.llvmPackages.clang}/bin/clang++";
@@ -137,7 +130,10 @@ in
     ];
   };
 
-  outputs = lib.optionalAttrs pkgs.stdenv.isLinux {
+  outputs = {
+    maplibre-native = maplibreNative;
+  }
+  // lib.optionalAttrs pkgs.stdenv.isLinux {
     linux-package = import ./dist/linux-package.nix {
       inherit inputs pkgs lib;
       hostLinker = linuxHostLinker;
@@ -151,11 +147,6 @@ in
 
   tasks."ci:checks" = {
     exec = "just check && just build && just test";
-  };
-
-  tasks."maplibre:prepare" = {
-    before = [ "devenv:enterShell" ];
-    exec = ''python3 "$DEVENV_ROOT/scripts/prepare_maplibre.py" --install-dir "$MAPLIBRE_NATIVE_FFI_LOCAL_BUILD"'';
   };
 
   scripts.knots.exec = ''

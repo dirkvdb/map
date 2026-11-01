@@ -1,17 +1,64 @@
 # Official MapLibre FFI native build handoff
 
+## Nix build (current workflow)
+
+`dist/maplibre-native.nix` is the shared native FFI derivation for the flake and
+devenv. It pins revision `6718eff7beeb927c6c629b4da617338b0b8fab03`, applies
+upstream's engine patches and Map's core patch, and includes both native
+extensions. Linux uses Vulkan; macOS uses Metal (x86_64 and aarch64 hosts).
+
+```sh
+nix build .#maplibre-native        # Native install prefix is ./result
+just maplibre                     # Native prefix is .devenv/maplibre-native-nix
+devenv build outputs.maplibre-native # Build with devenv's locked package set
+devenv shell -- cargo build       # Prefix exported automatically
+
+# Cargo outside devenv, after just maplibre:
+export MAPLIBRE_NATIVE_FFI_LOCAL_BUILD="$(readlink -f .devenv/maplibre-native-nix)"
+```
+
+Sources (including selected submodules), CMake downloads, and Rust dependencies
+are fixed-output Nix fetches; the native build runs offline. The result contains
+the official headers, complete static archive, platform archive and artifact
+descriptor. Install checks validate the revision, target, backend and extension
+symbols. Only the native extension sources/hooks/patches enter the native
+derivation's local source hash: changing application Rust code or this handoff
+does not rebuild C++. A changed pin, patch, native source or toolchain does.
+
+Nix retains successful builds locally and can distribute them through a binary
+cache. Publishing to Cachix is a separate action; no cache upload is automatic.
+Flake and devenv share the recipe, but differing locked nixpkgs/toolchain versions
+can produce different store paths. Release cross-compilation remains separate.
+
+Validated on x86_64 Linux: sandboxed configure/build/install and all install
+checks pass, including the SBOM and extension symbols. The flake and devenv build
+commands reuse the same cached store output with the current locks. Flake
+evaluation passes for all four
+platforms; macOS and aarch64 native builds have not been run here.
+
+The former Python preparation/build wrapper and its dedicated tests have been
+removed: the Nix derivation owns source preparation, extension injection,
+archive-symbol fixes and install validation. There is no longer a maintained
+manual non-Nix build wrapper. Existing local checkouts and build outputs are
+untouched.
+
+The historical manual-build and runtime-validation log below records commands
+for the removed wrapper; those commands are not current build instructions.
+Its `.devenv/maplibre-native-ffi-build` paths are not the Nix installation.
+
 **Latest test status:** the full Linux application suite passes **693 tests with
 zero failures and zero ignored tests**. The earlier image-test blockers below are
 resolved; see [test closure](#test-closure) for the fixes and reproduction command.
 Windows/macOS native runtime validation and release packaging remain separate work.
 
-The app dependency must use official `maplibre-native-ffi` git revision
-`6718eff7beeb927c6c629b4da617338b0b8fab03`. `scripts/prepare_maplibre.py`
-pins the same revision. This build task does not edit Cargo manifests or app source.
+The app dependency and `dist/maplibre-native.nix` must use the same official
+`maplibre-native-ffi` git revision, currently
+`6718eff7beeb927c6c629b4da617338b0b8fab03`. The native derivation does not edit
+Cargo manifests or app source.
 
 ## Extension coordination contract
 
-The build script composes these absolute project includes into a generated
+The Nix derivation composes these store-path includes into a generated
 `map-extensions.cmake` (passed as `CMAKE_PROJECT_INCLUDE`):
 
 - `crates/maplibre-custom-layer/cmake/inject.cmake`
@@ -28,68 +75,27 @@ The hooks must use distinct function names. If additional generated shaders or
 libraries are needed, arrange them from that hook. Both extensions are required
 for a full build; there is deliberately no silent custom-layer-only fallback.
 
-The script first runs official `tools/deps/sync-submodules`, then applies
+The fixed-output source fetch runs official `tools/deps/sync-submodules` in an
+isolated checkout. The native derivation then applies
 `crates/maplibre-custom-layer/patches/*.patch` to `third_party/maplibre-native`.
 It uses upstream CMake presets, builds Release, installs the official artifact
-layout, and validates the descriptor revision/target/backend and complete static
-archive. Tests/fixtures are disabled for the application library build.
-Linux and Windows select Vulkan; macOS selects Metal. Windows presets require
-the official MSVC/clang toolchain, not the legacy MinGW/wgpu packaging setup.
+layout, and validates the descriptor revision/target/backend, static archives,
+SBOM and extension symbols. Tests/fixtures are disabled for the application
+library build. Linux selects Vulkan; macOS selects Metal. The Nix derivation
+supports native x86_64/aarch64 Linux and macOS, not Windows cross-compilation.
+Windows requires the official MSVC/clang toolchain, not the legacy MinGW/wgpu
+packaging setup.
 
-## Commands and environment
+## Install environment
 
-```sh
-# Sources only; no compositor hook or compiler required yet.
-python3 scripts/prepare_maplibre.py --prepare-only
+`MAPLIBRE_NATIVE_FFI_LOCAL_BUILD` must be an **absolute install prefix**, not a
+source or build directory. Devenv exports the native derivation's store path
+automatically; for Cargo outside devenv, use the export in the Nix commands above.
+The prefix contains `share/maplibre-native-c/artifact.json`,
+`lib/libmaplibre-native-c.a` and `lib/libmln_ffi_platform.a`. Upstream prebuilt
+archives do not contain Map's extensions and must not be used instead.
 
-# Build and install both extensions inside the configured native environment.
-just maplibre
-
-# Select another official target or supply SDK/toolchain options explicitly.
-python3 scripts/prepare_maplibre.py --target aarch64-apple-darwin --jobs 4
-```
-
-Default source checkout: `.devenv/maplibre-native-ffi-map`.
-Default build/install: `.devenv/maplibre-native-ffi-build/<official-preset>/install`.
-The additional source directory avoids reusing the earlier manually prepared
-`.devenv/maplibre-native-ffi` checkout. A positional argument selects a different
-source checkout; `--build-dir` and `--install-dir` override output paths.
-Extra CMake options use `--cmake-arg=-DNAME=value`.
-
-For the current x86_64 Linux host, the app's environment must be:
-
-```sh
-export MAPLIBRE_NATIVE_FFI_LOCAL_BUILD=/home/dirk/dev/map/.devenv/maplibre-native-ffi-build/linux-gnu-x64-vulkan/install
-```
-
-**This prefix now contains a validated Linux Vulkan native installation.**
-The complete static archive is approximately 47 MiB, and the separately installed
-Rust platform archive is approximately 64 MiB. Both native extensions are present;
-the parent can use this environment for Cargo checks/tests now.
-
-This is an **absolute install prefix**, not a source or build directory. Devenv
-exports the host's corresponding prefix and its existing preparation task now
-builds/installs FFI. Successful standalone builds print the export, but cannot
-modify their caller's environment. The prefix must contain
-`share/maplibre-native-c/artifact.json` and `lib/libmaplibre-native-c.a`
-(or `lib/maplibre-native-c-static.lib` on MSVC). Upstream prebuilt archives do not
-contain Map's extensions and must not be used instead.
-
-Linux official presets require Zig plus Rust's `llvm-tools` component; devenv
-now supplies both, and `cargo-about` for upstream's license inventory generation. Apple requires its native SDK; Windows requires the upstream
-preset's clang/MSVC SDK setup. Existing GPUI setup is unchanged.
-
-## Checkout safety
-
-Upstream preparation uses forced submodule checkouts internally. This wrapper
-allows it only on an entirely clean, unrecorded tree. It records the exact
-post-patch state, including staged/unstaged edits and nonignored untracked file
-contents in initialized nested submodules. Subsequent runs validate that state
-and skip upstream's forced reset. User edits or changed preparation patches
-cause an actionable refusal; use a fresh checkout rather than resetting edits.
-Ignored build outputs are not part of the preparation snapshot.
-
-## Current validation / blockers
+## Historical manual-build validation / blockers
 
 - Original `.devenv/maplibre-native-ffi` root remains untouched at `d47a1fb...`.
   Its core and several nested submodules have pre-existing patch changes despite

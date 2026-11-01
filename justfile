@@ -45,9 +45,9 @@ generate-package-icons:
     convert data/icon.png -resize '512x512!' dist/icon_512x512.png
     convert data/icon.png -resize '1024x1024!' dist/icon_512x512@2x.png
 
-# Build/install official FFI plus Map's native custom-layer/compositor extensions.
+# Build the cacheable native FFI derivation independently of the application.
 maplibre args='':
-    python3 scripts/prepare_maplibre.py {{ args }}
+    nix build .#maplibre-native --out-link .devenv/maplibre-native-nix {{ args }}
 
 # Refresh bundled themes from the source revision of gpui-kit in Cargo.lock.
 sync-themes:
