@@ -187,14 +187,14 @@ fn zero_limit_terminates_at_zoom_zero() -> Result<()> {
 }
 
 #[test]
-fn height_union_uses_each_sources_own_selected_zoom_before_coverage_budgeting() -> Result<()> {
+fn height_union_uses_each_sources_native_zoom_before_coverage_budgeting() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let coarse = coverage_source(&directory.path().join("coarse.tif"), [-40.0, -20.0, 40.0, 20.0])?;
     let fine = coverage_source(&directory.path().join("fine.tif"), [-0.05, -0.05, 0.05, 0.05])?;
     let p = orthographic(5.0, 0.0, 60.0, 64.0, 0.0);
     let coarse_height = extrusion_height::maximum(&p, &coarse, 1.0);
     let fine_height = extrusion_height::maximum(&p, &fine, 1.0);
-    assert!(selected_zoom(&p, &coarse) < selected_zoom(&p, &fine));
+    assert!(coarse.metadata().max_zoom < fine.metadata().max_zoom);
     assert!(coarse_height > fine_height);
     assert_eq!(maximum_height(&p, &[(&coarse, 1.0), (&fine, 1.0)]), coarse_height);
     assert_eq!(maximum_height(&p, &[(&coarse, 0.0), (&fine, 1.0)]), fine_height);

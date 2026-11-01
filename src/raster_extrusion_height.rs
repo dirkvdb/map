@@ -3,7 +3,6 @@
 use geo::constants::LATITUDE_MAX;
 use maplibre_native::WgpuLayerParameters;
 
-use super::selected_zoom;
 use crate::raster_source::{EXTRUSION_HEIGHT_FACTOR, RasterSource};
 
 const EARTH_CIRCUMFERENCE: f64 = std::f64::consts::TAU * 6_378_137.0;
@@ -38,10 +37,10 @@ pub fn pixels_per_meter(parameters: &WgpuLayerParameters) -> f64 {
 
 /// Maximum extrusion height in projection-input meters, shared by CPU and GPU.
 ///
-/// The nominal pixel width is fixed by the source-selected zoom, before coverage
-/// budgeting or cached-ancestor selection. Rendered tile zoom, texture grid size,
-/// DPI, geometry LOD, and averaging must not change this height. The shader still
-/// normalizes values and multiplies them by this maximum.
+/// The nominal pixel width is fixed by the source's native maximum tile zoom.
+/// Camera zoom scales that width continuously, without integer tile-zoom jumps.
+/// Rendered tile zoom, texture grid size, DPI, geometry LOD, and averaging must
+/// not change this reference. The shader normalizes values against this maximum.
 ///
 /// Disabled/non-finite styles, invalid parameters/scales, and results that cannot
 /// be represented by a finite f32 GPU uniform return zero.
@@ -53,8 +52,10 @@ pub fn maximum(parameters: &WgpuLayerParameters, source: &RasterSource, height: 
     if scale <= 0.0 {
         return 0.0;
     }
-    let pixels = f64::from(source.metadata().tile_size.unwrap_or(256).max(1));
-    let pixel_width = 512.0 * (parameters.zoom - f64::from(selected_zoom(parameters, source))).exp2() / pixels;
+    let metadata = source.metadata();
+    let pixels = f64::from(metadata.tile_size.unwrap_or(256).max(1));
+    let native_zoom = f64::from(metadata.max_zoom.clamp(0, 22));
+    let pixel_width = 512.0 * (parameters.zoom - native_zoom).exp2() / pixels;
     let meters = positive_finite(pixel_width * f64::from(height) * f64::from(EXTRUSION_HEIGHT_FACTOR) / scale);
     if meters <= f64::from(f32::MAX) { meters } else { 0.0 }
 }

@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use super::*;
-use crate::raster_tiles::{extrusion_view, test_support::parameters, tests::coverage_source};
+use crate::raster_tiles::{extrusion_view, selected_zoom, test_support::parameters, tests::coverage_source};
 
 fn orientations() -> impl Iterator<Item = (f64, f64)> {
     [0.0, 30.0, 60.0]
@@ -143,7 +143,7 @@ fn nonfinite_matrix_entries_and_invalid_orthographic_parameters_return_zero_scal
 }
 
 #[test]
-fn source_selected_zoom_controls_maximum_world_height_at_every_camera_angle() -> Result<()> {
+fn native_source_zoom_controls_maximum_world_height_at_every_camera_angle() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let source = coverage_source(&directory.path().join("height.tif"), [-0.05, -0.05, 0.05, 0.05])?;
     for zoom in [0.0, 1.8, 5.0] {
@@ -151,12 +151,28 @@ fn source_selected_zoom_controls_maximum_world_height_at_every_camera_angle() ->
             for (pitch, bearing) in orientations() {
                 let (p, eye_scale, _) = native_parameters(zoom, latitude, pitch, bearing);
                 let pixels = f64::from(source.metadata().tile_size.unwrap_or(256).max(1));
-                let nominal = 512.0 * (zoom - f64::from(selected_zoom(&p, &source))).exp2() / pixels * 2.0 * f64::from(EXTRUSION_HEIGHT_FACTOR);
+                let nominal = 512.0 * (zoom - f64::from(source.metadata().max_zoom.clamp(0, 22))).exp2() / pixels * 2.0 * f64::from(EXTRUSION_HEIGHT_FACTOR);
                 let meters = maximum(&p, &source, 2.0);
                 assert_relative(meters * eye_scale, nominal);
                 assert!((meters as f32).is_finite());
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn maximum_world_height_scales_smoothly_across_tile_zoom_boundaries() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let source = coverage_source(&directory.path().join("zoom-height.tif"), [-0.05, -0.05, 0.05, 0.05])?;
+    let native_zoom = f64::from(source.metadata().max_zoom.clamp(0, 22));
+    assert!(native_zoom > 6.0, "Fixture must exercise multiple tile zoom transitions");
+    let reference = parameters(native_zoom);
+    let reference_world_height = maximum(&reference, &source, 2.0) * pixels_per_meter(&reference);
+    for zoom in [0.0, 0.000001, 1.999999, 2.0, 2.000001, 5.999999, 6.0, 6.000001, native_zoom, native_zoom + 1.0] {
+        let p = parameters(zoom);
+        let world_height = maximum(&p, &source, 2.0) * pixels_per_meter(&p);
+        assert_relative(world_height, reference_world_height * (zoom - native_zoom).exp2());
     }
     Ok(())
 }
@@ -175,7 +191,8 @@ fn maximum_is_unchanged_when_actual_coverage_uses_a_coarser_grid() -> Result<()>
     assert!(detailed.iter().all(|tile| tile.z == selected_zoom(&p, &source)));
     assert!(coarse.iter().all(|tile| tile.z < selected_zoom(&p, &source)));
     assert_eq!(extrusion_view::maximum_height(&p, &sources), meters);
-    assert_relative(meters * pixels_per_meter(&p), 10.0);
+    let native_zoom = f64::from(source.metadata().max_zoom.clamp(0, 22));
+    assert_relative(meters * pixels_per_meter(&p), 20.0 * (p.zoom - native_zoom).exp2());
     assert_eq!(maximum(&p, &source, 1.0), meters);
     Ok(())
 }

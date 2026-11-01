@@ -181,8 +181,8 @@ impl RasterSource {
         self.extruded
     }
 
-    /// Maximum bar height in units of ten nominal raster-pixel widths, before
-    /// coverage/cache/geometry coarsening. Each scaled value multiplies this by
+    /// Maximum bar height in units of ten native-resolution raster-pixel widths,
+    /// independent of camera zoom and coverage/cache/geometry coarsening. Each scaled value multiplies this by
     /// its clamped position within the color-map range.
     pub fn extrusion_height(&self) -> f32 {
         self.extrusion_height
