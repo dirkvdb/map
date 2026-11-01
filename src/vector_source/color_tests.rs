@@ -72,7 +72,7 @@ fn absent_numeric_values_keep_uniform_theme_coloring() -> Result<()> {
         for layer in source.layers_json(0.25, "rgb(12,34,56)") {
             let kind = layer["type"].as_str().unwrap();
             assert_eq!(layer["paint"][format!("{kind}-color")], "rgb(12,34,56)");
-            maplibre_native::AnyLayer::from_json_value(&layer)?;
+            crate::map_renderer::native_api_tests::validate_layer(&layer)?;
         }
     }
     Ok(())
@@ -202,7 +202,7 @@ fn every_geometry_uses_guarded_palette_stops_with_independent_opacity() -> Resul
                 assert_eq!(interpolation[4 + ix * 2], css(palette.get_color_by_value(ix as u8)));
             }
             assert_eq!(layer["paint"][format!("{kind}-opacity")], 0.375);
-            maplibre_native::AnyLayer::from_json_value(&layer)?;
+            crate::map_renderer::native_api_tests::validate_layer(&layer)?;
         }
     }
     Ok(())
@@ -248,7 +248,7 @@ fn normalized_interpolation_handles_tiny_adjacent_and_overflowing_ranges() -> Re
         assert_eq!(numeric_expression(normalized, -f64::MAX), 0.0);
         assert_eq!(numeric_expression(normalized, f64::MAX), 1.0);
         for layer in styled.layers_json(1.0, "red") {
-            maplibre_native::AnyLayer::from_json_value(&layer)?;
+            crate::map_renderer::native_api_tests::validate_layer(&layer)?;
         }
     }
     Ok(())
@@ -412,7 +412,7 @@ fn tiled_archives_use_schema_ranges_and_remain_native_after_styling() -> Result<
         assert_ne!(styled.style_id(), source.style_id());
         for layer in styled.layers_json(0.5, "red") {
             assert_eq!(layer["source-layer"], "values");
-            maplibre_native::AnyLayer::from_json_value(&layer)?;
+            crate::map_renderer::native_api_tests::validate_layer(&layer)?;
         }
     }
     Ok(())

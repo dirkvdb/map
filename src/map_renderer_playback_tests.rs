@@ -119,6 +119,47 @@ fn ready_revision(frame: &MapFrame, revision: u64) -> bool {
         .is_some_and(|playback| playback.revision() == revision && !playback.is_buffering())
 }
 
+#[test]
+#[ignore = "release-mode cadence measurement; requires native Vulkan/Metal and wgpu devices"]
+fn worker_playback_frame_cadence() -> Result<()> {
+    let fixture = Fixture::new()?;
+    for size in [512, 1024] {
+        let renderer = MapRenderer::with_test_style(tests::DARK_STYLE)?;
+        let mut request = fixture.map_request();
+        request.viewport.width = NonZeroU32::new(size).unwrap();
+        request.viewport.height = NonZeroU32::new(size).unwrap();
+        request.camera = MapCamera::fit_bounds(fixture.bands[0].metadata().bounds, f64::from(size), f64::from(size));
+        send(&renderer, request, fixture.command(0.0, 1, true))?;
+        measure_worker_cadence(&renderer.frames(), size)?;
+    }
+    Ok(())
+}
+
+fn measure_worker_cadence(frames: &async_channel::Receiver<MapFrame>, size: u32) -> Result<()> {
+    for _ in 0..10 {
+        receive_matching(frames, |frame| ready_revision(frame, 1))?;
+    }
+    let started = Instant::now();
+    let mut previous = started;
+    let mut intervals = Vec::with_capacity(60);
+    for _ in 0..60 {
+        receive_matching(frames, |frame| ready_revision(frame, 1))?;
+        let now = Instant::now();
+        intervals.push(now.duration_since(previous));
+        previous = now;
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    intervals.sort_unstable();
+    eprintln!(
+        "{size}x{size} worker playback: {:.1} fps, mean {:.2} ms, p50 {:.2} ms, p95 {:.2} ms",
+        60.0 / elapsed,
+        elapsed * 1000.0 / 60.0,
+        intervals[30].as_secs_f64() * 1000.0,
+        intervals[57].as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
 fn settled_native(fixture: &Fixture) -> Result<(NativeMap, RenderRequest, RgbaImage)> {
     settled_native_request(fixture.render_request(fixture.command(0.0, 1, false)))
 }
@@ -146,8 +187,7 @@ fn settle(map: &mut NativeMap) -> Result<RgbaImage> {
 }
 
 fn freeze_native_callbacks(map: &mut NativeMap) {
-    map.renderer.map_observer().set_did_become_idle_callback(|| {});
-    map.renderer.set_render_requested_callback(|| {});
+    map.callbacks_frozen = true;
     map.needs_frame.set(false);
 }
 
@@ -171,11 +211,11 @@ fn assert_cold_band_fade(fixture: &Fixture, position: f64) -> Result<()> {
     request.playback = Some(fixture.command(42.0, 4, false));
     map.apply_render_request(&request)?;
     assert!(
-        map.numeric.borrow().playback_frame().unwrap().is_buffering(),
+        lock(&map.numeric).playback_frame().unwrap().is_buffering(),
         "The selected window must not already be cached"
     );
     assert_native_band_fade(&mut map, &outgoing, &incoming)?;
-    assert_eq!(map.numeric.borrow().playback_frame().unwrap().position(), 42.0);
+    assert_eq!(lock(&map.numeric).playback_frame().unwrap().position(), 42.0);
     Ok(())
 }
 
@@ -389,7 +429,7 @@ fn playing_raster_does_not_exempt_stalled_native_work_from_timeout() -> Result<(
     let (mut map, mut request, _) = settled_native(&fixture)?;
     request.playback = Some(fixture.command(0.0, 2, true));
     map.apply_render_request(&request)?;
-    assert!(!map.numeric.borrow().is_loading());
+    assert!(!lock(&map.numeric).is_loading());
     freeze_native_callbacks(&mut map);
     map.idle.set(false);
     let expired = Instant::now() - Duration::from_secs(1);
@@ -407,7 +447,7 @@ fn playing_buffered_raster_does_not_renew_deadline_even_when_native_is_idle() ->
     request.playback = Some(fixture.command(42.5, 2, true));
     map.apply_render_request(&request)?;
     assert!(
-        map.numeric.borrow().is_loading(),
+        lock(&map.numeric).is_loading(),
         "The last partial window must not have been prefetched at band zero"
     );
     freeze_native_callbacks(&mut map);
@@ -430,7 +470,7 @@ fn ready_playing_raster_renews_deadline_without_changing_the_native_camera() -> 
     freeze_native_callbacks(&mut map);
     map.idle.set(true);
     map.deadline = Instant::now() - Duration::from_secs(1);
-    assert!(map.poll_frame()?.is_some());
+    let _ = tests::wait_for_native_frame(&mut map)?;
     assert!(map.deadline > Instant::now());
     assert_eq!(map.camera_updates, camera_updates);
     Ok(())
@@ -455,19 +495,20 @@ fn shared_band_range_drag_renders_latest_colors_without_changing_anchor_or_clock
     }
     assert_ne!(before.as_raw(), after.as_raw());
     assert_eq!(map.raster.as_ref().unwrap().id(), anchor);
-    assert_eq!(map.numeric.borrow().playback_frame().unwrap().position(), 3.25);
+    assert_eq!(lock(&map.numeric).playback_frame().unwrap().position(), 3.25);
     assert_eq!(map.camera_updates, camera_updates);
-    assert_final_range_matches_legacy(&fixture, &mut map, request, &after)
+    assert_final_range_matches_restyled_sources(&fixture, &mut map, request, &after)
 }
 
-fn assert_final_range_matches_legacy(fixture: &Fixture, map: &mut NativeMap, mut request: RenderRequest, after: &RgbaImage) -> Result<()> {
-    // The final pixels must exactly match a direct legacy source restyle.
+fn assert_final_range_matches_restyled_sources(fixture: &Fixture, map: &mut NativeMap, mut request: RenderRequest, after: &RgbaImage) -> Result<()> {
+    // Constructors select the all-band data range. Explicitly match the 0–700
+    // display range when comparing replacement band styles to range-only edits.
     let styled = fixture
         .bands
         .iter()
         .map(|band| band.restyled(ColorMapPreset::Gray, (0.0, 700.0)))
         .collect::<Result<Vec<_>>>()?;
-    request.playback = Some(PlaybackRequest::new(styled, 0.0, 7, false, 2.0, true));
+    request.playback = Some(PlaybackRequest::new(styled, 0.0, 7, false, 2.0, true).with_style(PlaybackStyle::default().with_range((0.0, 700.0))?));
     map.apply_render_request(&request)?;
     let expected = settle(map)?;
     assert_eq!(after.as_raw(), expected.as_raw());
@@ -481,7 +522,7 @@ fn same_revision_restyle_changes_pixels_without_rewinding_or_updating_camera() -
     let request = fixture.render_request(fixture.command(3.25, 7, false));
     let (mut map, mut request, before) = settled_native_request(request)?;
     let updates = map.camera_updates;
-    let position = map.numeric.borrow().playback_frame().unwrap().position();
+    let position = lock(&map.numeric).playback_frame().unwrap().position();
     let styled = fixture
         .bands
         .iter()
@@ -493,7 +534,7 @@ fn same_revision_restyle_changes_pixels_without_rewinding_or_updating_camera() -
     map.apply_render_request(&request)?;
     let after = settle(&mut map)?;
     assert_ne!(before.as_raw(), after.as_raw());
-    assert_eq!(map.numeric.borrow().playback_frame().unwrap().position(), position);
+    assert_eq!(lock(&map.numeric).playback_frame().unwrap().position(), position);
     assert_eq!(map.camera_updates, updates);
     assert!(map.camera == Some(request.map.camera));
     Ok(())

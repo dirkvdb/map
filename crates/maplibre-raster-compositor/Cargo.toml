@@ -1,0 +1,16 @@
+[package]
+name = "maplibre-raster-compositor"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+description = "Native in-pass Vulkan/Metal compositor for MapLibre custom layers"
+
+[dependencies]
+maplibre-custom-layer = { path = "../maplibre-custom-layer" }
+thiserror = "2"
+
+[features]
+vulkan = ["maplibre-custom-layer/vulkan"]
+metal = ["maplibre-custom-layer/metal"]
+
+[workspace]

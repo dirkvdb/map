@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 
-use maplibre_native::WgpuLayerParameters;
+use crate::raster_parameters::WgpuLayerParameters;
 
 use crate::raster_tiles::VisibleTile;
 

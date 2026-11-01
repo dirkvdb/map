@@ -39,6 +39,7 @@ pub(super) struct WindowWorkers {
     jobs: async_channel::Sender<WindowJob>,
     results: async_channel::Receiver<WindowResult>,
     generation: Arc<AtomicU64>,
+    threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl WindowWorkers {
@@ -46,20 +47,23 @@ impl WindowWorkers {
         let (jobs, receiver) = async_channel::bounded::<WindowJob>(MAX_JOBS);
         let (results, completed) = async_channel::bounded(MAX_JOBS);
         let generation = Arc::new(AtomicU64::new(0));
+        let mut workers = Self {
+            jobs,
+            results: completed,
+            generation: generation.clone(),
+            threads: Vec::new(),
+        };
         for index in 0..2 {
             let receiver = receiver.clone();
             let results = results.clone();
             let generation = generation.clone();
-            std::thread::Builder::new()
+            let thread = std::thread::Builder::new()
                 .name(format!("multiband-tiles-{index}"))
                 .spawn(move || run_worker(receiver, results, generation))
                 .context("Could not start multiband tile workers")?;
+            workers.threads.push(thread);
         }
-        Ok(Self {
-            jobs,
-            results: completed,
-            generation,
-        })
+        Ok(workers)
     }
 
     pub fn reset(&self) -> u64 {
@@ -87,6 +91,13 @@ impl Drop for WindowWorkers {
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.jobs.close();
         self.results.close();
+        // Cancellation is cooperative during I/O. Join after closing both
+        // queues so no native decoder or TLS destructor outlives its owner.
+        for thread in self.threads.drain(..) {
+            if thread.join().is_err() {
+                log::error!("Multiband tile worker panicked during shutdown");
+            }
+        }
     }
 }
 
@@ -227,6 +238,15 @@ pub(super) use crate::raster_source::test_support::cog_fixture;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_workers_joins_threads_and_releases_shared_state() -> Result<()> {
+        let workers = WindowWorkers::new()?;
+        let generation = workers.generation.clone();
+        drop(workers);
+        assert_eq!(Arc::strong_count(&generation), 1);
+        Ok(())
+    }
 
     fn wait_for_result(workers: &WindowWorkers) -> Result<WindowResult> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

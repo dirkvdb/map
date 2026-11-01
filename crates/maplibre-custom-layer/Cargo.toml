@@ -1,0 +1,17 @@
+[package]
+name = "maplibre-custom-layer"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+description = "Isolated CustomLayerHost bridge for the pinned MapLibre Native FFI"
+
+[dependencies]
+maplibre-native-ffi = { git = "https://github.com/maplibre/maplibre-native-ffi", rev = "6718eff7beeb927c6c629b4da617338b0b8fab03" }
+thiserror = "2"
+
+[features]
+metal = ["maplibre-native-ffi/metal"]
+vulkan = ["maplibre-native-ffi/vulkan"]
+
+# Keep this independently testable without changing the application's workspace.
+[workspace]

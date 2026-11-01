@@ -154,8 +154,7 @@ fn settled_native_map_ignores_expired_deadline_but_pending_work_still_times_out(
     // Test deadline handling after real native settlement, not the number of
     // callback/render turns needed to get there. Freeze callbacks so tick cannot
     // race the explicit pending-work flags below.
-    map.renderer.map_observer().set_did_become_idle_callback(|| {});
-    map.renderer.set_render_requested_callback(|| {});
+    map.callbacks_frozen = true;
     let deadline = Instant::now();
     map.deadline = deadline;
     assert!(map.poll_frame()?.is_none());
@@ -177,6 +176,69 @@ fn settled_native_map_ignores_expired_deadline_but_pending_work_still_times_out(
     );
     assert!(map.needs_frame.get(), "Expired work must fail before rendering");
     assert_eq!(map.deadline, deadline, "Pending repaint must not extend the deadline");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires native Vulkan/Metal and wgpu devices; local raster and style, no network"]
+fn completed_raster_frames_are_handed_off_before_starting_another_native_frame() -> Result<()> {
+    let (_directory, bands) = crate::raster_source::test_support::cog_fixture(1)?;
+    let source = bands[0].clone();
+    let viewport = Viewport {
+        width: NonZeroU32::new(64).unwrap(),
+        height: NonZeroU32::new(64).unwrap(),
+        scale: 1.0,
+    };
+    let request = MapRequest {
+        viewport,
+        camera: MapCamera::fit_bounds(source.metadata().bounds, 64.0, 64.0),
+    };
+    let mut map = NativeMap::with_style(viewport, Some(tests::DARK_STYLE))?;
+    map.set_raster(Some(source), 1.0)?;
+    map.apply_request(request)?;
+    let mut frames = 0;
+    loop {
+        if map.poll_frame()?.is_some() {
+            frames += 1;
+            assert!(!map.frame_pending, "Future native callbacks must not advance state before image handoff");
+            if map.rendered_update < map.latest_update {
+                assert!(!map.is_settled(), "Deferring a frame request must not hide an unrendered native update");
+            }
+        }
+        if map.is_settled() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(frames > 0, "The handoff check must observe an actual native raster frame");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native Vulkan/Metal device; local style, no network"]
+fn attached_session_resizes_map_and_readback_without_replacing_native_handles() -> Result<()> {
+    let viewport = Viewport {
+        width: NonZeroU32::new(32).unwrap(),
+        height: NonZeroU32::new(24).unwrap(),
+        scale: 1.0,
+    };
+    let mut map = NativeMap::with_style(viewport, Some(tests::DARK_STYLE))?;
+    let handles = (map.renderer.id(), map.session.id());
+    // Scale is fixed at attachment; the worker recreates the map on DPI changes.
+    for (width, height) in [(32, 24), (96, 72), (24, 16)] {
+        let request = MapRequest {
+            viewport: Viewport {
+                width: NonZeroU32::new(width).unwrap(),
+                height: NonZeroU32::new(height).unwrap(),
+                scale: 1.0,
+            },
+            camera: MapCamera::default(),
+        };
+        let image = map.render(request)?;
+        assert_eq!(image.dimensions(), (width, height));
+        assert!(map.viewport == request.viewport);
+        assert_eq!((map.renderer.id(), map.session.id()), handles);
+    }
     Ok(())
 }
 

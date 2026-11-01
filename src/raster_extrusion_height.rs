@@ -1,7 +1,7 @@
 //! Convert nominal raster-pixel heights to the meter-valued Z input of MapLibre's projection.
 
+use crate::raster_parameters::WgpuLayerParameters;
 use geo::constants::LATITUDE_MAX;
-use maplibre_native::WgpuLayerParameters;
 
 use super::selected_zoom;
 use crate::raster_source::{EXTRUSION_HEIGHT_FACTOR, RasterSource};

@@ -1,7 +1,9 @@
 //! Shader-colored numeric rasters rendered by a native MapLibre custom layer.
 
+#[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,12 +12,14 @@ use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use geo::Tile;
 use inf::colormap::{ColorMapDirection, ColorMapPreset};
-use maplibre_native::{WgpuCustomLayer, WgpuLayerParameters, texture_format_from_webgpu};
 use wgpu::util::DeviceExt;
 
 use crate::multiband_layer::MultibandLayer;
 use crate::raster_composite::{PaletteOpacity, RasterComposite};
 use crate::raster_extrusion_animation::ExtrusionAnimation;
+#[cfg(test)]
+use crate::raster_parameters::WgpuCustomLayer;
+use crate::raster_parameters::{WgpuLayerParameters, texture_format_from_webgpu};
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest};
 use crate::raster_source::{NumericTile, RasterSource};
 use crate::raster_tiles::{MAX_PENDING_TILES, TileWorkers, VisibleTile, extrusion_view, parent_uv, tile_matrix, transition_tiles, visible_tiles};
@@ -85,7 +89,7 @@ struct DrawTile {
 }
 
 struct RasterPipeline {
-    formats: (u32, u32, bool),
+    formats: (u32, u32, bool, bool),
     pipeline: wgpu::RenderPipeline,
     extrusion_pipeline: wgpu::RenderPipeline,
     extrusion_indices: wgpu::Buffer,
@@ -114,6 +118,25 @@ impl PreviousRaster {
     }
 }
 
+struct RetainedRasterTiles {
+    source_id: tiler::LayerId,
+    dpi: u8,
+    cache: HashMap<Tile, CachedTile>,
+    bytes: usize,
+}
+
+impl RetainedRasterTiles {
+    fn trim(&mut self, bytes: usize, tiles: usize) {
+        while self.bytes > bytes || self.cache.len() > tiles {
+            let oldest = self.cache.iter().min_by_key(|(_, tile)| tile.used).map(|(key, _)| *key);
+            let Some(oldest) = oldest else { break };
+            if let Some(tile) = self.cache.remove(&oldest) {
+                self.bytes -= tile.texture.as_ref().map_or(0, |texture| texture.bytes);
+            }
+        }
+    }
+}
+
 pub struct RasterLayer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -136,6 +159,8 @@ pub struct RasterLayer {
     cache_bytes: usize,
     waiting: bool,
     previous: Option<PreviousRaster>,
+    previous_dpi: u8,
+    retained: Option<RetainedRasterTiles>,
     fade_started: Option<Instant>,
     queued: Option<(Arc<RasterSource>, u8)>,
     reduce_motion: bool,
@@ -172,6 +197,8 @@ impl RasterLayer {
             cache_bytes: 0,
             waiting: false,
             previous: None,
+            previous_dpi: 1,
+            retained: None,
             fade_started: None,
             queued: None,
             reduce_motion: false,
@@ -183,6 +210,25 @@ impl RasterLayer {
             #[cfg(test)]
             uploads: 0,
         })
+    }
+
+    pub(crate) fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub(crate) fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Includes outgoing fades and growing/collapsing static or multiband surfaces.
+    pub(crate) fn is_extruded(&self) -> bool {
+        if let Some(layer) = &self.multiband {
+            return layer.is_extruded();
+        }
+        self.source
+            .as_ref()
+            .is_some_and(|source| self.extrusion_animation.maximum_height(effective_height(source)) > 0.0)
+            || self.previous.as_ref().is_some_and(|previous| effective_height(&previous.source) > 0.0)
     }
 
     pub fn set_pixel_ratio(&mut self, pixel_ratio: f32) {
@@ -203,7 +249,7 @@ impl RasterLayer {
         }
         self.queued = None;
         if changed {
-            self.reset_for_source_change(source.is_some());
+            self.change_source(source.as_deref(), dpi);
         } else if !self.reduce_motion
             && let (Some(previous), Some(target)) = (&self.source, &source)
         {
@@ -217,12 +263,25 @@ impl RasterLayer {
         self.dpi = dpi;
     }
 
+    fn change_source(&mut self, source: Option<&RasterSource>, dpi: u8) {
+        let retained = self
+            .retained
+            .take()
+            .filter(|retained| retained.dpi == dpi && source.is_some_and(|source| source.metadata().id == retained.source_id));
+        self.reset_for_source_change(source.is_some());
+        if let Some(retained) = retained {
+            self.cache = retained.cache;
+            self.cache_bytes = retained.bytes;
+        }
+    }
+
     fn reset_for_source_change(&mut self, has_source: bool) {
         self.extrusion_animation = ExtrusionAnimation::default();
         if has_source {
             // During loading, replace only the incoming slot, even across
             // datasets. The outgoing slot keeps its own data and style.
             if self.previous.is_none() && !self.cache.is_empty() {
+                self.previous_dpi = self.dpi;
                 self.previous = self.source.clone().map(|source| PreviousRaster {
                     source,
                     cache: std::mem::take(&mut self.cache),
@@ -232,6 +291,7 @@ impl RasterLayer {
             self.previous = None;
         }
         self.fade_started = None;
+        self.retained = None;
         self.generation = self.workers.reset();
         self.pending.clear();
         self.coverage.clear();
@@ -361,7 +421,9 @@ impl RasterLayer {
         }
     }
 
-    fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
+    /// Records into a matching single-sampled pass; native hosts supply both converted
+    /// projections and enable `capture_depth` to preserve flat surface depth.
+    pub(crate) fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
         if let Some(layer) = &mut self.multiband {
             layer.render_scaled(pass, parameters, self.pixel_ratio);
             return;
@@ -374,6 +436,8 @@ impl RasterLayer {
             .as_ref()
             .is_some_and(|source| self.extrusion_animation.height(effective_height(source)) > 0.0)
             || self.previous.as_ref().is_some_and(|previous| effective_height(&previous.source) > 0.0);
+        let parameters = parameters.for_extrusion(self.is_extruded());
+        let parameters = parameters.as_ref();
         if !extruded || (parameters.depth_format != 0 && !self.needs_compositing()) {
             self.composite = None;
             self.render_content(pass, parameters, now);
@@ -480,7 +544,7 @@ impl RasterLayer {
             .fade_started
             .is_some_and(|start| self.reduce_motion || now.duration_since(start) >= BAND_FADE)
         {
-            self.previous = None;
+            self.retain_previous_tiles();
             self.fade_started = None;
             self.draws.clear();
             if let Some((source, dpi)) = self.queued.take() {
@@ -490,10 +554,37 @@ impl RasterLayer {
     }
 
     fn prepare_pipeline(&mut self, parameters: &WgpuLayerParameters) {
-        let formats = (parameters.color_format, parameters.depth_format, parameters.depth_test);
+        let formats = parameters.pipeline_formats();
         if self.pipeline.as_ref().is_none_or(|pipeline| pipeline.formats != formats) {
             self.pipeline = Some(RasterPipeline::new(&self.device, formats));
             self.draws.clear();
+        }
+    }
+
+    fn retain_previous_tiles(&mut self) {
+        let Some(previous) = self.previous.take() else { return };
+        let bytes = previous
+            .cache
+            .values()
+            .map(|tile| tile.texture.as_ref().map_or(0, |texture| texture.bytes))
+            .sum();
+        self.retained = Some(RetainedRasterTiles {
+            source_id: previous.source.metadata().id,
+            dpi: self.previous_dpi,
+            cache: previous.cache,
+            bytes,
+        });
+        self.trim_retained_tiles();
+    }
+
+    fn trim_retained_tiles(&mut self) {
+        if let Some(retained) = &mut self.retained {
+            // Inactive tiles share the existing budget; never compete with the
+            // current coverage or accumulate a cache for every visited band.
+            retained.trim(
+                MAX_CACHE_BYTES.saturating_sub(self.cache_bytes),
+                MAX_CACHE_TILES.saturating_sub(self.cache.len()),
+            );
         }
     }
 
@@ -509,7 +600,7 @@ impl RasterLayer {
         self.waiting = visible.iter().any(|tile| !self.cache.contains_key(&tile.canonical()));
         if !self.waiting && self.previous.is_some() && self.fade_started.is_none() {
             if self.reduce_motion {
-                self.previous = None;
+                self.retain_previous_tiles();
                 self.draws.clear();
             } else {
                 self.fade_started = Some(now);
@@ -648,14 +739,9 @@ impl RasterLayer {
         if self.debug
             && let Some(pipeline) = &mut self.pipeline
         {
-            let debug_pipeline = pipeline.debug_pipeline.get_or_insert_with(|| {
-                create_pipeline(
-                    &self.device,
-                    (parameters.color_format, parameters.depth_format, parameters.depth_test),
-                    &pipeline.layout,
-                    "debug_fragment",
-                )
-            });
+            let debug_pipeline = pipeline
+                .debug_pipeline
+                .get_or_insert_with(|| create_pipeline(&self.device, parameters.pipeline_formats(), &pipeline.layout, "debug_fragment"));
             // Draw after every raster quad so neighboring tiles cannot cover
             // the grid or labels. Debug visibility is independent of opacity.
             pass.set_pipeline(debug_pipeline);
@@ -667,6 +753,7 @@ impl RasterLayer {
     }
 
     fn evict(&mut self) {
+        self.trim_retained_tiles();
         while self.cache.len() > MAX_CACHE_TILES || self.cache_bytes > MAX_CACHE_BYTES {
             let oldest = self
                 .cache
@@ -682,16 +769,19 @@ impl RasterLayer {
     }
 }
 
-/// MapLibre owns this host; the renderer retains the shared state to apply
-/// style updates and pump completed tile jobs without rebuilding the layer.
+/// Standalone test host with shared state for style updates and completed tile jobs.
+/// The native MapLibre host instead owns `Arc<Mutex<RasterLayer>>`.
+#[cfg(test)]
 pub struct RasterLayerHost(Rc<RefCell<RasterLayer>>);
 
+#[cfg(test)]
 impl RasterLayerHost {
     pub fn new(layer: Rc<RefCell<RasterLayer>>) -> Self {
         Self(layer)
     }
 }
 
+#[cfg(test)]
 impl WgpuCustomLayer for RasterLayerHost {
     fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
         self.0.borrow_mut().render(pass, parameters);
@@ -706,6 +796,7 @@ impl WgpuCustomLayer for RasterLayerHost {
         layer.cache.clear();
         layer.cache_bytes = 0;
         layer.previous = None;
+        layer.retained = None;
         layer.fade_started = None;
         layer.queued = None;
         layer.extrusion_animation = ExtrusionAnimation::default();
@@ -723,7 +814,7 @@ fn retained_zoom_tiles(displayed: &mut Vec<VisibleTile>, target: Vec<VisibleTile
 }
 
 impl RasterPipeline {
-    fn new(device: &wgpu::Device, formats: (u32, u32, bool)) -> Self {
+    fn new(device: &wgpu::Device, formats: (u32, u32, bool, bool)) -> Self {
         let texture_binding = |binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -831,7 +922,7 @@ fn palette_key(source: &RasterSource) -> (ColorMapPreset, ColorMapDirection) {
     (source.palette(), source.color_map_direction())
 }
 
-fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wgpu::BindGroupLayout, fragment: &str) -> wgpu::RenderPipeline {
+fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool, bool), layout: &wgpu::BindGroupLayout, fragment: &str) -> wgpu::RenderPipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Numeric raster layout"),
         bind_group_layouts: &[Some(layout)],
@@ -865,21 +956,7 @@ fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wg
             cull_mode: extruded.then_some(wgpu::Face::Back),
             ..Default::default()
         },
-        depth_stencil: (formats.1 != 0).then(|| wgpu::DepthStencilState {
-            format: texture_format_from_webgpu(formats.1),
-            depth_write_enabled: Some(extruded),
-            // Keep the first surface on depth ties; farther walls must not
-            // overwrite tops after quantization in native depth attachments.
-            depth_compare: Some(if extruded {
-                wgpu::CompareFunction::Less
-            } else if formats.2 && fragment == "fragment" {
-                wgpu::CompareFunction::LessEqual
-            } else {
-                wgpu::CompareFunction::Always
-            }),
-            stencil: Default::default(),
-            bias: Default::default(),
-        }),
+        depth_stencil: crate::raster_parameters::depth_stencil(formats, extruded, fragment == "debug_fragment"),
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: &shader,
@@ -1002,6 +1079,71 @@ pub(crate) fn draw_pixels(pass: &mut wgpu::RenderPass<'_>, extrusion: [f32; 4], 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_tiles_evict_oldest_entries_within_the_shared_tile_budget() {
+        let cache = (0..3).map(|x| (Tile { z: 2, x, y: 0 }, CachedTile { texture: None, used: x as u64 })).collect();
+        let mut retained = RetainedRasterTiles {
+            source_id: 1.into(),
+            dpi: 1,
+            cache,
+            bytes: 0,
+        };
+        retained.trim(MAX_CACHE_BYTES, 2);
+        assert_eq!(retained.cache.len(), 2);
+        assert!(!retained.cache.contains_key(&Tile { z: 2, x: 0, y: 0 }));
+        retained.trim(0, 0);
+        assert!(retained.cache.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible device; local raw tile only"]
+    fn retained_tiles_release_gpu_resources_when_the_shared_byte_budget_is_full() -> Result<()> {
+        let (device, queue) = crate::raster_tiles::test_support::device()?;
+        let texture = upload_tile(
+            &device,
+            &queue,
+            NumericTile {
+                width: 1,
+                height: 1,
+                values: vec![1.0],
+            },
+        );
+        let bytes = texture.bytes;
+        let cache = HashMap::from([(
+            Tile { z: 0, x: 0, y: 0 },
+            CachedTile {
+                texture: Some(texture),
+                used: 0,
+            },
+        )]);
+        let mut retained = RetainedRasterTiles {
+            source_id: 1.into(),
+            dpi: 1,
+            cache,
+            bytes,
+        };
+        retained.trim(bytes - 1, MAX_CACHE_TILES);
+        assert!(retained.cache.is_empty());
+        assert_eq!(retained.bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_host_uses_local_borrowed_pass_contract() -> Result<()> {
+        fn assert_send<T: Send>() {}
+        assert_send::<RasterLayer>();
+        let (device, queue) = crate::raster_tiles::test_support::device()?;
+        let layer = Rc::new(RefCell::new(RasterLayer::new(device.clone(), queue.clone())?));
+        let mut host = RasterLayerHost::new(layer.clone());
+        let image = crate::raster_tiles::test_support::paint(&device, &queue, |pass| {
+            host.render(pass, &crate::raster_tiles::test_support::parameters(0.0));
+        })?;
+        host.deinitialize();
+        assert!(image.pixels().all(|pixel| pixel[3] == 0));
+        assert!(!layer.borrow().is_extruded());
+        Ok(())
+    }
 
     #[test]
     fn palette_keys_invalidate_current_and_outgoing_slots_independently_on_reversal() -> Result<()> {

@@ -1148,7 +1148,7 @@ mod tests {
                 assert_eq!(expression[2][4 + ix * 2], original[2][4 + (PALETTE_STOPS - 1 - ix) * 2]);
             }
             assert_eq!(layer["paint"][format!("{kind}-opacity")], 0.375);
-            maplibre_native::AnyLayer::from_json_value(&layer)?;
+            crate::map_renderer::native_api_tests::validate_layer(&layer)?;
         }
         Ok(())
     }

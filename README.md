@@ -33,8 +33,26 @@ A GPUI desktop geospatial viewer with a MapLibre Native vector basemap.
 
 # Development
 - Test: `devenv shell -- cargo test --locked` (debug) and `devenv shell -- just test` (release-mode Nextest, also used by CI).
+- Full Linux application suite, including normally ignored tests: see the [all-tests command](dist/maplibre-ffi-build.md#test-closure). Run serially with the repository's raster, NetCDF and vector fixtures; the network basemap cases require internet access.
 - Test a local NetCDF file: `MAP_TEST_NETCDF=/path/to/file.nc devenv shell -- cargo test --locked netcdf_local_file -- --ignored --nocapture`.
-- Package: `just exe` (Windows), `just appimage` (Linux), or `just dmg` (macOS).
+- Release packaging scripts are still being migrated; see [native build status](dist/maplibre-ffi-build.md). The legacy Windows MinGW packaging path is not compatible with the official FFI's MSVC artifacts.
+
+## MapLibre Native FFI migration
+
+The application uses the official `maplibre-native-ffi` revision pinned in `Cargo.toml`, with Map's two integration crates:
+
+- `crates/maplibre-custom-layer` bridges native custom-layer callbacks and projection parameters.
+- `crates/maplibre-raster-compositor` uploads raster color/depth and records composition inside MapLibre's existing native pass.
+
+MapLibre uses **Vulkan on Linux/Windows** and **Metal on macOS**. GPUI continues to use **wgpu**. Numeric raster shaders also remain on a separate wgpu device: completed, tightly packed color/depth readbacks are uploaded through the native compositor. MapLibre's final RGBA readback is converted to BGRA for GPUI. This is a CPU-transfer integration, not zero-copy texture sharing.
+
+An upstream prebuilt native archive does not contain these extensions. `devenv shell` builds the extended library and exports its absolute install prefix as `MAPLIBRE_NATIVE_FFI_LOCAL_BUILD`. Outside devenv, run `python3 scripts/prepare_maplibre.py`, then export the prefix printed by that command before running Cargo. See [native build instructions](dist/maplibre-ffi-build.md) for target selection and toolchain requirements.
+
+Run native renderer regressions serially with `cargo test --locked map_renderer:: -- --include-ignored --test-threads=1`; some opt-in cases require network access or local fixture environment variables. For offline frame-handoff and resize coverage, use the `map_renderer::progress_tests::` filter instead. The independent integration crates expose mutually exclusive `vulkan` and `metal` features; do not enable both with `--all-features` when testing those crates directly.
+
+Measure warm local raster-playback cadence with `cargo test --release --locked worker_playback_frame_cadence -- --ignored --test-threads=1 --nocapture`. It reports worker frame delivery at 512×512 and 1024×1024 after warmup, not physical presentation or a machine-independent performance threshold. Run GPU measurements without concurrent device tests. Compatible native compositor pipelines are reused; upload buffers remain frame-owned. The CPU color/depth transfer is still a migration limitation, particularly at larger/HiDPI viewports.
+
+Mouse-rate camera updates use a separate regression: `cargo test --release --locked continuous_camera_input_keeps_delivering_frames -- --ignored --test-threads=1 --nocapture`. It continuously pans at roughly 500 input requests/sec and verifies that images arrive during movement, rather than only after input stops. The worker coalesces pending input and admits the newest request after handing off the in-flight frame, so rapid input cannot continually invalidate completed images.
 
 ## Complexity checks
 

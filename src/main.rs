@@ -8,15 +8,18 @@ mod dataset_properties;
 mod feature_info;
 mod log_output;
 mod map_camera;
+#[cfg(test)]
 mod map_readback;
 mod map_renderer;
 mod map_view;
 mod multiband_layer;
+mod native_raster_layer;
 mod pixel_info;
 mod raster_composite;
 mod raster_extrusion_animation;
 mod raster_layer;
 mod raster_panel;
+mod raster_parameters;
 mod raster_playback;
 mod raster_source;
 mod raster_tiles;

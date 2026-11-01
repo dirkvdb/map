@@ -2,8 +2,8 @@
 
 use std::collections::HashSet;
 
+use crate::raster_parameters::WgpuLayerParameters;
 use geo::{Coordinate, LatLonBounds};
-use maplibre_native::WgpuLayerParameters;
 
 use super::{VisibleTile, extrusion_height, intersects_bounds, normalized_mercator, selected_zoom};
 use crate::raster_source::RasterSource;

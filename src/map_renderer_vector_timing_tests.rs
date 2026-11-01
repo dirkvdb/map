@@ -3,6 +3,7 @@
 //! and RUST_LOG=map::vector_load=info. No network basemap or GPUI window is used.
 
 use super::*;
+use std::rc::Rc;
 
 // Read only the TLS slot, not the effective value inherited from GDAL globals
 // or the environment. Two fallbacks distinguish absent from present-but-empty.
@@ -347,7 +348,7 @@ fn measure_vector_display_case(map: &mut NativeMap, viewport: Viewport, path: &s
     let installation_started = Instant::now();
     map.set_vector(Some(source.clone()), 1.0, "#3b82f6")?;
     let installation = installation_started.elapsed();
-    map.apply_request(request);
+    map.apply_request(request)?;
     let installed = Instant::now();
     let timing = VectorReadbackTiming::poll_until_settled(map, &background, case, source.id(), installation_started, load_started, installed)?;
     let settled = installed.elapsed();

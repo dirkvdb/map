@@ -1,6 +1,6 @@
 use std::f64::consts::PI;
 
-use maplibre_native::{CameraUpdate, LatLng};
+use maplibre_native_ffi::{CameraOptions, CameraUpdate, LatLng};
 
 const MIN_ZOOM: f64 = 0.0;
 const MAX_ZOOM: f64 = 18.0;
@@ -131,14 +131,19 @@ impl MapCamera {
     }
 
     pub fn update(self) -> CameraUpdate {
-        CameraUpdate::new()
-            .center(LatLng {
-                lat: (PI * (1.0 - 2.0 * self.y)).sinh().atan().to_degrees(),
-                lng: self.x * 360.0 - 180.0,
-            })
-            .zoom(self.zoom)
-            .pitch(self.pitch)
-            .bearing(self.bearing)
+        CameraUpdate {
+            camera: CameraOptions {
+                center: Some(LatLng {
+                    latitude: (PI * (1.0 - 2.0 * self.y)).sinh().atan().to_degrees(),
+                    longitude: self.x * 360.0 - 180.0,
+                }),
+                zoom: Some(self.zoom),
+                pitch: Some(self.pitch),
+                bearing: Some(self.bearing),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     /// Tilt by a vertical pointer delta in logical pixels; dragging up increases pitch.
@@ -254,20 +259,23 @@ mod tests {
         camera.tilt(-40.0);
         let before = camera;
         camera.rotate(740.0);
-        assert_eq!(camera.update(), before.update().bearing(10.0));
+        let mut expected = before.update().camera;
+        expected.bearing = Some(10.0);
+        assert_eq!(camera.update().camera, expected);
         assert_ne!(camera, before, "Bearing participates in render request equality");
         camera.rotate(-40.0);
-        assert_eq!(camera.update(), before.update().bearing(350.0));
+        expected.bearing = Some(350.0);
+        assert_eq!(camera.update().camera, expected);
         camera.rotate(-720.0);
-        assert_eq!(camera.update(), before.update().bearing(350.0));
+        assert_eq!(camera.update().camera, expected);
         for delta in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             camera.rotate(delta);
-            assert_eq!(camera.update(), before.update().bearing(350.0));
+            assert_eq!(camera.update().camera, expected);
         }
         camera.rotate(20.0);
         assert_eq!(camera, before);
         let fitted = MapCamera::fit_bounds([-10.0, -10.0, 10.0, 10.0], 800.0, 600.0);
-        assert_eq!(fitted.update(), fitted.update().bearing(0.0).pitch(0.0));
+        assert_eq!((fitted.update().camera.bearing, fitted.update().camera.pitch), (Some(0.0), Some(0.0)));
     }
 
     #[test]
@@ -288,14 +296,16 @@ mod tests {
         let mut camera = MapCamera::default();
         let before = camera;
         camera.tilt(-40.0);
-        assert_eq!(camera.update(), before.update().pitch(20.0));
+        let mut expected = before.update().camera;
+        expected.pitch = Some(20.0);
+        assert_eq!(camera.update().camera, expected);
         assert_ne!(camera, before, "Pitch participates in render request equality");
         for delta in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             camera.tilt(delta);
-            assert_eq!(camera.update(), before.update().pitch(20.0));
+            assert_eq!(camera.update().camera, expected);
         }
         assert_eq!(MapCamera::fit_bounds([-10.0, -10.0, 10.0, 10.0], 800.0, 600.0).pitch, 0.0);
-        assert_eq!(before.update(), before.update().pitch(0.0));
+        assert_eq!(before.update().camera.pitch, Some(0.0));
     }
 
     fn coordinate_under_pointer(camera: MapCamera, offset: (f64, f64)) -> (f64, f64) {

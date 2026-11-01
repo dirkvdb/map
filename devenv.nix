@@ -51,6 +51,7 @@ in
       "rust-src"
       "rustfmt"
       "clippy"
+      "llvm-tools"
     ];
   };
 
@@ -62,6 +63,7 @@ in
     [
       pkg-mod-curl
       cargo-nextest
+      cargo-about
       sccache
       pkg-config
 
@@ -70,6 +72,7 @@ in
       pkg-mod-zlib-compat
       cmake
       ninja
+      zig
       pkg-mod-gdal
       pkg-mod-proj
       pkg-mod-openssl
@@ -99,9 +102,15 @@ in
       cores = 0
     '';
     RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
-    MLN_PRECOMPILE = "0";
-    MLN_LOCAL_REPOSITORY = "${config.devenv.root}/.devenv/maplibre-native";
-    MLN_CMAKE_CXX_LAUNCHER = "${pkgs.sccache}/bin/sccache";
+    MAPLIBRE_NATIVE_FFI_LOCAL_BUILD =
+      "${config.devenv.root}/.devenv/maplibre-native-ffi-build/"
+      + (
+        if pkgs.stdenv.isDarwin then
+          (if pkgs.stdenv.hostPlatform.isAarch64 then "macos-arm64-metal" else "macos-x64-metal")
+        else
+          (if pkgs.stdenv.hostPlatform.isAarch64 then "linux-gnu-arm64-vulkan" else "linux-gnu-x64-vulkan")
+      )
+      + "/install";
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     CC = "${pkgs.llvmPackages.clang}/bin/clang";
     CXX = "${pkgs.llvmPackages.clang}/bin/clang++";
@@ -146,7 +155,7 @@ in
 
   tasks."maplibre:prepare" = {
     before = [ "devenv:enterShell" ];
-    exec = ''python3 "$DEVENV_ROOT/scripts/prepare_maplibre.py" "$MLN_LOCAL_REPOSITORY"'';
+    exec = ''python3 "$DEVENV_ROOT/scripts/prepare_maplibre.py" --install-dir "$MAPLIBRE_NATIVE_FFI_LOCAL_BUILD"'';
   };
 
   scripts.knots.exec = ''

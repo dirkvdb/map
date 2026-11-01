@@ -1,0 +1,173 @@
+diff --git a/include/mln/style/layers/custom_layer_render_parameters.hpp b/include/mln/style/layers/custom_layer_render_parameters.hpp
+--- a/include/mln/style/layers/custom_layer_render_parameters.hpp
++++ b/include/mln/style/layers/custom_layer_render_parameters.hpp
+@@ -2,6 +2,8 @@
+ 
+ #include <memory>
+ #include <array>
++
++#define MLN_CUSTOM_LAYER_RASTER_PARAMETERS_VERSION 1
+ 
+ namespace mln {
+ 
+@@ -30,6 +32,19 @@
+     /// A 4×4 matrix representing the map view’s current near clip projection state.
+     std::array<double, 16> nearClippedProjectionMatrix;
+ 
++    /// Pixel-grid-aligned world projection, with the native flat-layer offset
++    /// already subtracted from element 14. Apply the caller's tile/model matrix.
++    /// Standard and near-clipped projection matrices above remain unchanged.
++    std::array<double, 16> rasterProjectionMatrix;
++
++    /// Whether this layer participates in the native flat depth test.
++    bool depthTest;
++    /// Positive clip-Z translation already subtracted from rasterProjectionMatrix.
++    /// Zero when depth testing is disabled (or GL uses its native depth range).
++    double flatDepthOffset;
++    /// Native logical-to-physical pixel ratio.
++    double pixelRatio;
++
+     CustomLayerRenderParameters(const PaintParameters&);
+ };
+ 
+diff --git a/src/mln/style/layers/custom_layer_render_parameters.cpp b/src/mln/style/layers/custom_layer_render_parameters.cpp
+--- a/src/mln/style/layers/custom_layer_render_parameters.cpp
++++ b/src/mln/style/layers/custom_layer_render_parameters.cpp
+@@ -1,6 +1,8 @@
+ #include <mln/style/layers/custom_layer_render_parameters.hpp>
+ #include <mln/renderer/paint_parameters.hpp>
+ #include <mln/util/mat4.hpp>
++
++#include <cassert>
+ 
+ namespace mln {
+ namespace style {
+@@ -19,6 +21,26 @@
+     state.getProjMatrix(projMatrix);
+     projectionMatrix = projMatrix;
+     nearClippedProjectionMatrix = paintParameters.transformParams.nearClippedProjMatrix;
++
++    // Upload visits groups bottom-to-top; draw numbers them top-to-bottom.
++    // preRender now runs during group upload, after group membership is final.
++    assert(paintParameters.layerGroupCount > 0);
++    assert(paintParameters.currentLayer < paintParameters.layerGroupCount);
++    const auto reverseIndex = paintParameters.layerGroupCount - 1 - paintParameters.currentLayer;
++    [[maybe_unused]] const auto uploadIndex = paintParameters.layerGroupUpload ? paintParameters.currentLayer : reverseIndex;
++    const auto drawIndex = paintParameters.layerGroupUpload ? reverseIndex : paintParameters.currentLayer;
++    depthTest = drawIndex >= paintParameters.opaquePassCutoff;
++    pixelRatio = paintParameters.pixelRatio;
++    rasterProjectionMatrix = paintParameters.transformParams.alignedProjMatrix;
++    flatDepthOffset = 0.0;
++#if !MLN_RENDER_BACKEND_OPENGL
++    if (depthTest) {
++        // Match LayerTweaker::multiplyWithProjectionMatrix, raster sublayer 0,
++        // including its float arithmetic before promotion to a matrix double.
++        flatDepthOffset = (1 + uploadIndex) * PaintParameters::numSublayers * PaintParameters::depthEpsilon;
++        rasterProjectionMatrix[14] -= flatDepthOffset;
++    }
++#endif
+ }
+ 
+ } // namespace style
+diff --git a/src/mln/renderer/paint_parameters.hpp b/src/mln/renderer/paint_parameters.hpp
+--- a/src/mln/renderer/paint_parameters.hpp
++++ b/src/mln/renderer/paint_parameters.hpp
+@@ -135,7 +135,9 @@
+     int32_t nextStencilID = 1;
+ 
+ public:
+-    uint32_t currentLayer;
++    uint32_t currentLayer = 0;
++    uint32_t layerGroupCount = 0;
++    bool layerGroupUpload = false;
+     float depthRangeSize;
+     uint32_t opaquePassCutoff = 0;
+     float symbolFadeChange;
+diff --git a/src/mln/renderer/renderer_impl.cpp b/src/mln/renderer/renderer_impl.cpp
+--- a/src/mln/renderer/renderer_impl.cpp
++++ b/src/mln/renderer/renderer_impl.cpp
+@@ -265,6 +265,7 @@
+     }
+ 
+     orchestrator.processChanges();
++    parameters.layerGroupCount = static_cast<uint32_t>(orchestrator.numLayerGroups());
+ 
+     // Upload layer groups
+     {
+@@ -279,10 +280,12 @@
+ 
+         // Tweakers are run in the upload pass so they can set up uniforms.
+         parameters.currentLayer = 0;
++        parameters.layerGroupUpload = true;
+         orchestrator.visitLayerGroups([&](LayerGroupBase& layerGroup) {
+             layerGroup.runTweakers(renderTree, parameters);
+             parameters.currentLayer++;
+         });
++        parameters.layerGroupUpload = false;
+         parameters.currentLayer = 0;
+         orchestrator.visitDebugLayerGroups([&](LayerGroupBase& layerGroup) {
+             layerGroup.runTweakers(renderTree, parameters);
+diff --git a/src/mln/renderer/layers/render_custom_layer.cpp b/src/mln/renderer/layers/render_custom_layer.cpp
+--- a/src/mln/renderer/layers/render_custom_layer.cpp
++++ b/src/mln/renderer/layers/render_custom_layer.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <mln/gfx/context.hpp>
+ #include <mln/renderer/layer_group.hpp>
++#include <mln/renderer/layer_tweaker.hpp>
+ #include <mln/gfx/drawable_custom_layer_host_tweaker.hpp>
+ #include <mln/gfx/drawable_builder.hpp>
+ 
+@@ -66,6 +67,23 @@
+ #endif
+     host->preRender(context, parameters);
+ }
++
++// Group upload is before native drawing, but after processChanges has installed
++// every group. Its index and count match the matrices uploaded for native rasters.
++class CustomLayerPreRenderTweaker final : public LayerTweaker {
++public:
++    CustomLayerPreRenderTweaker(std::string id,
++                               Immutable<style::LayerProperties> properties,
++                               std::shared_ptr<style::CustomLayerHost> host_)
++        : LayerTweaker(std::move(id), std::move(properties)), host(std::move(host_)) {}
++
++    void execute(LayerGroupBase&, const PaintParameters& parameters) override {
++        callPreRender(host, parameters.context, parameters);
++    }
++
++private:
++    std::shared_ptr<style::CustomLayerHost> host;
++};
+ 
+ } // namespace
+ 
+@@ -134,12 +152,13 @@
+         needsInitialize = false;
+     }
+ 
+-    // call the pre-render
+-    MBGL_CHECK_ERROR(callPreRender(host, context, paintParameters));
+-
+     // create drawable
+     if (localLayerGroup->getDrawableCount() == 0 || hostChanged) {
+         localLayerGroup->clearDrawables();
++
++        // Prepare preRender from this group's finalized upload index.
++        layerTweaker = std::make_shared<CustomLayerPreRenderTweaker>(getID(), evaluatedProperties, host);
++        layerGroup->addLayerTweaker(layerTweaker);
+ 
+         // create tweaker
+         auto tweaker = std::make_shared<gfx::DrawableCustomLayerHostTweaker>(host);
+diff --git a/platform/default/src/mln/layermanager/layer_manager.cpp b/platform/default/src/mln/layermanager/layer_manager.cpp
+--- a/platform/default/src/mln/layermanager/layer_manager.cpp
++++ b/platform/default/src/mln/layermanager/layer_manager.cpp
+@@ -78,7 +78,7 @@
+ #if !defined(MBGL_LAYER_HEATMAP_DISABLE_ALL)
+     addLayerType(std::make_unique<HeatmapLayerFactory>());
+ #endif
+-#ifdef MLN_RENDER_BACKEND_OPENGL
++#if defined(MLN_RENDER_BACKEND_OPENGL) || defined(MLN_RENDER_BACKEND_VULKAN) || defined(MLN_RENDER_BACKEND_METAL)
+ #if !defined(MBGL_LAYER_CUSTOM_DISABLE_ALL)
+     addLayerType(std::make_unique<CustomLayerFactory>());
+ #endif

@@ -1,8 +1,8 @@
 //! Offline, deterministic GPU readbacks: tests decide when replacement tiles arrive.
 
+use crate::raster_parameters::WgpuLayerParameters;
 use anyhow::Result;
 use image::RgbaImage;
-use maplibre_native::WgpuLayerParameters;
 
 pub fn device() -> Result<(wgpu::Device, wgpu::Queue)> {
     futures_lite::future::block_on(async {
@@ -41,6 +41,7 @@ pub fn parameters(zoom: f64) -> WgpuLayerParameters {
         color_format: 0x16,
         depth_format: 0,
         depth_test: false,
+        ..Default::default()
     }
 }
 

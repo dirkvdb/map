@@ -1,5 +1,10 @@
 # Packaging
 
+> MapLibre FFI migration: see [native build handoff](maplibre-ffi-build.md) for
+> the current pin, extension hook contract, absolute local-install environment,
+> validation and blockers. The legacy packaging pipelines below have not yet
+> been validated with official FFI/Vulkan/Metal.
+
 Packaging uses devenv and the static `pkg-mod-*` dependencies from the geo
 overlay, building MapLibre Native from its locked source revision.
 

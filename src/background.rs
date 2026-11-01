@@ -296,8 +296,7 @@ mod tests {
             assert_eq!(source["minzoom"], tiles.min_zoom);
             assert_eq!(source["maxzoom"], tiles.max_zoom);
             assert_eq!(source["tileSize"], 256);
-            maplibre_native::AnySource::from_json_value("background-tiles", source).unwrap();
-            maplibre_native::AnyLayer::from_json_value(&style["layers"][0]).unwrap();
+            crate::map_renderer::native_api_tests::validate_style(&style.to_string()).unwrap();
         }
     }
 

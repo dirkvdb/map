@@ -3,6 +3,8 @@
 use inf::colormap::{ColorMapDirection, ColorMapPreset, ProcessedColorMap};
 use wgpu::{Device, Queue, RenderPass, TextureFormat, TextureView};
 
+use crate::raster_parameters::{WgpuLayerParameters, texture_format_from_webgpu};
+
 /// CPU palette metadata survives switches between host and offscreen pipelines.
 #[derive(Default)]
 pub(crate) struct PaletteOpacity {
@@ -38,11 +40,11 @@ pub(crate) struct RasterComposite {
 }
 
 impl RasterComposite {
-    /// Reuses viewport-sized targets. The native ABI reports logical dimensions.
-    pub(crate) fn prepare(target: Option<Self>, device: &Device, parameters: &maplibre_native::WgpuLayerParameters, pixel_ratio: f32) -> Self {
+    /// Reuses viewport-sized targets. Parameters report logical dimensions.
+    pub(crate) fn prepare(target: Option<Self>, device: &Device, parameters: &WgpuLayerParameters, pixel_ratio: f32) -> Self {
         let size = [parameters.width, parameters.height].map(|value| (value * f64::from(pixel_ratio)).round().max(1.0) as u32);
-        let color = maplibre_native::texture_format_from_webgpu(parameters.color_format);
-        let depth = (parameters.depth_format != 0).then(|| maplibre_native::texture_format_from_webgpu(parameters.depth_format));
+        let color = texture_format_from_webgpu(parameters.color_format);
+        let depth = (parameters.depth_format != 0).then(|| texture_format_from_webgpu(parameters.depth_format));
         target
             .filter(|target| target.matches(size, color, depth))
             .unwrap_or_else(|| Self::new(device, size, color, depth))
@@ -53,12 +55,12 @@ impl RasterComposite {
         &self,
         device: &Device,
         queue: &Queue,
-        parameters: &maplibre_native::WgpuLayerParameters,
-        render: impl FnOnce(&mut RenderPass<'_>, &maplibre_native::WgpuLayerParameters),
+        parameters: &WgpuLayerParameters,
+        render: impl FnOnce(&mut RenderPass<'_>, &WgpuLayerParameters),
     ) {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Raster surface") });
         let mut surface_parameters = parameters.clone();
-        // WebGPU C ABI WGPUTextureFormat_Depth32Float, matching our private depth target.
+        // Local attachment identifier for our private Depth32Float target.
         surface_parameters.depth_format = 0x30;
         surface_parameters.depth_test = true;
         {

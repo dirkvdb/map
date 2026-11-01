@@ -17,5 +17,8 @@ fn vertex(@builtin(vertex_index) ix: u32) -> Vertex {
 
 @fragment
 fn fragment(in: Vertex) -> @location(0) vec4<f32> {
-    return raster_color(in.uv);
+    let color = raster_color(in.uv);
+    // Captured depth belongs only to visible raster coverage.
+    if color.a == 0.0 { discard; }
+    return color;
 }

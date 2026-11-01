@@ -1,21 +1,21 @@
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::num::NonZeroU32;
-use std::rc::Rc;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, ensure};
 use gpui_kit::RenderImage;
 use image::RgbaImage;
-use maplibre_native::{
-    AnyLayer, AnySource, Continuous, GeoJson, GeoJsonSource, ImageRenderer, ImageRendererBuilder, MapDebugOptions, RunLoopHandle, ScreenCoordinate, Size,
-    WgpuCustomLayer, WgpuLayerParameters,
+use maplibre_native_ffi::{
+    GeoJsonSourceDataHandle, GraphicsDeviceHandle, GraphicsDeviceTextureDescriptor, LogicalExtent, MapDebugFlag, MapHandle, MapOptions, NativeFuture,
+    RenderDriverKind, RenderResult, RenderSessionAttachOptions, RenderSessionHandle, RenderedFeatureQueryOptions, RenderedQueryGeometry, RuntimeEvent,
+    RuntimeEventFlag, RuntimeEventHandler, RuntimeEventType, RuntimeHandle, RuntimeOptions, ScreenBox, ScreenPoint, TextureReadbackResult,
 };
 
 pub use crate::background::BasemapStyle;
 use crate::map_camera::MapCamera;
-use crate::map_readback::GpuReadback;
-use crate::raster_layer::{RasterLayer, RasterLayerHost};
+use crate::native_raster_layer::NativeRasterLayerHost;
+use crate::raster_layer::RasterLayer;
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest};
 use crate::raster_source::{RasterSource, RasterTiles};
 use crate::vector_source::VectorSource;
@@ -71,13 +71,13 @@ struct RenderRequest {
 impl RenderRequest {
     fn resume_playback(&mut self, map: Option<&NativeMap>) {
         if let Some(playback) = &self.playback {
-            self.playback = Some(playback.resumed_from(map.and_then(|map| map.numeric.borrow().playback_frame())));
+            self.playback = Some(playback.resumed_from(map.and_then(|map| lock(&map.numeric).playback_frame())));
         }
     }
 
     fn playback_frame(&self, map: Option<&NativeMap>) -> Option<PlaybackFrame> {
         let request = self.playback.as_ref()?;
-        let frame = map.and_then(|map| map.numeric.borrow().playback_frame());
+        let frame = map.and_then(|map| lock(&map.numeric).playback_frame());
         frame
             .filter(|frame| Some(frame.dataset_id()) == request.dataset_id() && frame.revision() == request.revision())
             .or_else(|| {
@@ -270,7 +270,7 @@ fn run_renderer(
     pending_result: async_channel::Receiver<FeatureQueryResult>,
     style_json: Option<String>,
 ) {
-    let mut map = None;
+    let mut map: Option<NativeMap> = None;
     let mut current_request: Option<RenderRequest> = None;
     let mut next_frame = Instant::now();
     let mut query_progress = FeatureQueryProgress {
@@ -281,10 +281,15 @@ fn run_renderer(
         previous_features: None,
     };
     let mut progress = FrameProgress::default();
+    let mut inbox = RenderInbox {
+        receiver: requests,
+        pending: None,
+    };
 
     loop {
         let timeout = map.as_ref().map(|_| next_frame.saturating_duration_since(Instant::now()));
-        let Ok(request) = receive_latest_request(&requests, timeout) else {
+        let frame_pending = map.as_ref().is_some_and(|map| map.frame_pending);
+        let Ok(request) = inbox.receive(timeout, frame_pending) else {
             break;
         };
         let request_changed = request.is_some();
@@ -299,14 +304,19 @@ fn run_renderer(
         let frame_started = Instant::now();
         let image = poll_map_image(&mut map, current_request, request_changed, next_frame, style_json.as_deref());
         query_progress.update(map.as_mut(), matches!(&image, Ok(Some(_))));
+        let poll_interval = if map.as_ref().is_some_and(|map| map.frame_pending) { 2 } else { 16 };
         let Some((image, settled)) = progress.update_result(&mut map, image) else {
             // Poll native resource/fade callbacks without busy-waiting.
             if Instant::now() >= next_frame {
-                next_frame = Instant::now() + Duration::from_millis(16);
+                // A draw just missing the 16 ms presentation tick should not
+                // wait another whole frame interval before its readback.
+                next_frame = Instant::now() + Duration::from_millis(poll_interval);
             }
             continue;
         };
-        let frame = MapFrame {
+        inbox.coalesce();
+        let settled = settled && !inbox.has_pending();
+        let mut frame = MapFrame {
             viewport: current_request.map.viewport,
             basemap: current_request.basemap,
             tile_boundaries: current_request.tile_boundaries,
@@ -316,12 +326,54 @@ fn run_renderer(
             playback: current_request.playback_frame(map.as_ref()),
             image,
         };
+        // Snapshot image metadata before native callbacks advance playback. The
+        // worker can then overlap the next draw with the presentation interval.
+        if !inbox.has_pending()
+            && let Some(native) = map.as_mut()
+            && let Err(error) = native.request_frame_if_needed(true)
+        {
+            frame.image = Err(error);
+            frame.settled = false;
+            map = None;
+            progress.reset();
+        }
         if let Err(async_channel::TrySendError::Full(frame)) = frames.try_send(frame) {
             // Keep one newest completed frame if GPUI is still busy.
             let _ = pending_frame.try_recv();
             let _ = frames.try_send(frame);
         }
         next_frame = frame_started + Duration::from_millis(16);
+    }
+}
+
+// Keep input responsive without moving the native generation fence past a draw
+// that is still in flight. Completed images retain their admitted request tags.
+struct RenderInbox {
+    receiver: mpsc::Receiver<RenderRequest>,
+    pending: Option<RenderRequest>,
+}
+
+impl RenderInbox {
+    fn receive(&mut self, timeout: Option<Duration>, frame_pending: bool) -> Result<Option<RenderRequest>, mpsc::RecvTimeoutError> {
+        let timeout = if self.pending.is_some() && !frame_pending {
+            Some(Duration::ZERO)
+        } else {
+            timeout
+        };
+        if let Some(latest) = receive_latest_request(&self.receiver, timeout)? {
+            self.pending = Some(latest);
+        }
+        Ok(if frame_pending { None } else { self.pending.take() })
+    }
+
+    fn coalesce(&mut self) {
+        for latest in self.receiver.try_iter() {
+            self.pending = Some(latest);
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pending.is_some()
     }
 }
 
@@ -338,7 +390,11 @@ fn log_vector_request(request: &RenderRequest, previous: Option<&RenderRequest>)
 
 impl FeatureQuery {
     fn matches_map(&self, map: &NativeMap) -> bool {
-        map.viewport == self.map.viewport && map.camera == Some(self.map.camera) && map.vector.as_ref().is_some_and(|source| source.id() == self.layer_id)
+        !map.needs_frame.get()
+            && map.rendered_update >= map.required_update
+            && map.viewport == self.map.viewport
+            && map.camera == Some(self.map.camera)
+            && map.vector.as_ref().is_some_and(|source| source.id() == self.layer_id)
     }
 }
 
@@ -476,14 +532,22 @@ fn initialize_map(request: &RenderRequest, style_json: Option<&str>) -> Result<N
     Ok(map)
 }
 
-// Style reloads deinitialize native hosts, but this renderer keeps the same
-// device and owns the raster state. Let source changes or NativeMap's drop free
-// that state instead, retaining numeric tiles and in-flight jobs across reloads.
-struct RetainedRasterLayerHost(RasterLayerHost);
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
-impl WgpuCustomLayer for RetainedRasterLayerHost {
-    fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
-        self.0.render(pass, parameters);
+// CoreWorker sessions progress on native's threads. Never call this helper
+// from a native callback: waiting there can deadlock the operation itself.
+fn wait_native<T>(future: NativeFuture<T>) -> Result<T> {
+    future
+        .wait(Duration::from_secs(30))
+        .map_err(|_| anyhow::anyhow!("Native operation timed out"))?
+        .map_err(Into::into)
+}
+
+impl Viewport {
+    fn native_extent(self) -> LogicalExtent {
+        LogicalExtent::new(self.width.get(), self.height.get(), f64::from(self.scale))
     }
 }
 
@@ -516,15 +580,29 @@ impl VectorLoadTiming {
 }
 
 struct NativeMap {
-    renderer: ImageRenderer<Continuous>,
+    renderer: MapHandle,
+    session: RenderSessionHandle,
+    // Native children keep their parents alive; keep owners explicit as well.
+    _graphics: GraphicsDeviceHandle,
+    _runtime: RuntimeHandle,
+    events: mpsc::Receiver<Vec<RuntimeEvent>>,
+    layer_errors: Vec<maplibre_custom_layer::LayerErrors>,
+    frame_pending: bool,
+    frame_token: u64,
+    rendered_update: u64,
+    latest_update: u64,
+    required_update: u64,
+    request_generation: u64,
+    fully_rendered: bool,
+    #[cfg(test)]
+    callbacks_frozen: bool,
     basemap: BasemapStyle,
     viewport: Viewport,
     camera: Option<MapCamera>,
+    #[cfg(test)]
     device: wgpu::Device,
-    queue: wgpu::Queue,
-    idle: Rc<Cell<bool>>,
-    needs_frame: Rc<Cell<bool>>,
-    readback: GpuReadback,
+    idle: Cell<bool>,
+    needs_frame: Cell<bool>,
     deadline: Instant,
     raster: Option<Arc<RasterSource>>,
     opacity: f32,
@@ -533,7 +611,7 @@ struct NativeMap {
     vector_opacity: f32,
     vector_color: String,
     vector_load: Option<VectorLoadTiming>,
-    numeric: Rc<RefCell<RasterLayer>>,
+    numeric: Arc<Mutex<RasterLayer>>,
     #[cfg(test)]
     camera_updates: u64,
     #[cfg(test)]
@@ -557,47 +635,39 @@ impl NativeMap {
 
     fn with_style_source(viewport: Viewport, basemap: BasemapStyle, json: Option<&str>) -> Result<Self> {
         RasterTiles::init()?;
-        // The wgpu FFI backend requires a host-supplied device and queue. This
-        // initialization can later accept GPUI's device instead of creating one.
-        let (device, queue) = futures_lite::future::block_on(async {
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle())
-                .request_adapter(&wgpu::RequestAdapterOptions::default())
-                .await
-                .context("Could not request wgpu adapter")?
-                .request_device(&wgpu::DeviceDescriptor {
-                    label: Some("MapLibre device"),
-                    ..Default::default()
-                })
-                .await
-                .context("Could not create the MapLibre wgpu device")
-        })?;
-        let mut renderer = ImageRendererBuilder::new()
-            .with_size(viewport.width, viewport.height)
-            .with_pixel_ratio(viewport.scale)
-            .build_continuous_renderer();
-        renderer.set_device_queue(device.clone(), queue.clone());
-        let idle = Rc::new(Cell::new(false));
-        renderer.map_observer().set_did_become_idle_callback({
-            let idle = idle.clone();
-            move || idle.set(true)
-        });
-        let needs_frame = Rc::new(Cell::new(true));
-        renderer.set_render_requested_callback({
-            let needs_frame = needs_frame.clone();
-            move || needs_frame.set(true)
-        });
-        let numeric = Rc::new(RefCell::new(RasterLayer::new(device.clone(), queue.clone())?));
-        numeric.borrow_mut().set_pixel_ratio(viewport.scale);
+        let (device, queue) = create_raster_device()?;
+        let (runtime, events) = create_runtime()?;
+        let mut options = MapOptions::new(viewport.native_extent());
+        options.event_mask =
+            Some(RuntimeEventFlag::MAP_STYLE_LOADED | RuntimeEventFlag::MAP_IDLE | RuntimeEventFlag::MAP_LOADING_FAILED | RuntimeEventFlag::MAP_RENDER_ERROR);
+        let (renderer, created) = runtime.create_map(&options)?;
+        wait_native(created)?;
+        let (graphics, session) = attach_native_session(&renderer, viewport)?;
+        let numeric = Arc::new(Mutex::new(RasterLayer::new(device.clone(), queue.clone())?));
+        lock(&numeric).set_pixel_ratio(viewport.scale);
         let mut map = Self {
             renderer,
+            session,
+            _graphics: graphics,
+            _runtime: runtime,
+            events,
+            layer_errors: Vec::new(),
+            frame_pending: false,
+            frame_token: 0,
+            rendered_update: 0,
+            latest_update: 0,
+            required_update: 0,
+            request_generation: 0,
+            fully_rendered: false,
+            #[cfg(test)]
+            callbacks_frozen: false,
             basemap,
             viewport,
             camera: None,
-            readback: GpuReadback::new(&device),
+            #[cfg(test)]
             device,
-            queue,
-            idle,
-            needs_frame,
+            idle: Cell::new(false),
+            needs_frame: Cell::new(true),
             deadline: Instant::now() + Duration::from_secs(30),
             raster: None,
             opacity: 1.0,
@@ -626,16 +696,14 @@ impl NativeMap {
     fn load_style(&mut self, basemap: BasemapStyle, json: Option<&str>) -> Result<()> {
         log::debug!("Loading background map style: {basemap:?}");
         self.idle.set(false);
-        let run_loop = RunLoopHandle::current();
         let generated = basemap.style_json();
         let style = match json.or(generated.as_deref()) {
-            Some(json) => self.renderer.load_style_from_json_str(json),
-            None => self
-                .renderer
-                .load_style_from_url(&basemap.style_url().context("Missing background style URL")?.parse()?),
+            Some(json) => self.renderer.set_style_json(json)?,
+            None => self.renderer.set_style_url(basemap.style_url().context("Missing background style URL")?)?,
         };
-        wait_until_ready(&run_loop, Instant::now() + Duration::from_secs(30), || style.is_ready())?;
-        style.finish().context("Could not load the background map style")?;
+        wait_native(style).context("Could not load the background map style")?;
+        self.wait_for_style()?;
+        self.layer_errors.clear();
         self.basemap = basemap;
         // Loading a style removes its sources and layers, not the native camera.
         // Reset only attachment bookkeeping so overlays are reinstalled without
@@ -652,16 +720,16 @@ impl NativeMap {
 
     fn apply_render_request(&mut self, request: &RenderRequest) -> Result<()> {
         {
-            let mut numeric = self.numeric.borrow_mut();
+            let mut numeric = lock(&self.numeric);
             numeric.set_reduce_motion(request.reduce_motion);
             numeric.set_debug(request.tile_boundaries);
         }
         self.set_basemap(request.basemap)?;
-        self.renderer.set_debug_flags(if request.tile_boundaries {
-            MapDebugOptions::TileBorders
+        wait_native(self.renderer.set_debug_options(if request.tile_boundaries {
+            MapDebugFlag::TILE_BORDERS
         } else {
-            MapDebugOptions::NoDebug
-        });
+            MapDebugFlag::empty()
+        })?)?;
         // The displayed band/style is not a static source change during playback.
         // Keep attachment identity anchored to the immutable dataset instead.
         let raster = request
@@ -669,10 +737,10 @@ impl NativeMap {
             .as_ref()
             .map_or_else(|| request.raster.clone(), |playback| playback.bands().first().cloned());
         self.set_raster(raster, request.opacity)?;
-        self.numeric.borrow_mut().set_playback(request.playback.clone(), request.opacity)?;
+        lock(&self.numeric).set_playback(request.playback.clone(), request.opacity)?;
         self.playback_playing = request.playback.as_ref().is_some_and(PlaybackRequest::is_playing);
         self.set_vector(request.vector.clone(), request.opacity, &request.vector_color)?;
-        self.apply_request(request.map);
+        self.apply_request(request.map)?;
         Ok(())
     }
 
@@ -686,39 +754,38 @@ impl NativeMap {
         let dpi = (self.viewport.scale.ceil() as u8).clamp(1, 4);
         let numeric_source = raster.as_ref().filter(|source| source.is_numeric()).cloned();
         self.update_raster_attachment(raster.as_ref(), opacity, dpi, changed && !retain_numeric)?;
-        self.numeric.borrow_mut().set_source(numeric_source, opacity, dpi);
+        lock(&self.numeric).set_source(numeric_source, opacity, dpi);
         self.raster = raster;
         self.opacity = opacity;
         Ok(())
     }
 
     fn update_raster_attachment(&mut self, source: Option<&Arc<RasterSource>>, opacity: f32, dpi: u8, replace: bool) -> Result<()> {
-        if let Some(source) = source.filter(|source| !source.is_numeric()) {
-            RasterTiles::init()?.register(source)?;
-        }
         if replace {
-            self.renderer.style().remove_layer("local-raster-layer");
-            self.renderer.style().remove_source("local-raster");
+            self.remove_layer("local-raster-layer")?;
+            self.remove_source("local-raster")?;
             if let Some(source) = source {
                 self.add_raster_attachment(source, opacity, dpi)?;
             }
         } else if let Some(source) = source.filter(|source| !source.is_numeric()) {
-            self.renderer.style().remove_layer("local-raster-layer");
-            self.renderer.style().add_layer(AnyLayer::from_json_value(&source.layer_json(opacity))?)?;
+            self.restyle_color_raster(source, opacity)?;
         }
         Ok(())
     }
 
-    fn add_raster_attachment(&mut self, source: &RasterSource, opacity: f32, dpi: u8) -> Result<()> {
+    fn restyle_color_raster(&self, source: &Arc<RasterSource>, opacity: f32) -> Result<()> {
+        RasterTiles::init()?.register(source)?;
+        self.remove_layer("local-raster-layer")?;
+        self.add_layer(&source.layer_json(opacity), None)
+    }
+
+    fn add_raster_attachment(&mut self, source: &Arc<RasterSource>, opacity: f32, dpi: u8) -> Result<()> {
         if source.is_numeric() {
-            self.renderer
-                .style()
-                .add_wgpu_custom_layer("local-raster-layer", RetainedRasterLayerHost(RasterLayerHost::new(self.numeric.clone())), None)?;
+            self.add_numeric_layer("local-raster-layer", None)?;
         } else {
-            self.renderer
-                .style()
-                .add_source(AnySource::from_json_value("local-raster", &source.source_json(dpi))?)?;
-            self.renderer.style().add_layer(AnyLayer::from_json_value(&source.layer_json(opacity))?)?;
+            RasterTiles::init()?.register(source)?;
+            self.add_source("local-raster", &source.source_json(dpi))?;
+            self.add_layer(&source.layer_json(opacity), None)?;
         }
         Ok(())
     }
@@ -728,14 +795,34 @@ impl NativeMap {
         let layers = ["fill", "line", "circle"].map(|kind| format!("local-vector-{}-{kind}", source.id()));
         // MapLibre uses logical pixels from the viewport's top-left, independent
         // of the physical GPU readback size and its DPI scale.
-        let point = ScreenCoordinate { x: point.0, y: point.1 };
-        if source.points_only() {
-            const HOVER_TOLERANCE: f64 = 4.0;
-            Ok(self.renderer.query_rendered_features_with_tolerance(point, HOVER_TOLERANCE, &layers)?)
+        let point = ScreenPoint { x: point.0, y: point.1 };
+        self.query_features(point, if source.points_only() { 4.0 } else { 0.0 }, &layers)
+    }
+
+    fn query_features(&self, point: ScreenPoint, tolerance: f64, layers: &[String]) -> Result<Vec<serde_json::Value>> {
+        let geometry = if tolerance > 0.0 {
+            RenderedQueryGeometry::Box(ScreenBox::new(
+                ScreenPoint {
+                    x: point.x - tolerance,
+                    y: point.y - tolerance,
+                },
+                ScreenPoint {
+                    x: point.x + tolerance,
+                    y: point.y + tolerance,
+                },
+            ))
         } else {
-            // Expanding polygon/line queries also hits neighboring geometries.
-            Ok(self.renderer.query_rendered_features(point, &layers)?)
-        }
+            RenderedQueryGeometry::Point(point)
+        };
+        let layers: Vec<_> = layers.iter().map(String::as_str).collect();
+        let options = RenderedFeatureQueryOptions {
+            layer_ids: Some(&layers),
+            ..Default::default()
+        };
+        wait_native(self.session.query_rendered_features(&geometry, Some(&options))?)?
+            .into_iter()
+            .map(|hit| serde_json::from_str(&hit.feature).map_err(Into::into))
+            .collect()
     }
 
     fn set_vector(&mut self, vector: Option<Arc<VectorSource>>, opacity: f32, color: &str) -> Result<()> {
@@ -751,7 +838,7 @@ impl NativeMap {
                 .map(VectorLoadTiming::new);
         }
         let installation_started = self.vector_phase_started().filter(|_| changed);
-        self.remove_vector_layers();
+        self.remove_vector_layers()?;
         if changed {
             self.replace_vector_source(vector.as_deref())?;
         }
@@ -767,19 +854,20 @@ impl NativeMap {
         if let Some(source) = source {
             let started = installation_started.map(|_| Instant::now());
             for layer in source.layers_json(opacity, color) {
-                self.renderer.style().add_layer(AnyLayer::from_json_value(&layer)?)?;
+                self.add_layer(&layer, None)?;
             }
             self.log_vector_phase("layer creation/add", started);
         }
         Ok(())
     }
 
-    fn remove_vector_layers(&mut self) {
+    fn remove_vector_layers(&mut self) -> Result<()> {
         if let Some(source) = &self.vector {
             for kind in ["fill", "line", "circle"] {
-                self.renderer.style().remove_layer(format!("local-vector-{}-{kind}", source.id()));
+                self.remove_layer(&format!("local-vector-{}-{kind}", source.id()))?;
             }
         }
+        Ok(())
     }
 
     fn replace_vector_source(&mut self, source: Option<&VectorSource>) -> Result<()> {
@@ -787,28 +875,17 @@ impl NativeMap {
         {
             self.vector_source_updates += 1;
         }
-        self.renderer.style().remove_source("local-vector");
+        self.remove_source("local-vector")?;
         let Some(source) = source else { return Ok(()) };
+        let started = self.vector_phase_started();
         if let Some(json) = source.geojson() {
+            let data = GeoJsonSourceDataHandle::create(json, None)?;
+            self.log_vector_phase("GeoJsonSourceDataHandle::create", started);
             let started = self.vector_phase_started();
-            let data = GeoJson::from_json_str(json)?;
-            self.log_vector_phase("GeoJson::from_json_str", started);
-            let mut native_source = GeoJsonSource::new("local-vector");
-            let started = self.vector_phase_started();
-            native_source.set_geojson(&data);
-            self.log_vector_phase("GeoJsonSource::set_geojson (including synchronous native copy)", started);
-            let started = self.vector_phase_started();
-            self.renderer.style().add_source(native_source)?;
-            self.log_vector_phase("style source add", started);
-            let started = self.vector_phase_started();
-            drop(data);
-            self.log_vector_phase("temporary native GeoJson drop", started);
+            wait_native(self.renderer.add_geo_json_source_data("local-vector", &data)?)?;
+            self.log_vector_phase("prepared GeoJSON style source add", started);
         } else if let Some(url) = source.tile_url() {
-            let started = self.vector_phase_started();
-            self.renderer.style().add_source(AnySource::from_json_value(
-                "local-vector",
-                &serde_json::json!({ "type": "vector", "url": url }),
-            )?)?;
+            self.add_source("local-vector", &serde_json::json!({ "type": "vector", "url": url }))?;
             self.log_vector_phase("tiled style source creation/add", started);
         }
         Ok(())
@@ -816,7 +893,7 @@ impl NativeMap {
 
     #[cfg(test)]
     fn render(&mut self, request: MapRequest) -> Result<RgbaImage> {
-        let texture = self.render_texture(request)?;
+        let texture = self.render_native_frame(request)?;
         self.read_frame(&texture)
     }
 
@@ -827,6 +904,13 @@ impl NativeMap {
     }
 
     #[cfg(test)]
+    fn render_raster_first_frame(&mut self, request: MapRequest, source: Option<Arc<RasterSource>>, opacity: f32) -> Result<RgbaImage> {
+        self.set_raster(source, opacity)?;
+        self.apply_request(request)?;
+        self.required_raster_image("Raster change must produce a native frame")
+    }
+
+    #[cfg(test)]
     fn render_vector(&mut self, request: MapRequest, source: Option<Arc<VectorSource>>, opacity: f32, color: &str) -> Result<RgbaImage> {
         self.set_vector(source, opacity, color)?;
         self.render(request)
@@ -834,13 +918,20 @@ impl NativeMap {
 
     #[cfg(test)]
     fn required_raster_image(&mut self, message: &str) -> Result<RgbaImage> {
-        self.poll_raster_image()?.context(message.to_owned())
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(image) = self.poll_raster_image()? {
+                return Ok(image);
+            }
+            ensure!(Instant::now() < deadline, "{message}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     #[cfg(test)]
     fn poll_raster_image(&mut self) -> Result<Option<RgbaImage>> {
         let Some(texture) = self.poll_frame()? else { return Ok(None) };
-        self.readback.read(&texture, &self.device, &self.queue).map(Some)
+        self.read_frame(&texture).map(Some)
     }
 
     fn vector_phase_started(&self) -> Option<Instant> {
@@ -854,9 +945,9 @@ impl NativeMap {
         }
     }
 
-    fn read_frame(&mut self, texture: &wgpu::Texture) -> Result<RgbaImage> {
+    fn read_frame(&mut self, texture: &TextureReadbackResult) -> Result<RgbaImage> {
         let started = self.vector_phase_started();
-        let pixels = self.readback.read(texture, &self.device, &self.queue)?;
+        let pixels = native_pixels(texture)?;
         if let (Some(timing), Some(started)) = (&mut self.vector_load, started) {
             let elapsed = started.elapsed();
             timing.readbacks += 1;
@@ -872,7 +963,12 @@ impl NativeMap {
     }
 
     fn is_settled(&self) -> bool {
-        self.idle.get() && !self.needs_frame.get() && !self.numeric.borrow().is_loading()
+        self.idle.get()
+            && self.fully_rendered
+            && self.rendered_update >= self.latest_update
+            && !self.needs_frame.get()
+            && !self.frame_pending
+            && !lock(&self.numeric).is_loading()
     }
 
     fn finish_vector_timing_if_idle(&mut self) {
@@ -888,41 +984,49 @@ impl NativeMap {
     }
 
     #[cfg(test)]
-    fn render_texture(&mut self, request: MapRequest) -> Result<wgpu::Texture> {
-        self.apply_request(request);
+    fn render_native_frame(&mut self, request: MapRequest) -> Result<TextureReadbackResult> {
+        self.apply_request(request)?;
         let mut latest = None;
-        while self.needs_frame.get() || !self.idle.get() || self.numeric.borrow().is_loading() {
+        while !self.is_settled() {
             if let Some(texture) = self.poll_frame()? {
                 latest = Some(texture)
             }
-            if !self.idle.get() || self.numeric.borrow().is_loading() {
+            if !self.is_settled() {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        latest.context("MapLibre did not produce a wgpu texture")
+        latest.context("MapLibre did not produce a native image")
     }
 
-    fn apply_request(&mut self, request: MapRequest) {
+    fn apply_request(&mut self, request: MapRequest) -> Result<()> {
         if self.viewport != request.viewport || self.camera != Some(request.camera) {
             self.idle.set(false);
             if self.viewport != request.viewport {
-                self.renderer.set_map_size(Size {
-                    width: request.viewport.width.get(),
-                    height: request.viewport.height.get(),
-                });
+                // An attached session owns resizing both its target and map.
+                wait_native(self.session.resize(request.viewport.native_extent())?)?;
                 self.viewport = request.viewport;
             }
-            self.renderer.update_camera(&request.camera.update());
+            wait_native(self.renderer.update_camera(&request.camera.update())?)?;
             self.camera = Some(request.camera);
             #[cfg(test)]
             {
                 self.camera_updates += 1;
             }
         }
-        // Shader-only changes repaint the retained scene without invalidating
-        // the native camera, tile layout, or label placement.
-        self.needs_frame.set(true);
+        self.invalidate_frame()
+    }
+
+    fn invalidate_frame(&mut self) -> Result<()> {
+        // Fence user requests, not each tile/fade repaint. Fencing every native
+        // animation update would discard all frames when rendering falls behind.
+        self.idle.set(false);
+        let completion = wait_native(self.renderer.request_repaint()?)?;
+        self.required_update = completion.render_update_generation;
+        self.request_generation = completion.generation;
+        self.fully_rendered = false;
+        self.needs_frame.set(false);
         self.deadline = Instant::now() + Duration::from_secs(30);
+        Ok(())
     }
 
     fn record_vector_render_time(&mut self, started: Option<Instant>) {
@@ -932,50 +1036,238 @@ impl NativeMap {
             timing.rendering += elapsed;
             if timing.frames == 1 {
                 log::info!(target: "map::vector_load",
-                    "source={} first native frame render/take_texture (includes run-loop dispatch; vector pixels NOT verified): elapsed={:?}, since_install={:?}",
+                    "source={} first native frame result/read_texture (includes driver progress; vector pixels NOT verified): elapsed={:?}, since_install={:?}",
                     timing.source_id, elapsed, timing.started.elapsed());
             }
         }
     }
 
-    fn poll_frame(&mut self) -> Result<Option<wgpu::Texture>> {
+    fn poll_frame(&mut self) -> Result<Option<TextureReadbackResult>> {
         let started = self.vector_phase_started();
-        RunLoopHandle::current().tick();
-        if self.numeric.borrow_mut().poll_tiles() {
-            self.needs_frame.set(true);
-        }
-        // Dispatch a pending idle callback before judging the deadline. Keep the
-        // deadline fixed so stalled native work or repeated repaints still fail.
-        if self.playback_playing && self.idle.get() && !self.numeric.borrow().is_loading() {
-            // Only active playback with native resources and tile work idle may
-            // renew the deadline. Paused or stalled prefetch cannot mask a timeout.
-            self.deadline = Instant::now() + Duration::from_secs(30);
-        }
+        self.poll_events()?;
+        self.check_layer_errors()?;
+        self.poll_raster_work();
         ensure!(self.is_settled() || Instant::now() < self.deadline, "Map rendering timed out");
         if self.needs_frame.replace(false) {
             self.idle.set(false);
-            self.renderer.render_once();
-            let texture = self.renderer.take_texture().context("MapLibre did not produce a wgpu texture")?;
-            self.record_vector_render_time(started);
-            return Ok(Some(texture));
+            wait_native(self.renderer.request_repaint()?)?;
         }
+        let image = self.drain_frame()?;
+        if image.is_some() {
+            self.record_vector_render_time(started);
+        }
+        // Observe pending updates even during handoff, but let the caller consume
+        // the image/state before another native callback can advance that state.
+        self.request_frame_if_needed(image.is_none())?;
         self.finish_vector_timing_if_idle();
-        Ok(None)
+        Ok(image)
+    }
+
+    fn poll_raster_work(&mut self) {
+        if lock(&self.numeric).poll_tiles() {
+            self.needs_frame.set(true);
+        }
+        if self.playback_playing && self.idle.get() && !self.frame_pending && !lock(&self.numeric).is_loading() {
+            // Only live, unstalled playback may renew the deadline.
+            self.deadline = Instant::now() + Duration::from_secs(30);
+        }
+    }
+
+    fn request_frame_if_needed(&mut self, can_request: bool) -> Result<()> {
+        let snapshot = self.renderer.get_snapshot()?;
+        self.latest_update = snapshot.latest_render_update_generation;
+        if can_request && !self.frame_pending && self.latest_update > self.rendered_update {
+            self.frame_token += 1;
+            self.session.request_frame(&maplibre_native_ffi::FrameDemand {
+                token: self.frame_token,
+                ..Default::default()
+            })?;
+            self.frame_pending = true;
+            self.idle.set(false);
+        }
+        Ok(())
+    }
+
+    fn drain_frame(&mut self) -> Result<Option<TextureReadbackResult>> {
+        let mut image = None;
+        for result in self.session.drain_frame_results()? {
+            self.frame_pending = false;
+            if let Some(rendered) = self.finish_frame(result)? {
+                image = Some(rendered);
+            }
+        }
+        Ok(image)
+    }
+
+    fn finish_frame(&mut self, result: maplibre_native_ffi::RenderFrameResult) -> Result<Option<TextureReadbackResult>> {
+        self.check_layer_errors()?;
+        match result.disposition {
+            RenderResult::Rendered => {
+                self.rendered_update = result.map_update_generation;
+                if result.needs_repaint {
+                    self.needs_frame.set(true);
+                }
+                if result.map_update_generation < self.required_update {
+                    return Ok(None);
+                }
+                self.fully_rendered = result.mode == maplibre_native_ffi::RenderMode::Full;
+                wait_native(self.session.read_texture()?).map(Some)
+            }
+            RenderResult::NoUpdate | RenderResult::TargetNotReady | RenderResult::Superseded => Ok(None),
+            other => anyhow::bail!("Native frame failed: {other:?}, {:?}", self.session.get_failure()?),
+        }
+    }
+
+    fn poll_events(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if self.callbacks_frozen {
+            return Ok(());
+        }
+        for event in self.events.try_iter().flatten().filter(|event| event.source == self.renderer.id()) {
+            self.handle_event(&event)?;
+        }
+        Ok(())
+    }
+
+    fn handle_event(&self, event: &RuntimeEvent) -> Result<()> {
+        match event.r#type {
+            RuntimeEventType::MapIdle if event.generation >= self.request_generation => self.idle.set(true),
+            RuntimeEventType::MapLoadingFailed | RuntimeEventType::MapRenderError => {
+                anyhow::bail!("Native map {:?}: {}", event.r#type, event.message);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn wait_for_style(&mut self) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let batch = self
+                .events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .context("Map loading timed out. Check your connection and retry.")?;
+            if self.style_loaded(batch)? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn style_loaded(&self, batch: Vec<RuntimeEvent>) -> Result<bool> {
+        let mut loaded = false;
+        for event in batch.into_iter().filter(|event| event.source == self.renderer.id()) {
+            self.handle_event(&event)?;
+            loaded |= event.r#type == RuntimeEventType::MapStyleLoaded;
+        }
+        Ok(loaded)
+    }
+
+    fn check_layer_errors(&self) -> Result<()> {
+        for monitor in &self.layer_errors {
+            if let Some(error) = monitor.first_error() {
+                return Err(error.into());
+            }
+        }
+        Ok(())
+    }
+
+    fn add_numeric_layer(&mut self, id: &str, before: Option<&str>) -> Result<()> {
+        let pending = maplibre_custom_layer::add_custom_layer(&self.renderer, id, NativeRasterLayerHost::new(self.numeric.clone()), before)?;
+        self.layer_errors.push(pending.errors());
+        pending.wait_timeout(Duration::from_secs(30))?;
+        Ok(())
+    }
+
+    fn add_source(&self, id: &str, source: &serde_json::Value) -> Result<()> {
+        wait_native(self.renderer.add_style_source_json(id, &source.to_string())?)?;
+        Ok(())
+    }
+
+    fn add_layer(&self, layer: &serde_json::Value, before: Option<&str>) -> Result<()> {
+        wait_native(self.renderer.add_style_layer_json(&layer.to_string(), before.unwrap_or(""))?)?;
+        Ok(())
+    }
+
+    fn remove_layer(&self, id: &str) -> Result<()> {
+        if wait_native(self.renderer.get_style_layer(id)?)?.is_some() {
+            wait_native(self.renderer.remove_style_layer(id)?)?;
+        }
+        Ok(())
+    }
+
+    fn remove_source(&self, id: &str) -> Result<()> {
+        if wait_native(self.renderer.get_style_source(id)?)?.is_some() {
+            wait_native(self.renderer.remove_style_source(id)?)?;
+        }
+        Ok(())
     }
 }
 
-fn wait_until_ready(run_loop: &RunLoopHandle, deadline: Instant, is_ready: impl Fn() -> bool) -> Result<()> {
-    while !is_ready() {
-        ensure!(Instant::now() < deadline, "Map loading timed out. Check your connection and retry.");
-        run_loop.tick();
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    Ok(())
+fn create_runtime() -> Result<(RuntimeHandle, mpsc::Receiver<Vec<RuntimeEvent>>)> {
+    let runtime = RuntimeHandle::create(&RuntimeOptions::default())?;
+    RasterTiles::install(&runtime)?;
+    let (sender, events) = mpsc::channel();
+    wait_native(runtime.set_event_handler(RuntimeEventHandler::new(move |batch| {
+        let _ = sender.send(batch);
+    }))?)?;
+    Ok((runtime, events))
 }
+
+fn attach_native_session(map: &MapHandle, viewport: Viewport) -> Result<(GraphicsDeviceHandle, RenderSessionHandle)> {
+    let graphics = GraphicsDeviceHandle::create(None)?;
+    let (session, attached) = map.attach_graphics_device_texture(
+        &graphics,
+        &GraphicsDeviceTextureDescriptor::new(viewport.native_extent()),
+        &RenderSessionAttachOptions::new(RenderDriverKind::CoreWorker),
+    )?;
+    wait_native(attached)?;
+    Ok((graphics, session))
+}
+
+fn create_raster_device() -> Result<(wgpu::Device, wgpu::Queue)> {
+    futures_lite::future::block_on(async {
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle())
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .context("Could not request raster wgpu adapter")?
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Raster device (separate from MapLibre)"),
+                ..Default::default()
+            })
+            .await
+            .context("Could not create the raster wgpu device")
+    })
+}
+
+fn native_pixels(image: &TextureReadbackResult) -> Result<RgbaImage> {
+    let info = image.info;
+    let row_bytes = (info.width as usize).checked_mul(4).context("Native row size overflow")?;
+    ensure!(
+        info.width > 0 && info.height > 0 && info.stride as usize >= row_bytes,
+        "Invalid native image extent/stride"
+    );
+    let length = (info.stride as usize).checked_mul(info.height as usize).context("Native image size overflow")?;
+    ensure!(image.data.len() >= length, "Truncated native image");
+    // GPUI RenderImage and the existing renderer tests consume BGRA bytes,
+    // despite image::RgbaImage's name. Native read_texture returns RGBA.
+    let pixels = image.data[..length]
+        .chunks_exact(info.stride as usize)
+        .flat_map(|row| row[..row_bytes].as_chunks::<4>().0.iter().flat_map(|&[r, g, b, a]| [b, g, r, a]))
+        .collect();
+    RgbaImage::from_raw(info.width, info.height, pixels).context("Invalid native RGBA image")
+}
+
+#[cfg(test)]
+#[path = "map_renderer_native_api_tests.rs"]
+pub(crate) mod native_api_tests;
 
 #[cfg(test)]
 #[path = "map_renderer_playback_tests.rs"]
 mod playback_tests;
+
+#[cfg(test)]
+#[path = "map_renderer_motion_tests.rs"]
+mod motion_tests;
 
 #[cfg(test)]
 #[path = "map_renderer_progress_tests.rs"]
@@ -1316,7 +1608,7 @@ mod tests {
     }
 
     fn add_query_basemap_decoy(map: &mut NativeMap) -> Result<()> {
-        map.renderer.style().add_source(AnySource::from_json_value(
+        map.add_source(
             "basemap-decoy",
             &serde_json::json!({
                 "type": "geojson", "data": {
@@ -1324,11 +1616,14 @@ mod tests {
                     "geometry": {"type": "Point", "coordinates": [0,0]}
                 }
             }),
-        )?)?;
-        map.renderer.style().add_layer(AnyLayer::from_json_value(&serde_json::json!({
-            "id": "basemap-decoy", "type": "circle", "source": "basemap-decoy",
-            "paint": {"circle-radius": 8, "circle-color": "#ff0000"}
-        }))?)?;
+        )?;
+        map.add_layer(
+            &serde_json::json!({
+                "id": "basemap-decoy", "type": "circle", "source": "basemap-decoy",
+                "paint": {"circle-radius": 8, "circle-color": "#ff0000"}
+            }),
+            None,
+        )?;
         Ok(())
     }
 
@@ -1387,11 +1682,11 @@ mod tests {
         let source = open_query_fixture(directory, if mixed { "adjacent-mixed.geojson" } else { "adjacent-polygons.geojson" }, adjacent)?;
         let layers = [format!("local-vector-{}-fill", source.id())];
         let _ = map.render_vector(request, Some(source), 1.0, "#3b82f6")?;
-        let near_edge = ScreenCoordinate {
+        let near_edge = ScreenPoint {
             x: center.0 - 3.0,
             y: center.1,
         };
-        let expanded = map.renderer.query_rendered_features_with_tolerance(near_edge, 4.0, &layers)?;
+        let expanded = map.query_features(near_edge, 4.0, &layers)?;
         assert!(
             expanded.iter().any(|feature| feature["properties"]["name"] == "right"),
             "The fixture must reproduce the neighboring polygon hit from expanded queries"
@@ -1406,13 +1701,13 @@ mod tests {
     }
 
     fn assert_point_query_tolerance(map: &mut NativeMap, center: (f64, f64)) -> Result<()> {
-        let near = ScreenCoordinate {
+        let near = ScreenPoint {
             x: center.0 + 7.0,
             y: center.1,
         };
         let circle = [format!("local-vector-{}-circle", map.vector.as_ref().unwrap().id())];
         assert!(
-            map.renderer.query_rendered_features(near, &circle)?.is_empty(),
+            map.query_features(near, 0.0, &circle)?.is_empty(),
             "An exact query must miss outside the point symbol"
         );
         assert!(
@@ -1512,7 +1807,7 @@ mod tests {
                 assert!(pixel[0] >= previous[0], "Fading must not flash the basemap or reverse direction");
             }
             assert_eq!(pixel[3], 255, "Blending two opaque bands must stay opaque");
-            if !map.numeric.borrow().is_loading() {
+            if !lock(&map.numeric).is_loading() {
                 break image;
             }
             intermediate |= pixel != *first_image.get_pixel(256, 256);
@@ -1520,7 +1815,7 @@ mod tests {
             if intermediate && !queued {
                 map.set_raster(Some(sources[3].clone()), 1.0)?;
                 map.set_raster(Some(fourth.clone()), 1.0)?;
-                map.apply_request(request);
+                map.apply_request(request)?;
                 queued = true;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -1542,7 +1837,7 @@ mod tests {
                 image.as_raw() == reference.as_raw() || image.as_raw() == first_image.as_raw(),
                 "Reduced motion must display an endpoint, never an interpolated band"
             );
-            if !map.numeric.borrow().is_loading() {
+            if !lock(&map.numeric).is_loading() {
                 assert_eq!(image.as_raw(), first_image.as_raw());
                 break;
             }
@@ -1607,11 +1902,9 @@ mod tests {
             Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##),
         )?;
         assert_initial_fallback_loading(&mut map, request, &sources)?;
-        map.set_raster(Some(sources[1].clone()), 1.0)?;
-        map.apply_request(request);
-        assert!(map.poll_frame()?.is_some());
+        let _ = map.render_raster_first_frame(request, Some(sources[1].clone()), 1.0)?;
         assert_eq!(
-            map.numeric.borrow().pending_fallback_count(),
+            lock(&map.numeric).pending_fallback_count(),
             0,
             "An outgoing raster already covers loading; fallback reads must not compete with the visible tiles needed to start the fade"
         );
@@ -1662,7 +1955,7 @@ mod tests {
             "Dataset endpoints {from} -> {to} must be visibly different: {old} vs {new}"
         );
         map.set_raster(Some(source.clone()), 0.6)?;
-        map.apply_request(request);
+        map.apply_request(request)?;
         let loading = map.required_raster_image("The outgoing dataset must remain renderable")?;
         assert_eq!(
             loading.as_raw(),
@@ -1686,7 +1979,7 @@ mod tests {
                     "Dataset footprints, palettes, nodata and opacity must blend without a flash: {actual} vs {expected}"
                 );
             }
-            if !map.numeric.borrow().is_loading() {
+            if !lock(&map.numeric).is_loading() {
                 assert_eq!(image.as_raw(), incoming.as_raw());
                 break;
             }
@@ -1750,7 +2043,7 @@ mod tests {
         )?;
         let (outgoing, incoming) = nodata_fade_endpoints(&mut map, request, first, &second)?;
         map.set_raster(Some(second), 0.6)?;
-        map.apply_request(request);
+        map.apply_request(request)?;
         assert_nodata_band_fade(&mut map, &outgoing, &incoming)?;
         Ok(())
     }
@@ -1764,7 +2057,7 @@ mod tests {
         assert!(source.clamp_colors(), "Endpoint clamping must remain the default");
         assert_eq!(source.scale(), geo::RasterScale { scale: -2.0, offset: 200.0 });
         let (mut map, request, background) = clamp_test_map(&source)?;
-        let counts = map.numeric.borrow().tile_counts();
+        let counts = lock(&map.numeric).tile_counts();
         assert!(counts.0 > 0 && counts.1 > 0, "Warm the raw tile cache before toggling clamping");
         std::fs::rename(&path, path.with_extension("cached.tif"))?;
 
@@ -1779,7 +2072,7 @@ mod tests {
                 let clamped = units.restyled(inf::colormap::ColorMapPreset::Gray, range)?;
                 assert_clamp_range_roundtrip(&mut map, request, clamped, &background, visible, gray)?;
                 assert_eq!(
-                    map.numeric.borrow().tile_counts(),
+                    lock(&map.numeric).tile_counts(),
                     counts,
                     "Clamp/unit/range changes must reuse raw tiles without uploads"
                 );
@@ -1844,12 +2137,12 @@ mod tests {
         let second = sources[1].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
         let (mut map, request, background) = clamp_test_map(&first)?;
         let endpoints = raster_fade_endpoints(&mut map, request, &[first.clone(), second.clone()])?;
-        let counts = map.numeric.borrow().tile_counts();
+        let counts = lock(&map.numeric).tile_counts();
         assert!(counts.0 > 0 && counts.1 > 0);
         std::fs::rename(&path, path.with_extension("cached.tif"))?;
         assert_cached_clamp_fades(&mut map, request, &first, &second, &endpoints, &background)?;
         assert_eq!(
-            map.numeric.borrow().tile_counts(),
+            lock(&map.numeric).tile_counts(),
             counts,
             "Fading clamp snapshots must reuse both bands' raw tiles"
         );
@@ -1878,10 +2171,12 @@ mod tests {
             assert_eq!(
                 incoming.as_raw(),
                 expected_incoming.as_raw(),
-                "The current band's clamp flag must control its endpoint"
+                "The current band's clamp flag must control its endpoint: previous_clamps={previous_clamps}, current_clamps={current_clamps}, center={:?}, expected={:?}",
+                incoming.get_pixel(128, 128),
+                expected_incoming.get_pixel(128, 128)
             );
             map.set_raster(Some(current), 0.6)?;
-            map.apply_request(request);
+            map.apply_request(request)?;
             assert_nodata_band_fade(map, &outgoing, &incoming)?;
         }
         Ok(())
@@ -1949,15 +2244,15 @@ mod tests {
         background: &RgbaImage,
         reduce_motion: bool,
     ) -> Result<RgbaImage> {
-        map.numeric.borrow_mut().set_reduce_motion(reduce_motion);
+        lock(&map.numeric).set_reduce_motion(reduce_motion);
         map.set_raster(Some(incoming), 1.0)?;
-        map.apply_request(request);
+        map.apply_request(request)?;
         let loading = map.required_raster_image("The scaled outgoing band must remain renderable while loading")?;
-        assert_eq!(
-            loading.as_raw(),
-            outgoing.as_raw(),
-            "Loading must retain the outgoing band's own scale and offset"
-        );
+        assert_scaled_loading_image(&loading, outgoing, background, expected, reduce_motion);
+        if !lock(&map.numeric).is_loading() {
+            assert_legend_center(&loading, expected);
+            return Ok(loading);
+        }
         let start = *outgoing.get_pixel(128, 128);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut previous = start[0];
@@ -1975,12 +2270,36 @@ mod tests {
                 "Nodata must not acquire the band's offset"
             );
             previous = pixel[0];
-            if !map.numeric.borrow().is_loading() {
+            if !lock(&map.numeric).is_loading() {
                 assert_legend_center(&image, expected);
                 return Ok(image);
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn assert_scaled_loading_image(loading: &RgbaImage, outgoing: &RgbaImage, background: &RgbaImage, expected: image::Rgba<u8>, reduce_motion: bool) {
+        if !reduce_motion {
+            assert_eq!(
+                loading.as_raw(),
+                outgoing.as_raw(),
+                "Loading must retain the outgoing band's own scale and offset"
+            );
+            return;
+        }
+        // Cached replacements may be ready on the first frame. Reduced motion
+        // must show a whole endpoint (including nodata), never a fractional fade.
+        let endpoint = RgbaImage::from_fn(outgoing.width(), outgoing.height(), |x, y| {
+            if outgoing.get_pixel(x, y) == background.get_pixel(x, y) {
+                *background.get_pixel(x, y)
+            } else {
+                expected
+            }
+        });
+        assert!(
+            loading.as_raw() == outgoing.as_raw() || loading.as_raw() == endpoint.as_raw(),
+            "Reduced motion must preserve a complete scaled-color endpoint"
+        );
     }
 
     fn assert_scaled_tiles_store_raw_values(first: &RasterSource, second: &RasterSource) -> Result<()> {
@@ -2039,7 +2358,7 @@ mod tests {
         outgoing: &RgbaImage,
         background: &RgbaImage,
     ) -> Result<()> {
-        let counts = map.numeric.borrow().tile_counts();
+        let counts = lock(&map.numeric).tile_counts();
         assert!(counts.0 > 0 && counts.1 > 0, "Warm the numeric tile cache before toggling units");
         let camera_updates = map.camera_updates;
         // Every following snapshot and render must use metadata and cached raw tiles only.
@@ -2069,7 +2388,7 @@ mod tests {
                 "Toggling units or clipping must leave nodata transparent"
             );
             assert_eq!(
-                map.numeric.borrow().tile_counts(),
+                lock(&map.numeric).tile_counts(),
                 counts,
                 "Unit/style changes must not request or upload numeric tiles"
             );
@@ -2104,10 +2423,10 @@ mod tests {
         let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
         let second = sources[1].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
         let first_image = map.render_raster(request, Some(first.clone()), 1.0)?;
-        let requests = map.numeric.borrow().tile_counts().0;
+        let requests = lock(&map.numeric).tile_counts().0;
         let second_image = map.render_raster(request, Some(second), 1.0)?;
         assert_ne!(first_image.as_raw(), second_image.as_raw(), "A different band must load different values");
-        assert!(map.numeric.borrow().tile_counts().0 > requests, "Band changes need new raw tiles");
+        assert!(lock(&map.numeric).tile_counts().0 > requests, "Band changes need new raw tiles");
 
         assert_native_cover_occludes_band_changes(&mut map, request, &first)?;
         assert_explicit_raster_layer_insertion(&mut map, request, first, &first_image)?;
@@ -2172,9 +2491,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a graphics device and MAP_TEST_NETCDF pointing to the Abu Dhabi WBGT example"]
-    fn local_wbgt_netcdf_places_the_coast_north_and_desert_south() -> Result<()> {
-        let path = std::path::PathBuf::from(std::env::var("MAP_TEST_NETCDF")?);
+    #[ignore = "requires a graphics device; synthetic local NetCDF coast/desert fixture"]
+    fn netcdf_places_north_nodata_and_south_values_without_flipping() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("coast.nc");
+        write_coast_netcdf_fixture(&path)?;
         let source = RasterSource::open(&path)?.remove(0);
         let viewport = Viewport {
             width: NonZeroU32::new(512).unwrap(),
@@ -2192,20 +2513,35 @@ mod tests {
         let step = geo::crs::lat_lon_to_web_mercator(camera.coordinate_at((-255.0, -255.0)));
         for (coordinate, has_data) in [(geo::Coordinate::latlon(25.0, 54.37), false), (geo::Coordinate::latlon(23.14, 53.78), true)] {
             let tile = geo::Tile::for_coordinate(coordinate, source.metadata().max_zoom.clamp(0, 22));
-            let data = source.numeric_tile(tile, 1)?.context("Missing WBGT tile")?;
+            let data = source.numeric_tile(tile, 1)?.context("Missing coast fixture tile")?;
             let grid = geo::GeoReference::from_tile(&tile, data.width as usize, 1);
             let projected = geo::crs::lat_lon_to_web_mercator(coordinate);
             let cell = grid.point_to_cell(projected);
             let value = data.values[(cell.row as u32 * data.width + cell.col as u32) as usize];
-            assert_eq!(value.is_finite(), has_data, "Numeric WBGT tile is reversed at {coordinate:?}");
+            assert_eq!(value.is_finite(), has_data, "Numeric coast fixture tile is reversed at {coordinate:?}");
             let x = ((projected.x() - origin.x()) / (step.x() - origin.x())).round() as u32;
             let y = ((projected.y() - origin.y()) / (step.y() - origin.y())).round() as u32;
             assert_eq!(
                 *image.get_pixel(x, y) != image::Rgba([255, 0, 255, 255]),
                 has_data,
-                "Rendered WBGT footprint is reversed at {coordinate:?}"
+                "Rendered coast fixture footprint is reversed at {coordinate:?}"
             );
         }
+        Ok(())
+    }
+
+    fn write_coast_netcdf_fixture(path: &std::path::Path) -> Result<()> {
+        let mut dataset = gdal::DriverManager::get_driver_by_name("netCDF")?.create_with_band_type::<f32, _>(path, 64, 80, 1)?;
+        dataset.set_geo_transform(&[52.5, 0.05, 0.0, 26.0, 0.0, -0.05])?;
+        dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(4326)?)?;
+        let mut band = dataset.rasterband(1)?;
+        band.set_no_data_value(Some(-9999.0))?;
+        // Retain the original Abu Dhabi probe coordinates and north/south
+        // validity assertions without depending on an unshared external file.
+        let mut values = vec![-9999.0_f32; 64 * 80];
+        values[64 * 40..].fill(35.0);
+        band.write((0, 0), (64, 80), &mut gdal::raster::Buffer::new((64, 80), values))?;
+        dataset.close()?;
         Ok(())
     }
 
@@ -2294,10 +2630,10 @@ mod tests {
             Some(r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##),
         )?;
         map.render_raster(request, Some(source.clone()), 1.0)?;
-        let counts = map.numeric.borrow().tile_counts();
+        let counts = lock(&map.numeric).tile_counts();
         let camera_updates = map.camera_updates;
         measure_raster_restyles(&mut map, request, &source)?;
-        assert_eq!(map.numeric.borrow().tile_counts(), counts);
+        assert_eq!(lock(&map.numeric).tile_counts(), counts);
         assert_eq!(map.camera_updates, camera_updates);
         Ok(())
     }
@@ -2322,10 +2658,10 @@ mod tests {
             camera.pan(10.0, 5.0);
             camera.zoom_at(0.01, (0.0, 0.0));
             let start = Instant::now();
-            map.apply_request(MapRequest { viewport, camera });
-            let texture = wait_for_native_texture(&mut map)?;
+            map.apply_request(MapRequest { viewport, camera })?;
+            let texture = wait_for_native_frame(&mut map)?;
             let rendered = Instant::now();
-            let image = map.readback.read(&texture, &map.device, &map.queue)?;
+            let image = map.read_frame(&texture)?;
             rendering += rendered - start;
             readback += rendered.elapsed();
             assert_eq!(image.dimensions(), (1800, 1140));
@@ -2536,7 +2872,7 @@ mod tests {
     ) -> Result<RgbaImage> {
         let numeric = map.numeric.clone();
         let device = map.device.clone();
-        let counts = numeric.borrow().tile_counts();
+        let counts = lock(&numeric).tile_counts();
         let camera_updates = map.camera_updates;
         assert!(counts.0 > 0 && counts.1 > 0);
         assert_ne!(dark_raster.as_raw(), dark_background.as_raw());
@@ -2547,14 +2883,14 @@ mod tests {
         assert_eq!(map.basemap, BasemapStyle::Light);
         assert!(map.camera == Some(request.camera));
         assert_eq!(map.device, device);
-        assert!(Rc::ptr_eq(&map.numeric, &numeric));
+        assert!(Arc::ptr_eq(&map.numeric, &numeric));
         let light_raster = map.render(request)?;
         assert_ne!(
             light_raster.as_raw(),
             dark_raster.as_raw(),
             "The new basemap must be visible through the overlay"
         );
-        assert_eq!(numeric.borrow().tile_counts(), counts, "Reloading must not request or upload numeric tiles");
+        assert_eq!(lock(&numeric).tile_counts(), counts, "Reloading must not request or upload numeric tiles");
 
         // Requesting the current basemap must not replace the offline style.
         map.set_basemap(BasemapStyle::Light)?;
@@ -2565,7 +2901,7 @@ mod tests {
             "A round trip must preserve the native camera and overlay"
         );
         assert_eq!(map.camera_updates, camera_updates);
-        assert_eq!(numeric.borrow().tile_counts(), counts);
+        assert_eq!(lock(&numeric).tile_counts(), counts);
         Ok(light_raster)
     }
 
@@ -2726,9 +3062,7 @@ mod tests {
         let rendered = map.render_vector(request, Some(source), 1.0, "#3b82f6")?;
         assert_eq!(rendered.dimensions(), (512, 512), "HiDPI readback must use physical pixels");
         let center = (128.0, 128.0);
-        let decoy = map
-            .renderer
-            .query_rendered_features(ScreenCoordinate { x: center.0, y: center.1 }, &["basemap-decoy".to_owned()])?;
+        let decoy = map.query_features(ScreenPoint { x: center.0, y: center.1 }, 0.0, &["basemap-decoy".to_owned()])?;
         assert_eq!(decoy.len(), 1, "The excluded basemap feature must really be queryable");
         assert_eq!(decoy[0]["properties"]["name"], "basemap-decoy");
 
@@ -2805,7 +3139,7 @@ mod tests {
         background: &RgbaImage,
     ) -> Result<()> {
         let gray = source.restyled(inf::colormap::ColorMapPreset::Gray, source.range())?;
-        let (requests, uploads) = map.numeric.borrow().tile_counts();
+        let (requests, uploads) = lock(&map.numeric).tile_counts();
         let camera_updates = map.camera_updates;
         assert!(requests > 0 && uploads > 0, "The custom layer must load and upload numeric tiles");
         // The following restyles must work even if the data is no longer readable.
@@ -2816,7 +3150,7 @@ mod tests {
         let rescaled = map.render_raster(request, Some(range), 1.0)?;
         assert_ne!(restyled.as_raw(), rescaled.as_raw(), "A range change must update the shader mapping");
         assert_eq!(
-            map.numeric.borrow().tile_counts(),
+            lock(&map.numeric).tile_counts(),
             (requests, uploads),
             "Restyling must not request or upload tile data"
         );
@@ -2839,7 +3173,7 @@ mod tests {
 
     fn assert_band_loading_and_supersession(map: &mut NativeMap, request: MapRequest, sources: &[Arc<RasterSource>], first_image: &RgbaImage) -> Result<()> {
         map.set_raster(Some(sources[1].clone()), 1.0)?;
-        map.apply_request(request);
+        map.apply_request(request)?;
         // The first render schedules new tiles, but still draws the old slot.
         let loading = map.required_raster_image("The outgoing slot must remain renderable")?;
         assert_eq!(first_image.as_raw(), loading.as_raw(), "Loading a band must not expose missing tiles");
@@ -2848,7 +3182,7 @@ mod tests {
         let third = sources[2].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
         map.set_raster(Some(sources[2].clone()), 1.0)?;
         map.set_raster(Some(third), 1.0)?;
-        map.apply_request(request);
+        map.apply_request(request)?;
         assert_eq!(
             first_image.as_raw(),
             map.required_raster_image("Rapid band changes must keep drawing")?.as_raw()
@@ -2865,20 +3199,16 @@ mod tests {
         replacement: &RgbaImage,
     ) -> Result<()> {
         // Clearing while a replacement is pending must immediately reveal the map.
-        map.set_raster(Some(sources[0].clone()), 1.0)?;
-        map.apply_request(request);
-        assert!(map.poll_frame()?.is_some());
-        map.set_raster(None, 1.0)?;
-        map.apply_request(request);
-        assert!(map.poll_frame()?.is_some(), "Clearing must not wait for cancelled band jobs");
-        assert!(!map.numeric.borrow().is_loading());
+        let _ = map.render_raster_first_frame(request, Some(sources[0].clone()), 1.0)?;
+        let _ = map.render_raster_first_frame(request, None, 1.0)?;
+        assert!(!lock(&map.numeric).is_loading());
 
         let reference = map.render_raster(request, Some(fourth), 1.0)?;
         assert_eq!(replacement.as_raw(), reference.as_raw(), "The latest queued band and style must win");
-        map.numeric.borrow_mut().set_reduce_motion(true);
+        lock(&map.numeric).set_reduce_motion(true);
         let first = sources[0].restyled(inf::colormap::ColorMapPreset::Gray, (0.0, 160.0))?;
         map.set_raster(Some(first), 1.0)?;
-        map.apply_request(request);
+        map.apply_request(request)?;
         assert_reduced_motion_band_swap(map, &reference, first_image)?;
         Ok(())
     }
@@ -2886,10 +3216,10 @@ mod tests {
     fn assert_initial_fallback_loading(map: &mut NativeMap, request: MapRequest, sources: &[Arc<RasterSource>]) -> Result<()> {
         map.render(request)?;
         map.set_raster(Some(sources[0].clone()), 1.0)?;
-        map.apply_request(request);
-        assert!(map.poll_frame()?.is_some());
+        map.apply_request(request)?;
+        let _ = wait_for_native_frame(map)?;
         assert!(
-            map.numeric.borrow().pending_fallback_count() > 0,
+            lock(&map.numeric).pending_fallback_count() > 0,
             "Initial loading still needs coarse tiles for progressive display"
         );
         map.render(request)?;
@@ -2897,14 +3227,14 @@ mod tests {
     }
 
     fn raster_fade_endpoints(map: &mut NativeMap, request: MapRequest, sources: &[Arc<RasterSource>]) -> Result<Vec<RgbaImage>> {
-        map.numeric.borrow_mut().set_reduce_motion(true);
+        lock(&map.numeric).set_reduce_motion(true);
         let mut endpoints = Vec::new();
         for source in sources {
             map.set_raster(Some(source.clone()), 0.6)?;
             endpoints.push(map.render(request)?);
         }
         map.render_raster(request, Some(sources[0].clone()), 0.6)?;
-        map.numeric.borrow_mut().set_reduce_motion(false);
+        lock(&map.numeric).set_reduce_motion(false);
         Ok(endpoints)
     }
 
@@ -2933,11 +3263,11 @@ mod tests {
     }
 
     fn nodata_fade_endpoints(map: &mut NativeMap, request: MapRequest, first: Arc<RasterSource>, second: &Arc<RasterSource>) -> Result<(RgbaImage, RgbaImage)> {
-        map.numeric.borrow_mut().set_reduce_motion(true);
+        lock(&map.numeric).set_reduce_motion(true);
         let outgoing = map.render_raster(request, Some(first.clone()), 0.6)?;
         let incoming = map.render_raster(request, Some(second.clone()), 0.6)?;
         map.render_raster(request, Some(first), 0.6)?;
-        map.numeric.borrow_mut().set_reduce_motion(false);
+        lock(&map.numeric).set_reduce_motion(false);
         Ok((outgoing, incoming))
     }
 
@@ -2962,7 +3292,7 @@ mod tests {
                     "Nodata/opacity must blend endpoint colors without a dark dip: {actual} vs {expected}"
                 );
             }
-            if !map.numeric.borrow().is_loading() {
+            if !lock(&map.numeric).is_loading() {
                 assert_eq!(image.as_raw(), incoming.as_raw());
                 break;
             }
@@ -3007,13 +3337,14 @@ mod tests {
     fn assert_native_cover_occludes_band_changes(map: &mut NativeMap, request: MapRequest, first: &Arc<RasterSource>) -> Result<()> {
         // A native opaque layer above the custom layer must cover it even when
         // MapLibre draws opaque geometry before its translucent/custom pass.
-        map.renderer.style().add_source(AnySource::from_json_str(
+        map.add_source(
             "cover",
-            r##"{"type":"geojson","data":{"type":"Polygon","coordinates":[[[-20,-20],[20,-20],[20,20],[-20,20],[-20,-20]]]}}"##,
-        )?)?;
-        map.renderer.style().add_layer(AnyLayer::from_json_str(
-            r##"{"id":"cover","type":"fill","source":"cover","paint":{"fill-color":"#00ff00","fill-antialias":false}}"##,
-        )?)?;
+            &serde_json::from_str(r##"{"type":"geojson","data":{"type":"Polygon","coordinates":[[[-20,-20],[20,-20],[20,20],[-20,20],[-20,-20]]]}}"##)?,
+        )?;
+        map.add_layer(
+            &serde_json::from_str(r##"{"id":"cover","type":"fill","source":"cover","paint":{"fill-color":"#00ff00","fill-antialias":false}}"##)?,
+            None,
+        )?;
         let covered = map.render(request)?;
         assert_eq!(*covered.get_pixel(128, 128), image::Rgba([0, 255, 0, 255]));
         map.set_raster(Some(first.clone()), 1.0)?;
@@ -3028,16 +3359,17 @@ mod tests {
     fn assert_explicit_raster_layer_insertion(map: &mut NativeMap, request: MapRequest, first: Arc<RasterSource>, first_image: &RgbaImage) -> Result<()> {
         // The same host API supports explicit insertion before a native layer.
         map.set_raster(None, 1.0)?;
-        map.numeric.borrow_mut().set_source(Some(first), 1.0, 1);
-        map.renderer
-            .style()
-            .add_wgpu_custom_layer("below-cover", RasterLayerHost::new(map.numeric.clone()), Some("cover"))?;
+        lock(&map.numeric).set_source(Some(first), 1.0, 1);
+        map.add_numeric_layer("below-cover", Some("cover"))?;
         let below = map.render(request)?;
         assert_eq!(*below.get_pixel(128, 128), image::Rgba([0, 255, 0, 255]));
-        map.renderer.style().remove_layer("cover");
-        map.renderer.style().add_layer(AnyLayer::from_json_str(
-            r##"{"id":"cover","type":"fill","source":"cover","paint":{"fill-color":"#00ff00","fill-opacity":0.5,"fill-antialias":false}}"##,
-        )?)?;
+        map.remove_layer("cover")?;
+        map.add_layer(
+            &serde_json::from_str(
+                r##"{"id":"cover","type":"fill","source":"cover","paint":{"fill-color":"#00ff00","fill-opacity":0.5,"fill-antialias":false}}"##,
+            )?,
+            None,
+        )?;
         let blended = map.render(request)?;
         let raster_pixel = first_image.get_pixel(128, 128);
         let expected = [raster_pixel[0] / 2, 128 + raster_pixel[1] / 2, raster_pixel[2] / 2, 255];
@@ -3090,10 +3422,10 @@ mod tests {
             let styled = Instant::now();
             // Follow the production path: publish the first available frame,
             // rather than waiting for all native fades to become idle.
-            map.apply_request(request);
-            let texture = map.poll_frame()?.context("Range update did not produce a frame")?;
+            map.apply_request(request)?;
+            let texture = wait_for_native_frame(map)?;
             let rendered = Instant::now();
-            let _image = map.readback.read(&texture, &map.device, &map.queue)?;
+            let _image = map.read_frame(&texture)?;
             styling += styled - start;
             rendering += rendered - styled;
             readback += rendered.elapsed();
@@ -3123,11 +3455,12 @@ mod tests {
         }
     }
 
-    fn wait_for_native_texture(map: &mut NativeMap) -> Result<wgpu::Texture> {
+    pub(super) fn wait_for_native_frame(map: &mut NativeMap) -> Result<TextureReadbackResult> {
         loop {
             if let Some(texture) = map.poll_frame()? {
                 return Ok(texture);
             }
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 

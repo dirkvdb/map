@@ -44,7 +44,7 @@ fn gpu_extrusion_opaque_bypass_releases_composite_without_reloading_raw_tiles() 
     tests::load_until_idle(&mut layer)?;
     paint_playback_depth(&mut layer)?;
     assert!(layer.composite.is_none(), "The first opaque frame must bypass offscreen targets");
-    assert_eq!(layer.pipeline.as_ref().unwrap().formats, (0x16, 0x30, false));
+    assert_eq!(layer.pipeline.as_ref().unwrap().formats, (0x16, 0x30, false, false));
     let counts = (layer.requests, layer.uploads, layer.generation, layer.cache.len(), layer.cache_bytes);
     for opacity in [0.5, 1.0] {
         layer.set_playback(request.clone(), opacity);
@@ -174,10 +174,54 @@ fn gpu_extrusion_playback_toggle_honors_reduced_motion_and_clearing() -> Result<
 }
 
 #[test]
+fn gpu_flat_multiband_depth_capture_occludes_farther_surfaces_only_when_requested() -> Result<()> {
+    let (device, queue) = device()?;
+    for (capture_depth, near_value, gray) in [(false, 64.0, 192), (true, 64.0, 64), (true, f32::NAN, 192)] {
+        let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, true, capture_depth));
+        pipeline.update_palette(&queue, (ColorMapPreset::Gray, ColorMapDirection::Regular));
+        let texture = tiles::upload_window(
+            &device,
+            &queue,
+            vec![Some(sample_tile([1; 2], &[near_value])), Some(sample_tile([1; 2], &[192.0]))],
+            1,
+        )?
+        .unwrap();
+        let draws = [0, 1].map(|_| pipeline.draw_tile(&device, [None; 3], [Some(&texture), Some(&texture), None]));
+        for (index, draw) in draws.iter().enumerate() {
+            let data = DrawUniform {
+                matrix: [
+                    [2.0, 0.0, 0.0, 0.0],
+                    [0.0, -2.0, 0.0, 0.0],
+                    [0.0; 4],
+                    [-1.0, 1.0, if index == 0 { 0.2 } else { 0.7 }, 1.0],
+                ],
+                scale: [1.0, 0.0],
+                next_scale: [1.0, 0.0],
+                range: [0.0, 255.0],
+                next_range: [0.0, 255.0],
+                parameters: [0.0, 1.0, 64.0, 0.0],
+                layers: [index as u32, index as u32, 1, 0],
+                ..DrawUniform::zeroed()
+            };
+            queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&data));
+        }
+        let image = paint_depth(&device, &queue, |pass| {
+            pass.set_pipeline(&pipeline.pipeline);
+            for draw in &draws {
+                pass.set_bind_group(0, &draw.bindings, &[]);
+                pass.draw(0..6, 0..1);
+            }
+        })?;
+        assert_eq!(image.get_pixel(32, 32).0, [gray, gray, gray, 255]);
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires a native graphics device"]
 fn gpu_extrusion_multiband_interpolates_values_and_omits_invalid_bars() -> Result<()> {
     let (device, queue) = device()?;
-    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false));
+    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false, false));
     pipeline.update_palette(&queue, (ColorMapPreset::Gray, ColorMapDirection::Regular));
     let bands = vec![
         Some(NumericTile {
@@ -307,7 +351,7 @@ fn render_bands(
 fn gpu_extrusion_multiband_height_normalizes_interpolated_scaled_values_and_ranges() -> Result<()> {
     use crate::raster_layer::extrusion_tests::top_row;
     let (device, queue) = device()?;
-    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false));
+    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false, false));
     pipeline.update_palette(&queue, (ColorMapPreset::Gray, ColorMapDirection::Regular));
     // The unequal ranges distinguish normalize-after-interpolation from blending
     // normalized endpoint heights. Colors and projected heights must agree.
@@ -340,7 +384,7 @@ fn gpu_extrusion_multiband_height_normalizes_interpolated_scaled_values_and_rang
 fn gpu_extrusion_multiband_height_respects_masks_clamping_and_zero_maximum() -> Result<()> {
     use crate::raster_layer::extrusion_tests::top_row;
     let (device, queue) = device()?;
-    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false));
+    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false, false));
     pipeline.update_palette(&queue, (ColorMapPreset::Gray, ColorMapDirection::Regular));
     for (values, row) in [([f32::NAN, 10.0], Some(18)), ([5.0, f32::NAN], Some(30)), ([f32::NAN; 2], None)] {
         let image = render_heights(&device, &queue, &pipeline, height_uniform(), values)?;
@@ -366,7 +410,7 @@ fn gpu_extrusion_multiband_height_respects_masks_clamping_and_zero_maximum() -> 
 fn gpu_extrusion_multiband_endpoints_use_only_the_selected_bands_style_and_validity() -> Result<()> {
     use crate::raster_layer::extrusion_tests::top_row;
     let (device, queue) = device()?;
-    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false));
+    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false, false));
     pipeline.update_palette(&queue, (ColorMapPreset::Gray, ColorMapDirection::Regular));
     for (blend, values, row, color) in [(0.0, [5.0, f32::NAN], 24, 64), (1.0, [f32::NAN, 15.0], 20, 96)] {
         let mut data = height_uniform();
@@ -390,7 +434,7 @@ fn gpu_extrusion_multiband_endpoints_use_only_the_selected_bands_style_and_valid
 fn gpu_extrusion_multiband_lighting_shades_compass_walls_and_preserves_premultiplied_alpha() -> Result<()> {
     use crate::raster_layer::extrusion_tests::{assert_bar_faces, rotated_height_matrix, write_solid_palette};
     let (device, queue) = device()?;
-    let pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false));
+    let pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false, false));
     write_solid_palette(&queue, &pipeline.palette, [192, 128, 64, 128]);
     for (azimuth, wall) in ["south", "east", "north", "west"].into_iter().enumerate() {
         let mut data = height_uniform();
@@ -408,7 +452,7 @@ fn gpu_extrusion_multiband_lighting_shades_compass_walls_and_preserves_premultip
 fn gpu_extrusion_multiband_lod_preserves_interpolated_heights_and_edge_cells() -> Result<()> {
     use crate::raster_layer::extrusion_tests::top_row;
     let (device, queue) = device()?;
-    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false));
+    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false, false));
     pipeline.update_palette(&queue, (ColorMapPreset::Gray, ColorMapDirection::Regular));
     let mut data = height_uniform();
     data.extrusion[0] = 5.0;
@@ -444,7 +488,7 @@ fn gpu_extrusion_multiband_retained_ancestors_do_not_cap_request_detail() -> Res
     };
     layer.cache.insert(root, CachedWindow { texture: None, used: 0 });
     assert_eq!(layer.view_tiles(&p, &request, &bands[0]), target);
-    let pipeline = MultibandPipeline::new(&layer.device, (0x16, 0, false));
+    let pipeline = MultibandPipeline::new(&layer.device, (0x16, 0, false, false));
     let draw = pipeline.draw_tile(&layer.device, [None; 3], [None; 3]);
     layer.retained = Some(RetainedFrame {
         draws: std::collections::HashMap::from([(VisibleTile { z: 0, x: 0, y: 0 }, draw)]),
@@ -464,7 +508,7 @@ fn gpu_extrusion_multiband_retained_ancestors_do_not_cap_request_detail() -> Res
 #[ignore = "requires a native graphics device"]
 fn gpu_extrusion_multiband_zero_height_matches_flat_with_masked_endpoints_and_blends() -> Result<()> {
     let (device, queue) = device()?;
-    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false));
+    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false, false));
     pipeline.update_palette(&queue, (ColorMapPreset::Gray, ColorMapDirection::Regular));
     for (values, alphas) in [
         ([5.0, 10.0], [255, 255, 255]),
@@ -491,7 +535,7 @@ fn gpu_extrusion_multiband_zero_height_matches_flat_with_masked_endpoints_and_bl
 fn gpu_extrusion_multiband_averaging_uses_raw_mean_before_endpoint_clamping() -> Result<()> {
     use crate::raster_layer::extrusion_tests::top_row;
     let (device, queue) = device()?;
-    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false));
+    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false, false));
     pipeline.update_palette(&queue, (ColorMapPreset::Gray, ColorMapDirection::Regular));
     for (values, mean, row) in [([-100.0, 0.0, 0.0, 100.0], 0.0, 32), ([0.0, 0.0, 0.0, 100.0], 25.0, 28)] {
         for (blend, clamp) in [(0.0, 0), (0.0, 1), (1.0, 0), (1.0, 1)] {
@@ -513,7 +557,7 @@ fn gpu_extrusion_multiband_averaging_uses_raw_mean_before_endpoint_clamping() ->
 fn gpu_extrusion_multiband_averaging_styles_unequal_endpoint_counts_before_value_interpolation() -> Result<()> {
     use crate::raster_layer::extrusion_tests::top_row;
     let (device, queue) = device()?;
-    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false));
+    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false, false));
     // A nonlinear palette distinguishes one lookup after value interpolation from blended colors.
     pipeline.update_palette(&queue, (ColorMapPreset::Blues, ColorMapDirection::Regular));
     for (current, next, means, row) in [
@@ -541,7 +585,7 @@ fn gpu_extrusion_multiband_averaging_styles_unequal_endpoint_counts_before_value
 fn gpu_extrusion_multiband_averaging_flags_select_current_and_next_means_independently() -> Result<()> {
     use crate::raster_layer::extrusion_tests::top_row;
     let (device, queue) = device()?;
-    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false));
+    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false, false));
     pipeline.update_palette(&queue, (ColorMapPreset::Gray, ColorMapDirection::Regular));
     for (flags, samples, rows) in [
         (0, [10.0, 20.0], [16, 16, 16]),
@@ -574,7 +618,7 @@ fn gpu_extrusion_multiband_averaging_flags_select_current_and_next_means_indepen
 #[ignore = "requires a native graphics device"]
 fn gpu_extrusion_multiband_averaging_fades_only_missing_endpoints_and_omits_all_nodata() -> Result<()> {
     let (device, queue) = device()?;
-    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false));
+    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false, false));
     pipeline.update_palette(&queue, (ColorMapPreset::Gray, ColorMapDirection::Regular));
     let partial = [50.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
     let missing = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
@@ -604,7 +648,7 @@ fn gpu_extrusion_multiband_averaging_fades_only_missing_endpoints_and_omits_all_
 fn gpu_extrusion_multiband_averaging_covers_odd_logical_grid_edges_once() -> Result<()> {
     use crate::raster_layer::extrusion_tests::odd_averaging_values;
     let (device, queue) = device()?;
-    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false));
+    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false, false));
     pipeline.update_palette(&queue, (ColorMapPreset::Gray, ColorMapDirection::Regular));
     let (values, means) = odd_averaging_values();
     // Window uploads are square; the 5x3 logical grid samples rows 0, 2 and 4.
@@ -638,7 +682,7 @@ fn gpu_extrusion_multiband_averaging_covers_odd_logical_grid_edges_once() -> Res
 #[ignore = "requires a native graphics device"]
 fn gpu_extrusion_multiband_averaging_flags_leave_flat_sampling_unchanged() -> Result<()> {
     let (device, queue) = device()?;
-    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false));
+    let mut pipeline = MultibandPipeline::new(&device, (0x16, 0x30, false, false));
     pipeline.update_palette(&queue, (ColorMapPreset::Gray, ColorMapDirection::Regular));
     let mut data = averaging_uniform();
     data.parameters[0] = 0.25;

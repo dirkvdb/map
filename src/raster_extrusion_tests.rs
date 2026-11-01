@@ -36,7 +36,7 @@ fn gpu_extrusion_static_opaque_bypass_releases_targets_without_reloading_tiles()
         assert_eq!((layer.requests, layer.uploads, layer.generation, layer.cache_bytes), counts);
         assert_eq!(layer.cache.len(), layer.coverage.len());
     }
-    assert_eq!(layer.pipeline.as_ref().unwrap().formats, (0x16, 0x30, false));
+    assert_eq!(layer.pipeline.as_ref().unwrap().formats, (0x16, 0x30, false, false));
     layer.previous = Some(PreviousRaster { source, cache: HashMap::new() });
     assert!(layer.needs_compositing(), "Opaque palettes can still fade against missing endpoints");
     paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
@@ -58,28 +58,35 @@ fn gpu_extrusion_static_toggle_animates_without_invalidating_raw_tiles() -> Resu
     let generation = layer.generation;
 
     layer.set_source(Some(raised.clone()), 1.0, 1);
-    let now = Instant::now();
-    assert_eq!(layer.extrusion_animation.height(4.0), 0.0, "Enabling must start at ground level");
-    assert!(layer.poll_tiles(), "An otherwise idle map must keep pumping the height transition");
-    layer.extrusion_animation.advance(now + Duration::from_millis(90));
-    assert!((0.0..4.0).contains(&layer.extrusion_animation.height(4.0)));
-    layer.extrusion_animation.advance(now + Duration::from_secs(1));
-    assert_eq!(layer.extrusion_animation.height(4.0), 4.0);
+    assert_extrusion_growth(&mut layer);
 
     layer.set_source(Some(flat.clone()), 1.0, 1);
     let now = Instant::now();
+    assert!(layer.is_extruded(), "A collapse keeps the extrusion projection until settled");
     assert_eq!(layer.extrusion_animation.height(0.0), 4.0, "Disabling must retain the visible height initially");
     assert_eq!(layer.extrusion_animation.maximum_height(0.0), 4.0, "Shrinking bars still need volume coverage");
     layer.extrusion_animation.advance(now + Duration::from_millis(90));
     assert!((0.0..4.0).contains(&layer.extrusion_animation.height(0.0)));
     layer.extrusion_animation.advance(now + Duration::from_secs(1));
     assert_eq!(layer.extrusion_animation.height(0.0), 0.0);
+    assert!(!layer.is_extruded());
     assert!(!layer.poll_tiles(), "The transition must stop scheduling frames after reaching ground");
     assert_eq!(layer.generation, generation);
     assert!(layer.cache.contains_key(&root));
     assert!(layer.previous.is_none());
     assert_eq!(layer.tile_counts(), (0, 0));
     Ok(())
+}
+
+fn assert_extrusion_growth(layer: &mut RasterLayer) {
+    let now = Instant::now();
+    assert_eq!(layer.extrusion_animation.height(4.0), 0.0, "Enabling must start at ground level");
+    assert!(layer.is_extruded(), "A growing surface selects the near-clipped matrix even at ground level");
+    assert!(layer.poll_tiles(), "An otherwise idle map must keep pumping the height transition");
+    layer.extrusion_animation.advance(now + Duration::from_millis(90));
+    assert!((0.0..4.0).contains(&layer.extrusion_animation.height(4.0)));
+    layer.extrusion_animation.advance(now + Duration::from_secs(1));
+    assert_eq!(layer.extrusion_animation.height(4.0), 4.0);
 }
 
 #[test]
@@ -229,10 +236,39 @@ fn uniform() -> DrawUniform {
 }
 
 #[test]
+fn gpu_flat_depth_capture_occludes_farther_surfaces_only_when_requested() -> Result<()> {
+    let (device, queue) = device()?;
+    for (capture_depth, near_value, gray) in [(false, 64.0, 192), (true, 64.0, 64), (true, f32::NAN, 192)] {
+        let pipeline = RasterPipeline::new(&device, (0x16, 0x30, true, capture_depth));
+        let palette: Vec<u8> = (0..=255).flat_map(|value| [value, value, value, 255]).collect();
+        write_texture(&queue, &pipeline.palettes[0], &palette, 256, 1, 4);
+        let textures = [near_value, 192.0].map(|value| upload_tile(&device, &queue, sample_tile([1; 2], &[value])));
+        let draws = textures
+            .each_ref()
+            .map(|texture| pipeline.draw_tile(&device, (None, None), Some(texture), None));
+        for (draw, depth) in draws.iter().zip([0.2, 0.7]) {
+            let mut data = uniform();
+            data.extrusion[3] = 0.0;
+            data.matrix[3][2] = depth;
+            queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&data));
+        }
+        let image = paint_depth(&device, &queue, |pass| {
+            pass.set_pipeline(&pipeline.pipeline);
+            for draw in &draws {
+                pass.set_bind_group(0, &draw.bindings, &[]);
+                pass.draw(0..6, 0..1);
+            }
+        })?;
+        assert_eq!(image.get_pixel(32, 32).0, [gray, gray, gray, 255]);
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires a native graphics device"]
 fn gpu_extrusion_omits_nodata_out_of_range_and_transparent_palette_without_occluding() -> Result<()> {
     let (device, queue) = device()?;
-    let pipeline = RasterPipeline::new(&device, (0x16, 0x30, false));
+    let pipeline = RasterPipeline::new(&device, (0x16, 0x30, false, false));
     let palette: Vec<u8> = (0..=255).flat_map(|v| [v, v, v, if v == 200 { 0 } else { 255 }]).collect();
     write_texture(&queue, &pipeline.palettes[0], &palette, 256, 1, 4);
     let front = upload_tile(
@@ -280,7 +316,7 @@ fn gpu_extrusion_omits_nodata_out_of_range_and_transparent_palette_without_occlu
 #[ignore = "requires a native graphics device"]
 fn gpu_extrusion_parent_uv_and_outgoing_snapshot_keep_pixel_color_on_walls() -> Result<()> {
     let (device, queue) = device()?;
-    let pipeline = RasterPipeline::new(&device, (0x16, 0x30, false));
+    let pipeline = RasterPipeline::new(&device, (0x16, 0x30, false, false));
     let palette: Vec<u8> = (0..=255).flat_map(|v| [v, v, v, 255]).collect();
     for texture in &pipeline.palettes {
         write_texture(&queue, texture, &palette, 256, 1, 4);
@@ -368,7 +404,7 @@ pub(crate) fn top_row(image: &image::RgbaImage) -> Option<u32> {
 }
 
 fn height_pipeline(device: &wgpu::Device, queue: &wgpu::Queue) -> RasterPipeline {
-    let pipeline = RasterPipeline::new(device, (0x16, 0x30, false));
+    let pipeline = RasterPipeline::new(device, (0x16, 0x30, false, false));
     let palette: Vec<u8> = (0..=255).flat_map(|v| [v, v, v, 255]).collect();
     for texture in &pipeline.palettes {
         write_texture(queue, texture, &palette, 256, 1, 4);

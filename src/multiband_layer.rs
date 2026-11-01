@@ -26,11 +26,11 @@ use anyhow::{Result, ensure};
 use bytemuck::{Pod, Zeroable};
 use geo::Tile;
 use inf::colormap::{ColorMapDirection, ColorMapPreset, ProcessedColorMap};
-use maplibre_native::{WgpuLayerParameters, texture_format_from_webgpu};
 
 use crate::raster_composite::{PaletteOpacity, RasterComposite};
 use crate::raster_extrusion_animation::ExtrusionAnimation;
 use crate::raster_layer::geometry;
+use crate::raster_parameters::{WgpuLayerParameters, texture_format_from_webgpu};
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest, PlaybackStyle, validate_bands};
 use crate::raster_source::RasterSource;
 use crate::raster_tiles::{VisibleTile, extrusion_view, tile_matrix, visible_tiles};
@@ -74,7 +74,7 @@ struct RetainedFrame {
 }
 
 struct MultibandPipeline {
-    formats: (u32, u32, bool),
+    formats: (u32, u32, bool, bool),
     pipeline: wgpu::RenderPipeline,
     extrusion_pipeline: wgpu::RenderPipeline,
     extrusion_indices: wgpu::Buffer,
@@ -307,6 +307,12 @@ impl MultibandLayer {
                 || self.wanted.iter().any(|key| !self.cache.contains_key(key)))
     }
 
+    pub(crate) fn is_extruded(&self) -> bool {
+        self.request
+            .as_ref()
+            .is_some_and(|request| self.extrusion_animation.maximum_height(playback_height(request)) > 0.0)
+    }
+
     /// Feedback carries the accepted position, never the speculative buffered frame.
     pub fn playback_frame(&self) -> Option<PlaybackFrame> {
         let request = self.request.as_ref()?;
@@ -328,6 +334,8 @@ impl MultibandLayer {
         let now = Instant::now();
         let Some(request) = self.extrusion_request(now) else { return };
         let extruded = playback_height(&request) > 0.0;
+        let parameters = parameters.for_extrusion(self.is_extruded());
+        let parameters = parameters.as_ref();
         if !extruded || (parameters.depth_format != 0 && !self.needs_compositing(&request)) {
             self.composite = None;
             self.render_content(pass, parameters, &request, now);
@@ -602,7 +610,7 @@ impl MultibandLayer {
     }
 
     fn prepare_pipeline(&mut self, parameters: &WgpuLayerParameters) {
-        let formats = (parameters.color_format, parameters.depth_format, parameters.depth_test);
+        let formats = parameters.pipeline_formats();
         if self.pipeline.as_ref().is_none_or(|pipeline| pipeline.formats != formats) {
             self.draws.clear();
             self.retained = None;
@@ -851,7 +859,7 @@ impl MultibandPipeline {
         self.palette_opaque && opacity >= 1.0 && (blend <= 0.0 || blend >= 1.0)
     }
 
-    fn new(device: &wgpu::Device, formats: (u32, u32, bool)) -> Self {
+    fn new(device: &wgpu::Device, formats: (u32, u32, bool, bool)) -> Self {
         let layout = create_layout(device);
         let pipeline = create_pipeline(device, formats, &layout, false);
         let palette = device.create_texture(&wgpu::TextureDescriptor {
@@ -992,7 +1000,7 @@ fn create_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wgpu::BindGroupLayout, extruded: bool) -> wgpu::RenderPipeline {
+fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool, bool), layout: &wgpu::BindGroupLayout, extruded: bool) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Multiband pipeline layout"),
         bind_group_layouts: &[Some(layout)],
@@ -1012,11 +1020,6 @@ fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wg
     } else {
         wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
     };
-    let depth_compare = match (extruded, formats.2) {
-        (true, _) => wgpu::CompareFunction::Less,
-        (false, true) => wgpu::CompareFunction::LessEqual,
-        (false, false) => wgpu::CompareFunction::Always,
-    };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(if extruded { "Multiband raster extrusion" } else { "Multiband raster" }),
         layout: Some(&layout),
@@ -1031,14 +1034,7 @@ fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wg
             cull_mode: extruded.then_some(wgpu::Face::Back),
             ..Default::default()
         },
-        depth_stencil: (formats.1 != 0).then(|| wgpu::DepthStencilState {
-            format: texture_format_from_webgpu(formats.1),
-            depth_write_enabled: Some(extruded),
-            // Preserve the nearer surface when finite depth precision ties.
-            depth_compare: Some(depth_compare),
-            stencil: Default::default(),
-            bias: Default::default(),
-        }),
+        depth_stencil: crate::raster_parameters::depth_stencil(formats, extruded, false),
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: &shader,
@@ -1088,6 +1084,7 @@ mod tests {
             color_format: 0x16,
             depth_format: 0,
             depth_test: false,
+            ..Default::default()
         }
     }
 
@@ -1434,7 +1431,7 @@ mod tests {
     fn gpu_interpolates_scaled_values_before_palette_and_fades_single_invalid_pixels() -> Result<()> {
         let (device, queue) = gpu_device()?;
         // WebGPU's WGPUTextureFormat_RGBA8Unorm, as used by the native host.
-        let pipeline = MultibandPipeline::new(&device, (0x16, 0, false));
+        let pipeline = MultibandPipeline::new(&device, (0x16, 0, false, false));
         let cases = [
             (100.0, false, [0, 255, 0, 255, 0, 64, 0, 64, 0, 191, 0, 191, 0, 0, 0, 0]),
             (200.0, true, [41, 41, 41, 255, 26, 26, 26, 64, 40, 40, 40, 191, 0, 0, 0, 0]),

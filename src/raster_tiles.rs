@@ -18,8 +18,8 @@ use geo::{
     constants::{EARTH_CIRCUMFERENCE_M, LATITUDE_MAX},
     crs::lat_lon_to_web_mercator,
 };
-use maplibre_native::WgpuLayerParameters;
 
+use crate::raster_parameters::WgpuLayerParameters;
 use crate::raster_source::{NumericTile, RasterSource};
 
 pub const MAX_PENDING_TILES: usize = 64;
@@ -42,6 +42,7 @@ pub struct TileWorkers {
     jobs: async_channel::Sender<TileJob>,
     results: async_channel::Receiver<TileResult>,
     generation: Arc<AtomicU64>,
+    threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl TileWorkers {
@@ -49,20 +50,23 @@ impl TileWorkers {
         let (jobs, receiver) = async_channel::bounded::<TileJob>(MAX_PENDING_TILES);
         let (results, completed) = async_channel::bounded(MAX_PENDING_TILES);
         let generation = Arc::new(AtomicU64::new(0));
+        let mut workers = Self {
+            jobs,
+            results: completed,
+            generation: generation.clone(),
+            threads: Vec::new(),
+        };
         for ix in 0..2 {
             let receiver = receiver.clone();
             let results = results.clone();
             let generation = generation.clone();
-            std::thread::Builder::new()
+            let thread = std::thread::Builder::new()
                 .name(format!("numeric-tiles-{ix}"))
                 .spawn(move || run_tile_worker(receiver, results, generation))
                 .context("Could not start numeric tile workers")?;
+            workers.threads.push(thread);
         }
-        Ok(Self {
-            jobs,
-            results: completed,
-            generation,
-        })
+        Ok(workers)
     }
 
     pub fn reset(&self) -> u64 {
@@ -103,7 +107,15 @@ fn run_tile_worker(receiver: async_channel::Receiver<TileJob>, results: async_ch
 impl Drop for TileWorkers {
     fn drop(&mut self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
+        self.jobs.close();
         self.results.close();
+        // Wake both blocked receives and sends before joining. Native raster
+        // I/O and its thread-local destructors must finish before process exit.
+        for thread in self.threads.drain(..) {
+            if thread.join().is_err() {
+                log::error!("Numeric tile worker panicked during shutdown");
+            }
+        }
     }
 }
 
@@ -234,6 +246,15 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn dropping_workers_joins_threads_and_releases_shared_state() -> Result<()> {
+        let workers = TileWorkers::new()?;
+        let generation = workers.generation.clone();
+        drop(workers);
+        assert_eq!(Arc::strong_count(&generation), 1);
+        Ok(())
+    }
+
     pub(super) fn coverage_source(path: &Path, [west, south, east, north]: [f64; 4]) -> Result<Arc<RasterSource>> {
         crate::raster_source::test_support::write_raster(path, 4326, 1)?;
         let mut dataset = gdal::Dataset::open_ex(
@@ -259,6 +280,7 @@ mod tests {
             color_format: 0,
             depth_format: 0,
             depth_test: false,
+            ..Default::default()
         }
     }
 
@@ -322,6 +344,7 @@ mod tests {
             color_format: 0,
             depth_format: 0,
             depth_test: false,
+            ..Default::default()
         };
         let low = visible_tiles(&parameters, &source);
         assert_eq!(low.len(), 4, "Only tiles overlapping the raster should be scheduled");

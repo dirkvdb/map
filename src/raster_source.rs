@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -9,7 +9,9 @@ use gdal::Metadata as _;
 use geo::{AnyDenseArray, Array, RasterScale, Tile};
 use inf::Legend;
 use inf::colormap::{ColorMap, ColorMapDirection, ColorMapPreset, ProcessedColorMap};
-use maplibre_native::file_source::{ErrorReason, FileSource, FileSourceType, RequestHandle, ResourceRequest, Responder, Response, register_file_source};
+use maplibre_native_ffi::{
+    ResourceErrorReason, ResourceProvider, ResourceRequestHandle, ResourceResponse, ResourceResponseStatus, ResourceRoute, RuntimeHandle, UrlMatchFlag,
+};
 use raster_tile::RasterTileIO;
 use serde_json::{Value, json};
 use tiler::tileproviderfactory::TileProviderOptions;
@@ -414,7 +416,7 @@ impl RasterSource {
         })
     }
 
-    fn tile(&self, address: TileAddress) -> Result<Response> {
+    fn tile(&self, address: TileAddress) -> Result<Option<Vec<u8>>> {
         let metadata = &self.metadata;
         ensure!(!self.is_numeric(), "Numeric rasters are rendered by the custom layer");
         // This protocol serves image-only MBTiles. Numeric data never goes
@@ -430,11 +432,7 @@ impl RasterSource {
             matches!(data.format, TileFormat::Png | TileFormat::Jpeg) || data.data.is_empty(),
             "The raster provider returned a non-image tile"
         );
-        Ok(if data.data.is_empty() {
-            Response::no_content()
-        } else {
-            Response::data(data.data).with_expires(SystemTime::now() + Duration::from_secs(3600))
-        })
+        Ok((!data.data.is_empty()).then_some(data.data))
     }
 }
 
@@ -1060,14 +1058,14 @@ impl TileAddress {
 type Sources = Arc<RwLock<HashMap<tiler::LayerId, Weak<RasterSource>>>>;
 struct TileJob {
     url: String,
-    responder: Responder,
-    cancelled: Arc<AtomicBool>,
+    request: ResourceRequestHandle,
 }
 
-/// Process-wide protocol adapter. Only raster:// requests are intercepted;
-/// MapLibre's normal network source still handles the vector basemap.
+/// Process-wide weak source registry and image tile workers. Install its
+/// raster:// resource provider on each runtime; other URLs load natively.
 pub struct RasterTiles {
     sources: Sources,
+    jobs: async_channel::Sender<TileJob>,
 }
 
 impl RasterTiles {
@@ -1091,8 +1089,47 @@ impl RasterTiles {
                 .name(format!("raster-tiles-{worker}"))
                 .spawn(move || run_tile_worker(receiver, sources))?;
         }
-        register_file_source(FileSourceType::Asset, RasterFileSource { jobs });
-        Ok(Self { sources })
+        Ok(Self { sources, jobs })
+    }
+
+    /// Registers the image resource provider before the runtime loads a style.
+    /// Call only from a host thread: this waits for native command completion.
+    /// Source registrations remain shared across runtimes and hold only weak refs.
+    pub(crate) fn install(runtime: &RuntimeHandle) -> Result<()> {
+        runtime
+            .set_resource_provider(Self::init()?.resource_provider())?
+            .wait(Duration::from_secs(30))
+            .map_err(|_| anyhow::anyhow!("Raster resource provider registration timed out"))??;
+        Ok(())
+    }
+
+    fn resource_provider(&self) -> ResourceProvider {
+        let jobs = self.jobs.clone();
+        ResourceProvider {
+            routes: vec![ResourceRoute {
+                flags: UrlMatchFlag::GLOB,
+                url: format!("{URL_PREFIX}**"),
+                ..Default::default()
+            }],
+            ..ResourceProvider::new(move |info, request| {
+                // Native callbacks must not block or submit/wait for commands.
+                // Request completion is explicitly permitted inline by the API.
+                if let Err(error) = jobs.try_send(TileJob {
+                    url: info.requested_url,
+                    request,
+                }) {
+                    complete_tile_request(
+                        error.into_inner().request,
+                        &ResourceResponse {
+                            status: ResourceResponseStatus::Error,
+                            error_reason: ResourceErrorReason::Other,
+                            error_message: "Raster tile queue is full or stopped",
+                            ..Default::default()
+                        },
+                    );
+                }
+            })
+        }
     }
 
     pub fn register(&self, source: &Arc<RasterSource>) -> Result<()> {
@@ -1105,16 +1142,63 @@ impl RasterTiles {
 
 fn run_tile_worker(receiver: async_channel::Receiver<TileJob>, sources: Sources) {
     while let Ok(job) = receiver.recv_blocking() {
-        if job.cancelled.load(Ordering::Relaxed) {
+        if tile_request_cancelled(&job.request) {
             continue;
         }
-        let response = tile_response(&sources, &job.url);
-        job.responder.complete(response);
+        let result = tile_response(&sources, &job.url);
+        if tile_request_cancelled(&job.request) {
+            continue;
+        }
+        match result {
+            Ok(bytes) => complete_tile_request(job.request, &tile_resource_response(bytes.as_deref())),
+            Err(error) => complete_tile_request(
+                job.request,
+                &ResourceResponse {
+                    status: ResourceResponseStatus::Error,
+                    error_reason: ResourceErrorReason::Other,
+                    error_message: &format!("{error:#}"),
+                    ..Default::default()
+                },
+            ),
+        }
     }
 }
 
-fn tile_response(sources: &Sources, url: &str) -> Response {
-    let result = (|| -> Result<Response> {
+fn tile_request_cancelled(request: &ResourceRequestHandle) -> bool {
+    request.is_cancelled().unwrap_or_else(|error| {
+        log::error!("Could not check raster request cancellation: {error}");
+        true
+    })
+}
+
+fn tile_resource_response(bytes: Option<&[u8]>) -> ResourceResponse<'_> {
+    ResourceResponse {
+        status: if bytes.is_some() {
+            ResourceResponseStatus::Ok
+        } else {
+            ResourceResponseStatus::NoContent
+        },
+        bytes: bytes.unwrap_or_default(),
+        expires_unix_ms: bytes.and_then(|_| {
+            (SystemTime::now() + Duration::from_secs(3600))
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| duration.as_millis().try_into().ok())
+        }),
+        ..Default::default()
+    }
+}
+
+fn complete_tile_request(request: ResourceRequestHandle, response: &ResourceResponse<'_>) {
+    if let Err((_request, error)) = request.complete(response) {
+        // Cancellation may win after the worker's final check. The returned
+        // owner releases the unconsumed handle on drop in either case.
+        log::debug!("Raster resource response was not accepted: {error}");
+    }
+}
+
+fn tile_response(sources: &Sources, url: &str) -> Result<Option<Vec<u8>>> {
+    let result = (|| -> Result<Option<Vec<u8>>> {
         let address = TileAddress::parse(url)?;
         let source = sources
             .read()
@@ -1125,46 +1209,21 @@ fn tile_response(sources: &Sources, url: &str) -> Response {
             Some(source) => source.tile(address).inspect_err(|error| {
                 let _ = source.errors.try_send(format!("Couldn’t render raster tiles: {error:#}"));
             }),
-            None => Ok(Response::no_content()),
+            None => Ok(None),
         }
     })();
-    result.unwrap_or_else(|error| {
+    result.inspect_err(|error| {
         log::error!("Raster tile {url} failed: {error:#}");
-        Response::error(ErrorReason::Other, format!("{error:#}"))
     })
-}
-
-struct RasterFileSource {
-    jobs: async_channel::Sender<TileJob>,
-}
-
-impl FileSource for RasterFileSource {
-    fn can_request(&self, request: &ResourceRequest) -> bool {
-        request.url.starts_with(URL_PREFIX)
-    }
-
-    fn request(&self, request: ResourceRequest, responder: Responder) -> RequestHandle {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        if let Err(error) = self.jobs.try_send(TileJob {
-            url: request.url,
-            responder,
-            cancelled: cancelled.clone(),
-        }) {
-            error
-                .into_inner()
-                .responder
-                .complete(Response::error(ErrorReason::Other, "Raster tile queue is full or stopped"));
-            return RequestHandle::Done;
-        }
-        RequestHandle::pending(move || {
-            cancelled.store(true, Ordering::Relaxed);
-        })
-    }
 }
 
 #[cfg(test)]
 #[path = "raster_source_loading_tests.rs"]
 mod loading_tests;
+
+#[cfg(test)]
+#[path = "raster_source_resource_tests.rs"]
+mod resource_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2017,17 +2076,17 @@ mod tests {
     #[test]
     fn protocol_returns_no_content_for_released_sources_and_rejects_numeric_tiles() -> Result<()> {
         let sources: Sources = Arc::default();
-        assert!(tile_response(&sources, "raster://999/0/0/0@1.png").no_content);
-        assert!(tile_response(&sources, "raster://999/0/0/0@0.png").error.is_some());
+        assert!(tile_response(&sources, "raster://999/0/0/0@1.png")?.is_none());
+        assert!(tile_response(&sources, "raster://999/0/0/0@0.png").is_err());
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("released.tif");
         super::test_support::write_raster(&path, 4326, 1)?;
         let source = RasterSource::open(&path)?.remove(0);
         let url = format!("raster://{}/3/3/3@1.png", source.metadata().id);
         sources.write().unwrap().insert(source.metadata().id, Arc::downgrade(&source));
-        assert!(tile_response(&sources, &url).error.is_some(), "Numeric tiles must bypass the image protocol");
+        assert!(tile_response(&sources, &url).is_err(), "Numeric tiles must bypass the image protocol");
         drop(source);
-        assert!(tile_response(&sources, &url).no_content);
+        assert!(tile_response(&sources, &url)?.is_none());
         Ok(())
     }
 
@@ -2062,25 +2121,29 @@ mod tests {
     fn image_mbtiles_pass_through_unchanged_across_style_snapshots() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("image.mbtiles");
-        write_red_image_mbtiles(&path)?;
-        let source = RasterSource::open(&path)?.remove(0);
+        let source = open_red_image_mbtiles(&path)?;
         assert!(!source.is_numeric());
         let tiles = RasterTiles::init()?;
         tiles.register(&source)?;
         let url = format!("raster://{}/0/0/0@1.png", source.metadata().id);
-        let before = tile_response(&tiles.sources, &url);
-        let image = image::load_from_memory(before.data.as_ref().context("Missing image MBTile")?)?.to_rgba8();
+        let before = tile_response(&tiles.sources, &url)?;
+        let image = image::load_from_memory(before.as_deref().context("Missing image MBTile")?)?.to_rgba8();
         assert_eq!(*image.get_pixel(128, 128), image::Rgba([255, 0, 0, 255]));
         let gray = source.restyled(ColorMapPreset::Gray, (10.0, 100.0))?;
         tiles.register(&gray)?;
         assert_eq!(source.source_json(1), gray.source_json(1));
         drop(source);
         assert_eq!(
-            tile_response(&tiles.sources, &url).data,
-            before.data,
+            tile_response(&tiles.sources, &url)?,
+            before,
             "Palette/range edits must not recolor MBTiles or release their URL identity"
         );
         Ok(())
+    }
+
+    pub(super) fn open_red_image_mbtiles(path: &Path) -> Result<Arc<RasterSource>> {
+        write_red_image_mbtiles(path)?;
+        Ok(RasterSource::open(path)?.remove(0))
     }
 
     fn write_red_image_mbtiles(path: &Path) -> Result<()> {
