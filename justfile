@@ -45,6 +45,10 @@ generate-package-icons:
     convert data/icon.png -resize '512x512!' dist/icon_512x512.png
     convert data/icon.png -resize '1024x1024!' dist/icon_512x512@2x.png
 
+# Build the cacheable native core independently of the application.
+maplibre args='':
+    nix build .#maplibre-native --out-link .devenv/maplibre-native-nix {{ args }}
+
 # Refresh bundled themes from the source revision of gpui-kit in Cargo.lock.
 sync-themes:
     python3 scripts/sync_gpui.py themes

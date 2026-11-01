@@ -26,7 +26,8 @@ def load_config(root, env):
 def package_environment(config, environ, root):
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise ValueError("AppImage packaging currently requires x86_64 Linux")
-    required = ("target", "hostCc", "cc", "cxx", "ar", "pkgConfigPath", "libraryPath", "gdal", "glibc", "cmakePrefixPath")
+    required = ("target", "hostCc", "cc", "cxx", "ar", "pkgConfigPath", "libraryPath",
+                "gdal", "glibc", "cmakePrefixPath", "maplibreNativeBuild")
     missing = [key for key in required if not isinstance(config.get(key), str) or not config[key]]
     if missing:
         raise ValueError("Missing Linux package configuration: " + ", ".join(missing))
@@ -70,6 +71,8 @@ def package_environment(config, environ, root):
         "PKG_CONFIG_ALLOW_CROSS": "1",
         "GDAL_HOME": config["gdal"],
         "GDAL_STATIC": "1",
+        # The shell's cached build uses host libraries, not the portable target.
+        "MLN_NATIVE_BUILD": config["maplibreNativeBuild"],
         "MLN_STATIC_DEPS": "1",
         "MLN_PRECOMPILE": "0",
         "MLN_CMAKE_PYTHON_EXECUTABLE": os.path.realpath(os.sys.executable),
@@ -115,7 +118,7 @@ def main():
         env = package_environment(config, os.environ, PROJECT_ROOT)
         prepare_build(env)
         if args.check:
-            for name in ("CC", "CXX", "GDAL_HOME", "CARGO_TARGET_DIR", "MLN_STATIC_DEPS",
+            for name in ("CC", "CXX", "GDAL_HOME", "CARGO_TARGET_DIR", "MLN_NATIVE_BUILD", "MLN_STATIC_DEPS",
                          "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "MLN_CMAKE_CXX_LAUNCHER"):
                 print(f"{name}={env[name]}")
             return

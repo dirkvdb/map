@@ -6,6 +6,7 @@
 }:
 let
   targetPkgs = (inputs.pkgs-mod.lib.mkBuildEnvMingwCross pkgs.system { }).pkgsMingw;
+  maplibreNative = import ./maplibre-native.nix { pkgs = targetPkgs; };
   compiler = targetPkgs.stdenv.cc;
   prefix = compiler.targetPrefix;
   libraries = lib.closePropagation (
@@ -68,6 +69,7 @@ assert lib.assertMsg pkgs.stdenv.isLinux "Windows cross-compilation requires Lin
 pkgs.writeText "map-windows-package.json" (
   builtins.toJSON {
     target = "x86_64-pc-windows-gnu";
+    maplibreNativeBuild = "${maplibreNative}";
     cc = "${compiler}/bin/${prefix}gcc";
     cxx = "${compiler}/bin/${prefix}g++";
     ar = "${compiler.bintools}/bin/${prefix}ar";

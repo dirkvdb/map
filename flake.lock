@@ -31,27 +31,6 @@
         "url": "https://github.com/VITObelgium/infra-rs/archive/refs/heads/main.tar.gz"
       }
     },
-    "maplibre-native": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1788656642,
-        "narHash": "sha256-pxqKzTRjXTKUoRmLynlIojKYx5dNwlTRjcHGuZplwXo=",
-        "ref": "refs/tags/core-a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b",
-        "rev": "a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b",
-        "shallow": true,
-        "submodules": true,
-        "type": "git",
-        "url": "https://github.com/maplibre/maplibre-native.git"
-      },
-      "original": {
-        "ref": "refs/tags/core-a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b",
-        "rev": "a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b",
-        "shallow": true,
-        "submodules": true,
-        "type": "git",
-        "url": "https://github.com/maplibre/maplibre-native.git"
-      }
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1793294725,
@@ -93,7 +72,6 @@
       "inputs": {
         "flake-utils": "flake-utils",
         "infra-rs": "infra-rs",
-        "maplibre-native": "maplibre-native",
         "nixpkgs": "nixpkgs",
         "pkgs-mod": "pkgs-mod",
         "rust-overlay": "rust-overlay"

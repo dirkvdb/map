@@ -21,6 +21,7 @@ ROOT = Path("/tmp/Map Project").resolve()
 TARGET = "x86_64-unknown-linux-gnu"
 CONFIG = {
     "target": TARGET,
+    "maplibreNativeBuild": "/nix/store/portable-maplibre-native",
     "hostCc": "/nix/store/native-toolchain/bin/cc",
     "cc": "/nix/store/portable-toolchain/bin/cc",
     "cxx": "/nix/store/portable-toolchain/bin/c++",
@@ -56,6 +57,7 @@ class PackageEnvironmentTests(unittest.TestCase):
             "PKG_CONFIG_ALLOW_CROSS": "1",
             "GDAL_HOME": CONFIG["gdal"],
             "GDAL_STATIC": "1",
+            "MLN_NATIVE_BUILD": CONFIG["maplibreNativeBuild"],
             "MLN_STATIC_DEPS": "1",
             "MLN_PRECOMPILE": "0",
             "MLN_CMAKE_PYTHON_EXECUTABLE": os.path.realpath(sys.executable),
@@ -89,7 +91,7 @@ class PackageEnvironmentTests(unittest.TestCase):
         replaced = {
             "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "PKG_CONFIG_ALL_STATIC",
             "PKG_CONFIG_ALLOW_CROSS", "CMAKE_TOOLCHAIN_FILE", "GDAL_HOME",
-            "GDAL_STATIC", "MLN_STATIC_DEPS", "MLN_PRECOMPILE", "CARGO_TARGET_DIR",
+            "GDAL_STATIC", "MLN_NATIVE_BUILD", "MLN_STATIC_DEPS", "MLN_PRECOMPILE", "CARGO_TARGET_DIR",
             "TMPDIR", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
             "CFLAGS", "CXXFLAGS", "CMAKE_PREFIX_PATH",
         }
@@ -105,6 +107,13 @@ class PackageEnvironmentTests(unittest.TestCase):
         self.assertEqual(env["HOME"], inherited["HOME"])
         self.assertEqual(env["MLN_LOCAL_REPOSITORY"], inherited["MLN_LOCAL_REPOSITORY"])
         self.assertNotIn("/native/should-not-leak", env.values())
+
+    def test_cached_maplibre_build_replaces_host_prefix_without_mutating_caller(self):
+        inherited = {"MLN_NATIVE_BUILD": "/nix/store/host-maplibre-native"}
+        env = packaging.package_environment(CONFIG, inherited, ROOT)
+        self.assertEqual(env["MLN_NATIVE_BUILD"], CONFIG["maplibreNativeBuild"])
+        self.assertEqual(env["MLN_STATIC_DEPS"], "1")
+        self.assertEqual(inherited, {"MLN_NATIVE_BUILD": "/nix/store/host-maplibre-native"})
 
     def test_removes_target_pkg_config_overrides_without_mutating_caller(self):
         inherited = {
@@ -305,7 +314,7 @@ class MainTests(unittest.TestCase):
         self.assertEqual(env["RUSTC_WRAPPER"], "")
         self.assertEqual(env["RUSTC_WORKSPACE_WRAPPER"], "")
         lines = output.getvalue().splitlines()
-        for name in ("CC", "CXX", "GDAL_HOME", "CARGO_TARGET_DIR", "MLN_STATIC_DEPS",
+        for name in ("CC", "CXX", "GDAL_HOME", "CARGO_TARGET_DIR", "MLN_NATIVE_BUILD", "MLN_STATIC_DEPS",
                      "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "MLN_CMAKE_CXX_LAUNCHER"):
             self.assertIn(f"{name}={env[name]}", lines)
         self.run.assert_not_called()

@@ -41,6 +41,7 @@ ENVIRONMENT = {
     "PKG_CONFIG_ALL_STATIC": "0",
     "GDAL_HOME": "/old/gdal",
     "GDAL_STATIC": "0",
+    "MLN_NATIVE_BUILD": "/nix/store/macos-maplibre-native",
     "MLN_STATIC_DEPS": "0",
     "CARGO_TARGET_DIR": "/old/mise/build",
     "MLN_LOCAL_REPOSITORY": "/old/maplibre",
@@ -83,6 +84,7 @@ class PackageEnvironmentTests(unittest.TestCase):
             "PKG_CONFIG_ALL_STATIC": "1",
             "GDAL_HOME": original["MAP_PACKAGE_GDAL_HOME"],
             "GDAL_STATIC": "1",
+            "MLN_NATIVE_BUILD": original["MLN_NATIVE_BUILD"],
             "MLN_STATIC_DEPS": "1",
             "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP": "none",
             "CARGO_TARGET_DIR": str(ROOT / "dist/build/devenv"),
@@ -151,6 +153,7 @@ class PackageEnvironmentTests(unittest.TestCase):
     def test_optional_stale_variables_need_not_exist(self):
         env = {name: ENVIRONMENT[name] for name in (
             "MAP_PACKAGE_PKG_CONFIG_PATH", "MAP_PACKAGE_GDAL_HOME", "MAP_PACKAGE_LIBRARY_PATH",
+            "MLN_NATIVE_BUILD",
         )}
         with patch.object(packaging.subprocess, "run", side_effect=[
             result(path) for path in (*NATIVE_PATHS, RUST_VERSION)
@@ -162,6 +165,13 @@ class PackageEnvironmentTests(unittest.TestCase):
         )
         for name in ("MLN_LOCAL_REPOSITORY", "CFLAGS", "CXXFLAGS", "OBJC", "OBJCXX", "LD", "LIBRARY_PATH"):
             self.assertNotIn(name, configured)
+
+    def test_preserves_shell_cached_maplibre_build_and_selects_static_dependencies(self):
+        for prefix in (ENVIRONMENT["MLN_NATIVE_BUILD"], "/tmp/Alternate Build/maplibre-native"):
+            with self.subTest(prefix=prefix):
+                env = self.configure({"MLN_NATIVE_BUILD": prefix, "MLN_STATIC_DEPS": "0"})
+                self.assertEqual(env["MLN_NATIVE_BUILD"], prefix)
+                self.assertEqual(env["MLN_STATIC_DEPS"], "1")
 
     def test_preserves_inherited_maplibre_checkout(self):
         for repository in (str(ROOT / ".devenv/maplibre-native"), "/tmp/Alternate Checkout/maplibre-native", ""):
@@ -273,7 +283,8 @@ class PackageEnvironmentTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_requires_nonempty_devenv_configuration(self):
-        for name in ("MAP_PACKAGE_PKG_CONFIG_PATH", "MAP_PACKAGE_GDAL_HOME", "MAP_PACKAGE_LIBRARY_PATH"):
+        for name in ("MAP_PACKAGE_PKG_CONFIG_PATH", "MAP_PACKAGE_GDAL_HOME", "MAP_PACKAGE_LIBRARY_PATH",
+                     "MLN_NATIVE_BUILD"):
             for value in (None, "", " \t"):
                 env = ENVIRONMENT.copy()
                 if value is None:
@@ -553,7 +564,7 @@ class CheckEnvironmentTests(unittest.TestCase):
         lines = output.getvalue().splitlines()
         for name in (
             "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "GDAL_HOME", "CARGO_TARGET_DIR",
-            "MLN_LOCAL_REPOSITORY", "SDKROOT", "CC", "CXX",
+            "MLN_NATIVE_BUILD", "MLN_STATIC_DEPS", "SDKROOT", "CC", "CXX",
             "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER",
         ):
             self.assertIn(f"{name}={env[name]}", lines)
@@ -563,20 +574,20 @@ class CheckEnvironmentTests(unittest.TestCase):
         self.assertIn(" ".join(command) + ":", lines)
         self.assertIn("-lgdal", output.getvalue())
 
-    def test_check_reports_inherited_or_unset_maplibre_checkout(self):
-        for repository in (None, "/tmp/Alternate Checkout/maplibre-native"):
-            with self.subTest(repository=repository):
+    def test_check_reports_inherited_or_unset_maplibre_build(self):
+        for prefix in (None, "/tmp/Alternate Build/maplibre-native"):
+            with self.subTest(prefix=prefix):
                 env = ENVIRONMENT.copy()
-                if repository is None:
-                    env.pop("MLN_LOCAL_REPOSITORY")
+                if prefix is None:
+                    env.pop("MLN_NATIVE_BUILD")
                 else:
-                    env["MLN_LOCAL_REPOSITORY"] = repository
+                    env["MLN_NATIVE_BUILD"] = prefix
                 output = io.StringIO()
                 with patch.object(packaging.subprocess, "run", return_value=result("-lgdal")):
                     with contextlib.redirect_stdout(output):
                         packaging.check_environment(env, ROOT)
-                expected = "<unset>" if repository is None else repository
-                self.assertIn("MLN_LOCAL_REPOSITORY=" + expected, output.getvalue().splitlines())
+                expected = "<unset>" if prefix is None else prefix
+                self.assertIn("MLN_NATIVE_BUILD=" + expected, output.getvalue().splitlines())
 
 
     def test_pkgconfig_failure_reports_missing_dependency(self):

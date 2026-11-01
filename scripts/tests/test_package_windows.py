@@ -16,6 +16,7 @@ import package_windows as packaging
 
 CONFIG = {
     "target": packaging.TARGET,
+    "maplibreNativeBuild": "/nix/store/mingw-maplibre-native",
     "cc": "/mingw/bin/gcc", "cxx": "/mingw/bin/g++",
     "ar": "/mingw/bin/ar", "rc": "/mingw/bin/windres",
     "objdump": "/mingw/bin/objdump", "magick": "/tools/bin/magick",
@@ -63,6 +64,13 @@ class PackageEnvironmentTests(unittest.TestCase):
         self.assertEqual(env["MLN_LOCAL_REPOSITORY"], inherited["MLN_LOCAL_REPOSITORY"])
         self.assertEqual(env[f"BINDGEN_EXTRA_CLANG_ARGS_{packaging.TARGET_KEY}"], CONFIG["bindgenArgs"])
 
+    def test_cached_maplibre_build_replaces_host_prefix_without_mutating_caller(self):
+        inherited = {"MLN_NATIVE_BUILD": "/nix/store/host-maplibre-native"}
+        env = packaging.package_environment(CONFIG, inherited, ROOT)
+        self.assertEqual(env["MLN_NATIVE_BUILD"], CONFIG["maplibreNativeBuild"])
+        self.assertEqual(env["MLN_STATIC_DEPS"], "1")
+        self.assertEqual(inherited, {"MLN_NATIVE_BUILD": "/nix/store/host-maplibre-native"})
+
     def test_host_pkg_config_is_separate_from_windows_dependencies(self):
         env = packaging.package_environment(CONFIG, {
             "PKG_CONFIG_PATH": "/host/openssl/lib/pkgconfig",
@@ -106,6 +114,14 @@ class PackageEnvironmentTests(unittest.TestCase):
                     packaging.package_environment(config, {}, ROOT)
         with self.assertRaisesRegex(ValueError, "Unsupported Windows target"):
             packaging.package_environment({**CONFIG, "target": "other"}, {}, ROOT)
+
+    def test_cached_maplibre_configuration_rejects_empty_or_non_string_values(self):
+        for value in ("", None, 0, [], {}):
+            with self.subTest(value=value):
+                with patch.object(packaging, "tool_environment") as tools:
+                    with self.assertRaisesRegex(ValueError, "Missing Windows package configuration: maplibreNativeBuild"):
+                        packaging.package_environment({**CONFIG, "maplibreNativeBuild": value}, {}, ROOT)
+                tools.assert_not_called()
 
     def test_non_linux_hosts_fail_before_loading_tools(self):
         with patch.object(packaging.platform, "system", return_value="Darwin"):

@@ -15,7 +15,7 @@ from xml.parsers.expat import ExpatError
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_PACKAGES = ("libpng", "libjpeg", "libwebp", "libcurl", "sqlite3", "zlib", "gdal")
 SETUP_VARIABLES = (
-    "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "GDAL_HOME", "MLN_LOCAL_REPOSITORY",
+    "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "GDAL_HOME", "MLN_NATIVE_BUILD", "MLN_STATIC_DEPS",
     "CARGO_TARGET_DIR", "CC", "CXX", "SDKROOT",
 )
 DEPENDENCY = re.compile(
@@ -37,7 +37,8 @@ def package_environment(environ, root):
         raise ValueError("macOS packaging requires Darwin")
     if sys.version_info < (3, 10):
         raise ValueError("macOS packaging requires Python 3.10 or newer; use devenv's Python")
-    required = ("MAP_PACKAGE_PKG_CONFIG_PATH", "MAP_PACKAGE_GDAL_HOME", "MAP_PACKAGE_LIBRARY_PATH")
+    required = ("MAP_PACKAGE_PKG_CONFIG_PATH", "MAP_PACKAGE_GDAL_HOME", "MAP_PACKAGE_LIBRARY_PATH",
+                "MLN_NATIVE_BUILD")
     missing = [name for name in required if not environ.get(name, "").strip()]
     if missing:
         raise ValueError("Missing devenv configuration: " + ", ".join(missing) + "; run just dmg")
@@ -50,6 +51,7 @@ def package_environment(environ, root):
         "PKG_CONFIG_ALL_STATIC": "1",
         "GDAL_HOME": env["MAP_PACKAGE_GDAL_HOME"],
         "GDAL_STATIC": "1",
+        # Match the static overlay dependencies used by the shell's cached build.
         "MLN_STATIC_DEPS": "1",
         "CARGO_TARGET_DIR": str(root / "dist/build/devenv"),
         # Apple's tool directories contain an older Python unsuitable for WebGPU generation.

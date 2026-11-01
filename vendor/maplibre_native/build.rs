@@ -14,6 +14,11 @@
 //! Set `MLN_CMAKE_PYTHON_EXECUTABLE` to Python 3.10+ for the WebGPU wrapper generator.
 //!
 
+//! Set `MLN_NATIVE_BUILD` to a prebuilt Nix install prefix (lib/, source/, include/).
+//! Its share/maplibre-native/build.toml must match the WGPU backend, Rust TARGET,
+//! package metadata release, and ndebug=true. This mode overrides source/precompiled
+//! selection and never uses an amalgam.
+//!
 //! Set `MLN_STATIC_DEPS=1` for macOS/Linux/MinGW packaging with static pkg-config dependencies.
 //! All non-system libraries, including transitive dependencies, must have archives.
 //!
@@ -414,6 +419,89 @@ fn build_bridge(
 struct Info {
     lib_name: String,
     include_dirs: Vec<PathBuf>,
+}
+
+fn validate_native_metadata(
+    metadata: &str,
+    backend: GraphicsApi,
+    target: &str,
+    release: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if backend != GraphicsApi::WGPU {
+        return Err(
+            format!("MLN_NATIVE_BUILD requires the wgpu backend, selected {backend}").into()
+        );
+    }
+    let metadata: toml::Table =
+        metadata.parse().map_err(|error| format!("Invalid build.toml: {error}"))?;
+    for (key, expected) in [("backend", "wgpu"), ("target", target), ("release", release)] {
+        let actual =
+            metadata.get(key).ok_or_else(|| format!("build.toml: missing required field {key}"))?;
+        if actual.as_str() != Some(expected) {
+            return Err(
+                format!("build.toml {key}: expected string {expected:?}, got {actual:?}").into()
+            );
+        }
+    }
+    let ndebug = metadata.get("ndebug").ok_or("build.toml: missing required field ndebug")?;
+    if ndebug.as_bool() != Some(true) {
+        return Err(format!(
+            "build.toml ndebug: expected true (cached Release core ABI), got {ndebug:?}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn consume_native_build(
+    prefix: &Path,
+    backend: GraphicsApi,
+) -> Result<Info, Box<dyn std::error::Error>> {
+    let metadata_path = prefix.join("share/maplibre-native/build.toml");
+    println!("cargo:rerun-if-changed={}", metadata_path.display());
+    let metadata = fs::read_to_string(&metadata_path)
+        .map_err(|error| format!("Failed to read {}: {error}", metadata_path.display()))?;
+    validate_native_metadata(
+        &metadata,
+        backend,
+        &env::var("TARGET")?,
+        &determine_cargo_toml_information().mln_release,
+    )?;
+
+    let library_dir = prefix.join("lib");
+    if !library_dir.join("libmbgl-core.a").is_file() {
+        return Err(format!("Missing {}/libmbgl-core.a", library_dir.display()).into());
+    }
+    println!("cargo:rerun-if-changed={}", library_dir.display());
+    println!("cargo:rustc-link-search=native={}", library_dir.display());
+
+    // Match build_local's source roots, with bundled ICU before external headers.
+    let source = prefix.join("source");
+    let mut include_dirs: Vec<_> = [
+        "vendor/icu/include",
+        "vendor/webgpu-cpp",
+        "include",
+        "src",
+        "platform/default/include",
+        "vendor/maplibre-native-base/include",
+        "vendor/maplibre-native-base/deps/variant/include",
+        "vendor/maplibre-native-base/deps/geometry.hpp/include",
+        "vendor/maplibre-native-base/deps/geojson.hpp/include",
+        "vendor/metal-cpp",
+        "vendor/expected-lite/include",
+    ]
+    .into_iter()
+    .map(|path| source.join(path))
+    .collect();
+    // The prefix owns generated webgpu-cpp headers and the pinned bridge webgpu.h.
+    include_dirs.push(prefix.join("include"));
+    for include in &include_dirs {
+        if !include.is_dir() {
+            return Err(format!("Missing native include directory {}", include.display()).into());
+        }
+        println!("cargo:rerun-if-changed={}", include.display());
+    }
+    Ok(Info { lib_name: "mbgl-core".to_owned(), include_dirs })
 }
 
 fn bundle_precompiled() -> Info {
@@ -922,6 +1010,35 @@ impl StaticDependencies {
     }
 }
 
+fn build_source(
+    local_repository: &str,
+    amalgam_lib: bool,
+    target_os: &str,
+    static_dependencies: Option<&StaticDependencies>,
+) -> Info {
+    const MAPLIBRE_NATIVE_DIR_NAME: &str = "maplibre-native";
+    let respository_dir = if local_repository.is_empty() {
+        let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        root.join("target")
+    } else {
+        assert!(
+            local_repository.ends_with(MAPLIBRE_NATIVE_DIR_NAME),
+            "The repository must be called: {MAPLIBRE_NATIVE_DIR_NAME}"
+        );
+        println!("cargo:warning=Using local repository from: {local_repository}");
+        PathBuf::from(local_repository).parent().unwrap().to_path_buf()
+    };
+
+    build_local(
+        &respository_dir,
+        MAPLIBRE_NATIVE_DIR_NAME,
+        amalgam_lib,
+        target_os,
+        static_dependencies,
+    )
+    .unwrap_or_else(|error| panic!("Failed to build maplibre native: {error}"))
+}
+
 #[allow(clippy::too_many_lines)]
 fn build_mln() {
     println!("cargo:rerun-if-env-changed=MLN_SYSTEM");
@@ -929,18 +1046,17 @@ fn build_mln() {
     println!("cargo:rerun-if-env-changed=MLN_CORE_LIBRARY_USE_AMALGAM");
     println!("cargo:rerun-if-env-changed=MLN_LOCAL_REPOSITORY");
     println!("cargo:rerun-if-env-changed=MLN_STATIC_DEPS");
+    println!("cargo:rerun-if-env-changed=MLN_NATIVE_BUILD");
+    let native_build = env::var_os("MLN_NATIVE_BUILD").filter(|path| !path.is_empty());
     let static_deps = env::var("MLN_STATIC_DEPS").as_deref() == Ok("1");
 
-    let precompiled = !env::var("MLN_PRECOMPILE").unwrap_or("0".to_string()).eq("0");
-    let amalgam_lib =
-        precompiled || !env::var("MLN_CORE_LIBRARY_USE_AMALGAM").unwrap_or("0".to_string()).eq("0");
+    let precompiled =
+        native_build.is_none() && !env::var("MLN_PRECOMPILE").unwrap_or("0".to_string()).eq("0");
+    let amalgam_lib = native_build.is_none()
+        && (precompiled
+            || !env::var("MLN_CORE_LIBRARY_USE_AMALGAM").unwrap_or("0".to_string()).eq("0"));
     let system_lib = !env::var("MLN_SYSTEM").unwrap_or("0".to_string()).eq("0");
     let local_repository = env::var("MLN_LOCAL_REPOSITORY").unwrap_or_default();
-
-    if !local_repository.is_empty() {
-        println!("cargo:warning=Using local repository from: {local_repository}");
-        println!("cargo:rerun-if-env-changed={local_repository}");
-    }
 
     // Add system library search paths for macOS
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
@@ -975,45 +1091,21 @@ fn build_mln() {
         }
     }
 
-    let info = if precompiled {
+    let backend = GraphicsApi::from_selected_features();
+    let info = if let Some(prefix) = &native_build {
+        consume_native_build(Path::new(prefix), backend).unwrap_or_else(|error| {
+            panic!("MLN_NATIVE_BUILD={}: {error}", Path::new(prefix).display())
+        })
+    } else if precompiled {
         bundle_precompiled()
     } else if system_lib {
         // Using pkg config
         // let mut cfg = pkg_config::Config::new();
         panic!("Not implemented")
     } else {
-        const MAPLIBRE_NATIVE_DIR_NAME: &str = "maplibre-native";
-        let respository_dir = if local_repository.is_empty() {
-            let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-            root.join("target")
-        } else {
-            assert!(
-                local_repository.ends_with(MAPLIBRE_NATIVE_DIR_NAME),
-                "The repository must be called: {MAPLIBRE_NATIVE_DIR_NAME}"
-            );
-            PathBuf::from(local_repository.clone()).parent().unwrap().to_path_buf()
-        };
-
-        match build_local(
-            &respository_dir,
-            MAPLIBRE_NATIVE_DIR_NAME,
-            amalgam_lib,
-            &target_os,
-            static_dependencies.as_ref(),
-        ) {
-            Err(e) => {
-                if respository_dir.join(MAPLIBRE_NATIVE_DIR_NAME).exists()
-                    && local_repository.is_empty()
-                {
-                    // let _ = fs::remove_dir_all(clone_dir.join(MAPLIBRE_NATIVE_DIR_NAME));
-                }
-                panic!("Failed to build maplibre native: {e}")
-            }
-            Ok(info) => info,
-        }
+        build_source(&local_repository, amalgam_lib, &target_os, static_dependencies.as_ref())
     };
 
-    let backend = GraphicsApi::from_selected_features();
     let source_core_uses_ndebug = match env::var("OPT_LEVEL").as_deref() {
         Ok("0") => false,
         Ok("1" | "2" | "3" | "s" | "z") => true,
@@ -1023,7 +1115,7 @@ fn build_mln() {
         &info.lib_name,
         &info.include_dirs,
         backend,
-        precompiled || source_core_uses_ndebug,
+        native_build.is_some() || precompiled || source_core_uses_ndebug,
     );
     let is_apple = target_os == "macos" || target_os == "ios";
     let native_link_kind = if static_deps { "static=" } else { "" };
@@ -1107,6 +1199,101 @@ fn build_mln() {
             println!("cargo:rustc-link-lib=framework=CoreLocation");
         }
         GraphicsApi::Vulkan | GraphicsApi::WGPU => {}
+    }
+}
+
+#[cfg(test)]
+mod native_build_tests {
+    use super::*;
+
+    const TARGET: &str = "x86_64-unknown-linux-gnu";
+    const METADATA: &str = r#"
+        backend = "wgpu"
+        target = "x86_64-unknown-linux-gnu"
+        release = "test-release"
+        ndebug = true
+    "#;
+
+    fn validate(metadata: &str) -> Result<(), Box<dyn std::error::Error>> {
+        validate_native_metadata(metadata, GraphicsApi::WGPU, TARGET, "test-release")
+    }
+
+    #[test]
+    fn accepts_matching_release_metadata() {
+        validate(METADATA).unwrap();
+    }
+
+    #[test]
+    fn rejects_malformed_toml() {
+        assert!(validate("backend = [").unwrap_err().to_string().contains("Invalid build.toml"));
+    }
+
+    #[test]
+    fn rejects_empty_metadata() {
+        assert!(validate("").unwrap_err().to_string().contains("backend"));
+    }
+
+    #[test]
+    fn rejects_selected_backend_mismatch() {
+        let error = validate_native_metadata(METADATA, GraphicsApi::Vulkan, TARGET, "test-release")
+            .unwrap_err();
+        assert!(error.to_string().contains("selected vulkan"));
+    }
+
+    #[test]
+    fn rejects_metadata_backend_mismatch() {
+        assert!(validate(&METADATA.replace("wgpu", "vulkan"))
+            .unwrap_err()
+            .to_string()
+            .contains("backend"));
+    }
+
+    #[test]
+    fn rejects_target_mismatch() {
+        assert!(validate(&METADATA.replace(TARGET, "aarch64-apple-darwin"))
+            .unwrap_err()
+            .to_string()
+            .contains("target"));
+    }
+
+    #[test]
+    fn rejects_release_mismatch() {
+        assert!(validate(&METADATA.replace("test-release", "wrong-release"))
+            .unwrap_err()
+            .to_string()
+            .contains("release"));
+    }
+
+    #[test]
+    fn rejects_debug_core_abi() {
+        assert!(validate(&METADATA.replace("true", "false"))
+            .unwrap_err()
+            .to_string()
+            .contains("ndebug"));
+    }
+
+    #[test]
+    fn rejects_wrong_metadata_field_types() {
+        for (value, replacement, field) in [
+            ("true", "1", "ndebug"),
+            ("true", "\"true\"", "ndebug"),
+            ("\"wgpu\"", "true", "backend"),
+            ("\"x86_64-unknown-linux-gnu\"", "42", "target"),
+            ("\"test-release\"", "[]", "release"),
+        ] {
+            assert!(validate(&METADATA.replace(value, replacement))
+                .unwrap_err()
+                .to_string()
+                .contains(field));
+        }
+    }
+
+    #[test]
+    fn rejects_missing_metadata_fields() {
+        for field in ["backend", "target", "release", "ndebug"] {
+            let error = validate(&METADATA.replace(field, "unknown")).unwrap_err().to_string();
+            assert!(error.contains(field) && error.contains("missing"), "{error}");
+        }
     }
 }
 

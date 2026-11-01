@@ -1,7 +1,13 @@
 # Packaging
 
 Packaging uses devenv and the static `pkg-mod-*` dependencies from the geo
-overlay, building MapLibre Native from its locked source revision.
+overlay. `dist/maplibre-native.nix` builds cacheable MapLibre Native outputs
+from its locked source revision with the wgpu backend and checked patches.
+Rust consumes the cached build prefix through `MLN_NATIVE_BUILD`. Linux and
+Windows package configs supply their own target-specific `maplibreNativeBuild`
+prefix, replacing the native shell's cached build; macOS requires the shell's
+`MLN_NATIVE_BUILD` and uses the same static overlay dependencies with
+`MLN_STATIC_DEPS=1`.
 
 - macOS app: `dist/build/devenv/release/bundle/osx/Map.app`
 - macOS DMG: `dist/build/devenv/release/bundle/dmg/Map.dmg`
@@ -50,8 +56,8 @@ There is no macOS mise or vcpkg toolchain.
 The build uses:
 
 - **Devenv:** Rust, cargo-bundle, CMake, Ninja, Python, and the overlay's static
-  third-party libraries. MapLibre's source checkout is pinned by the devenv
-  preparation task. Packaging artifacts are isolated under `dist/build/devenv`.
+  third-party libraries and cached MapLibre Native build. Packaging artifacts
+  are isolated under `dist/build/devenv`.
 - **Apple:** the native SDK, C/C++/Swift compilers, linker, signing, and disk-image
   tools. This avoids Nix compiler wrappers injecting Nix-store runtime libraries.
 - **Explicit dependency selection:** isolated pkg-config paths and Rust library

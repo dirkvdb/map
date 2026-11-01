@@ -32,7 +32,7 @@ def package_environment(config, environ, root):
         raise ValueError("Windows cross-compilation requires Linux")
     required = ("target", "cc", "cxx", "ar", "rc", "objdump", "magick", "toolPath",
                 "pkgConfigPath", "libraryPath", "cmakePrefixPath", "bindgenArgs", "cflags",
-                "gdal", "gpuiWindows", "gpuiPreWindows")
+                "gdal", "gpuiWindows", "gpuiPreWindows", "maplibreNativeBuild")
     missing = [key for key in required if not isinstance(config.get(key), str) or not config[key]]
     if missing:
         raise ValueError("Missing Windows package configuration: " + ", ".join(missing))
@@ -73,6 +73,8 @@ def package_environment(config, environ, root):
         "PKG_CONFIG_ALL_STATIC": "1",
         "GDAL_HOME": config["gdal"],
         "GDAL_STATIC": "1",
+        # Never link the native shell's cached build into a cross package.
+        "MLN_NATIVE_BUILD": config["maplibreNativeBuild"],
         "MLN_STATIC_DEPS": "1",
         "MLN_PRECOMPILE": "0",
         "MLN_CMAKE_PYTHON_EXECUTABLE": os.path.realpath(os.sys.executable),
@@ -203,7 +205,8 @@ def main():
         prepare_build(config, env)
         resource = prepare_resources(config, env, PROJECT_ROOT)
         if args.check:
-            for name in (f"CC_{TARGET_KEY}", f"CXX_{TARGET_KEY}", "GDAL_HOME", "CARGO_TARGET_DIR"):
+            for name in (f"CC_{TARGET_KEY}", f"CXX_{TARGET_KEY}", "GDAL_HOME", "CARGO_TARGET_DIR",
+                         "MLN_NATIVE_BUILD", "MLN_STATIC_DEPS"):
                 print(f"{name}={env[name]}")
             print(shlex.join(build_command(config, resource)))
             return

@@ -8,6 +8,7 @@
 let
   ui = import ./linux-ui.nix { inherit inputs pkgs lib; };
   targetPkgs = ui.uiPkgs;
+  maplibreNative = import ./maplibre-native.nix { pkgs = targetPkgs; };
   nativeLibraries = lib.closePropagation (
     with targetPkgs;
     [
@@ -63,6 +64,7 @@ assert lib.assertMsg pkgs.stdenv.hostPlatform.isx86_64
 pkgs.writeText "map-linux-package.json" (
   builtins.toJSON {
     target = "x86_64-unknown-linux-gnu";
+    maplibreNativeBuild = "${maplibreNative}";
     arch = "x86_64";
     glibc = "2.28";
     hostCc = "${hostLinker}";

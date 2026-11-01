@@ -36,6 +36,14 @@ A GPUI desktop geospatial viewer with a MapLibre Native vector basemap.
 - Test a local NetCDF file: `MAP_TEST_NETCDF=/path/to/file.nc devenv shell -- cargo test --locked netcdf_local_file -- --ignored --nocapture`.
 - Package: `just exe` (Windows), `just appimage` (Linux), or `just dmg` (macOS).
 
+## MapLibre Native build
+
+`dist/maplibre-native.nix` builds the pinned MapLibre Native **wgpu** core with the vendored custom-layer, tile-boundary, and bundled-ICU patches. The development shell and application flake both set `MLN_NATIVE_BUILD` to its Nix-store install prefix; Cargo compiles only the Rust/C++ bridge. Unchanged native sources, patches, dependencies, and toolchain reuse the cached derivation, even when application code changes. The Python preparation script and shell-entry preparation task are no longer needed.
+
+Build the core independently with `just maplibre` or `nix build .#maplibre-native`. Linux AppImage and Windows packaging select separate derivations for their portable/MinGW toolchains; macOS packaging uses the shell's native derivation. The installed metadata checks the backend, native revision, target, and Release ABI before the bridge is compiled. Outside Nix, leaving `MLN_NATIVE_BUILD` unset retains the existing source-build workflow.
+
+The output is eligible for Nix binary caches; sharing it across machines requires publishing it to a cache they trust (for example, Cachix). No cache upload is performed automatically.
+
 ## Complexity checks
 
 Run `devenv shell -- just check` after Rust changes, followed by `cargo test --workspace --all-features` and `just test` in the development shell. The devenv `ci:checks` task also runs this gate before building/testing. The individual checks are:

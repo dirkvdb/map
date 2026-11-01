@@ -2,10 +2,11 @@
   pkgs,
   lib,
   inputs,
-  config,
+
   ...
 }:
 let
+  maplibreNative = import ./dist/maplibre-native.nix { inherit pkgs; };
   linuxHostLinker = pkgs.writeShellScript "map-linux-host-linker" ''
     # Override rustc's x86_64 LLD default: the bundled Nix wrapper contains
     # unresolved @mktemp@/@rm@ placeholders. Keep host code on Nix's binutils.
@@ -99,9 +100,9 @@ in
       cores = 0
     '';
     RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
-    MLN_PRECOMPILE = "0";
-    MLN_LOCAL_REPOSITORY = "${config.devenv.root}/.devenv/maplibre-native";
-    MLN_CMAKE_CXX_LAUNCHER = "${pkgs.sccache}/bin/sccache";
+    MLN_NATIVE_BUILD = "${maplibreNative}";
+    MLN_STATIC_DEPS = "1";
+    WEBGPU_SHIM_HEADER = "${maplibreNative.webgpuHeader}";
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     CC = "${pkgs.llvmPackages.clang}/bin/clang";
     CXX = "${pkgs.llvmPackages.clang}/bin/clang++";
@@ -128,7 +129,10 @@ in
     ];
   };
 
-  outputs = lib.optionalAttrs pkgs.stdenv.isLinux {
+  outputs = {
+    maplibre-native = maplibreNative;
+  }
+  // lib.optionalAttrs pkgs.stdenv.isLinux {
     linux-package = import ./dist/linux-package.nix {
       inherit inputs pkgs lib;
       hostLinker = linuxHostLinker;
@@ -142,11 +146,6 @@ in
 
   tasks."ci:checks" = {
     exec = "just check && just build && just test";
-  };
-
-  tasks."maplibre:prepare" = {
-    before = [ "devenv:enterShell" ];
-    exec = ''python3 "$DEVENV_ROOT/scripts/prepare_maplibre.py" "$MLN_LOCAL_REPOSITORY"'';
   };
 
   scripts.knots.exec = ''

@@ -11,10 +11,7 @@
       url = "github:VITO-RMA/nix-pkgs/main";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    maplibre-native = {
-      url = "git+https://github.com/maplibre/maplibre-native.git?ref=refs/tags/core-a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b&rev=a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b&submodules=1&shallow=1";
-      flake = false;
-    };
+
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay/stable";
@@ -27,7 +24,7 @@
       nixpkgs,
       pkgs-mod,
       infra-rs,
-      maplibre-native,
+
       flake-utils,
       rust-overlay,
       ...
@@ -47,10 +44,7 @@
           cargo = rustToolchain;
           rustc = rustToolchain;
         };
-        webgpuHeader = pkgs.fetchurl {
-          url = "https://raw.githubusercontent.com/webgpu-native/webgpu-headers/673658bc2bd70ec39fc55ebe6bb0173cf6d0a603/webgpu.h";
-          hash = "sha256-pIMDHD/tBepd0cdAgqcWdsRsWyuCDMyhDaUVwDPvyZc=";
-        };
+        maplibreNative = import ./dist/maplibre-native.nix { inherit pkgs; };
         # MapLibre probes libuv.pc; the static overlay provides libuv-static.pc.
         libuvPkgConfig = pkgs.runCommand "map-libuv-pkgconfig" { } ''
           mkdir -p $out/lib/pkgconfig
@@ -66,6 +60,7 @@
         ];
       in
       {
+        packages.maplibre-native = maplibreNative;
         packages.default = rustPlatform.buildRustPackage {
           pname = "map";
           version = (fromTOML (builtins.readFile ./Cargo.toml)).package.version;
@@ -80,9 +75,7 @@
 
           nativeBuildInputs = [
             pkgs.pkg-config
-            pkgs.cmake
-            pkgs.ninja
-            pkgs.git
+
             pkgs.python3
             pkgs.llvmPackages.clang
           ]
@@ -114,27 +107,12 @@
             )
             ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.apple-sdk_15 ];
 
-          dontUseCmakeConfigure = true;
-          dontUseNinjaBuild = true;
-          dontUseNinjaCheck = true;
-          dontUseNinjaInstall = true;
-          MLN_PRECOMPILE = "0";
+          MLN_NATIVE_BUILD = "${maplibreNative}";
+          MLN_STATIC_DEPS = "1";
+          WEBGPU_SHIM_HEADER = "${maplibreNative.webgpuHeader}";
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           CC = "${pkgs.llvmPackages.clang}/bin/clang";
           CXX = "${pkgs.llvmPackages.clang}/bin/clang++";
-
-          postPatch = ''
-            # Seed the build script's verified header cache without sandbox networking.
-            substituteInPlace vendor/webgpu-shim/build.rs \
-              --replace-fail 'let file = out_path.join("webgpu.h");' \
-                'let file = out_path.join("webgpu.h"); if !file.exists() { fs::copy("${webgpuHeader}", &file).expect("Could not copy the prefetched WebGPU header"); }'
-
-            # The build script patches the native sources and runs git submodule.
-            cp -R ${maplibre-native} "$TMPDIR/maplibre-native"
-            chmod -R u+w "$TMPDIR/maplibre-native"
-            git -C "$TMPDIR/maplibre-native" init
-            export MLN_LOCAL_REPOSITORY="$TMPDIR/maplibre-native"
-          '';
 
           nativeCheckInputs = [ pkgs.cacert ];
           preCheck = ''
