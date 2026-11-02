@@ -11,6 +11,7 @@ struct Draw {
     outgoing_scale: vec2<f32>,
     outgoing_range: vec2<f32>,
     outgoing: vec4<f32>,
+    projection: ProjectionUniform,
 };
 
 @group(0) @binding(0) var<uniform> draw: Draw;

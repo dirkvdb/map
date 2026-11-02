@@ -5,6 +5,8 @@
 #include <mln/style/layers/custom_layer.hpp>
 #include <mln/style/layers/custom_layer_host.hpp>
 #include <mln/style/layers/webgpu/custom_layer_render_parameters.hpp>
+#include <mln/util/mat4.hpp>
+#include <cmath>
 
 namespace mln::bridge {
 namespace {
@@ -14,13 +16,22 @@ public:
     void initialize(const mln::style::CustomLayerInitParameters&) override {}
     void render(const mln::style::CustomLayerRenderParameters& base) override {
         const auto& params = static_cast<const mln::style::webgpu::CustomLayerRenderParameters&>(base);
-        WgpuLayerParameters context;
+        WgpuLayerParameters context{};
         context.width = params.width;
         context.height = params.height;
         context.latitude = params.latitude;
         context.longitude = params.longitude;
         context.zoom = params.zoom;
         context.projection = params.projectionMatrix;
+        const double worldSize = 512.0 * std::exp2(params.zoom);
+        mln::matrix::scale(context.mercator_projection, params.projectionMatrix, worldSize, worldSize, 1.0);
+        context.globe = params.globe;
+        context.projection_transition = params.globe ? params.projectionTransition : 0.0;
+        context.globe_projection = params.globe ? params.globeProjectionMatrix : context.mercator_projection;
+        if (params.globe) {
+            context.globe_clipping_plane = params.globeClippingPlane;
+        }
+        context.depth_offset = params.depthOffset;
         context.color_format = params.colorFormat;
         context.depth_format = params.depthStencilFormat;
         context.depth_test = params.depthTest;

@@ -3,8 +3,7 @@ let
   lib = pkgs.lib;
   platform = pkgs.stdenv.hostPlatform;
   release =
-    (builtins.fromTOML (builtins.readFile ../vendor/maplibre_native/Cargo.toml))
-    .package.metadata.mln.release;
+    (fromTOML (builtins.readFile ../vendor/maplibre_native/Cargo.toml)).package.metadata.mln.release;
   revision = lib.removePrefix "core-" release;
   source = pkgs.fetchgit {
     url = "https://github.com/maplibre/maplibre-native.git";
@@ -143,7 +142,7 @@ stdenv.mkDerivation {
       --replace-fail "$PWD/webgpu-cpp/webgpu.hpp" "$out/include/webgpu.hpp"
     cd ..
     ${lib.concatMapStringsSep "\n" (root: ''
-      mkdir -p "$out/source/${builtins.dirOf root}"
+      mkdir -p "$out/source/${dirOf root}"
       cp -R ${root} "$out/source/${root}"
     '') includeRoots}
     cat > "$out/share/maplibre-native/build.toml" <<'EOF'

@@ -59,6 +59,7 @@ impl Fixture {
             reduce_motion: false,
             basemap: BasemapStyle::Dark,
             tile_boundaries: false,
+            globe: false,
             enqueued_at: None,
         }
     }

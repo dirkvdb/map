@@ -1,4 +1,4 @@
-//! Numeric tile jobs and flat Web Mercator tile coverage, independent of style.
+//! Numeric tile jobs and Mercator/globe tile coverage, independent of style.
 
 #[path = "raster_extrusion_height.rs"]
 pub(crate) mod extrusion_height;
@@ -23,6 +23,8 @@ use maplibre_native::WgpuLayerParameters;
 use crate::raster_source::{NumericTile, RasterSource};
 
 pub const MAX_PENDING_TILES: usize = 64;
+const MAX_GLOBE_TILES: usize = 4096;
+const MAX_GLOBE_VISITS: usize = 65_536;
 
 struct TileJob {
     generation: u64, // Incremented whenever the visible tiles change, so stale jobs can be ignored.
@@ -146,8 +148,9 @@ fn intersects_bounds(tile: VisibleTile, bounds: LatLonBounds) -> bool {
     }
 }
 
-/// Conservative ground coverage from MapLibre's projection, including pitch,
-/// bearing, and unwrapped world copies.
+/// Conservative ground coverage from MapLibre's projection, including pitch
+/// and bearing. Active globe selects each canonical tile once, using its nearest
+/// camera-relative world copy while blending. Coverage coarsens above 4096 tiles.
 pub fn visible_tiles(parameters: &WgpuLayerParameters, source: &RasterSource) -> Vec<VisibleTile> {
     tiles_at_zoom(parameters, selected_zoom(parameters, source), &[source.metadata().bounds.into()])
 }
@@ -172,6 +175,9 @@ fn selected_zoom(parameters: &WgpuLayerParameters, source: &RasterSource) -> i32
 }
 
 fn tiles_at_zoom(parameters: &WgpuLayerParameters, z: i32, bounds: &[LatLonBounds]) -> Vec<VisibleTile> {
+    if active_globe(parameters) {
+        return globe_tiles(parameters, z, bounds, MAX_GLOBE_TILES, true);
+    }
     let n = (1_u32 << z) as f64;
     let world = 512.0 * parameters.zoom.exp2();
     let center = normalized_mercator(Coordinate::latlon(parameters.latitude, parameters.longitude));
@@ -204,6 +210,167 @@ fn tiles_at_zoom(parameters: &WgpuLayerParameters, z: i32, bounds: &[LatLonBound
     tiles
 }
 
+fn active_globe(parameters: &WgpuLayerParameters) -> bool {
+    parameters.globe && parameters.projection_transition > 0.0
+}
+
+/// Traverse only canonical tiles, coarsening the whole grid rather than dropping
+/// coverage when a large viewport or an unusable projection exceeds the budget.
+/// Extrusions disable surface clipping: their raised geometry can enter the view
+/// even when the ground is outside the frustum or behind the sphere horizon.
+fn globe_tiles(parameters: &WgpuLayerParameters, mut z: i32, bounds: &[LatLonBounds], limit: usize, surface: bool) -> Vec<VisibleTile> {
+    loop {
+        if let Some(mut tiles) = globe_coverage(parameters, z, bounds, limit, surface) {
+            sort_globe_tiles(&mut tiles, parameters);
+            return tiles;
+        }
+        z -= 1;
+    }
+}
+
+fn globe_coverage(parameters: &WgpuLayerParameters, z: i32, bounds: &[LatLonBounds], limit: usize, surface: bool) -> Option<Vec<VisibleTile>> {
+    let mut pending = vec![VisibleTile { z: 0, x: 0, y: 0 }];
+    let mut tiles = Vec::new();
+    let mut visits = 0;
+    while let Some(tile) = pending.pop() {
+        visits += 1;
+        if visits > MAX_GLOBE_VISITS {
+            return None;
+        }
+        if !bounds.iter().any(|bounds| intersects_bounds(tile, *bounds)) || (surface && !globe_tile_visible(parameters, tile)) {
+            continue;
+        }
+        if tile.z < z {
+            extrusion_view::push_children(&mut pending, tile);
+            continue;
+        }
+        tiles.push(globe_projection_tile(parameters, tile));
+        if z > 0 && tiles.len() > limit {
+            return None;
+        }
+    }
+    Some(tiles)
+}
+
+fn sort_globe_tiles(tiles: &mut [VisibleTile], parameters: &WgpuLayerParameters) {
+    let center = normalized_mercator(Coordinate::latlon(parameters.latitude, parameters.longitude));
+    let distance = |tile: &VisibleTile| {
+        let n = f64::from(1_u32 << tile.z);
+        let dx = (f64::from(tile.canonical().x) + 0.5 - center.x().rem_euclid(1.0) * n).abs();
+        dx.min(n - dx).hypot(f64::from(tile.y) + 0.5 - center.y() * n)
+    };
+    tiles.sort_by(|a, b| distance(a).total_cmp(&distance(b)).then(a.y.cmp(&b.y)).then(a.x.cmp(&b.x)));
+}
+
+/// Native's Mercator fallback includes world wrap, unlike its sphere input.
+/// Keep data identities canonical, but project exactly one camera-nearest copy.
+fn globe_projection_tile(parameters: &WgpuLayerParameters, tile: VisibleTile) -> VisibleTile {
+    if !active_globe(parameters) || parameters.projection_transition > 0.999 || !parameters.longitude.is_finite() {
+        return tile;
+    }
+    let n = f64::from(1_u32 << tile.z);
+    let center = parameters.longitude / 360.0 + 0.5;
+    let wrap = (center - (tile.x as f64 + 0.5) / n).round();
+    VisibleTile {
+        x: tile.x.saturating_add((wrap * n) as i64),
+        ..tile
+    }
+}
+
+type Range = [f64; 2];
+
+fn globe_mercator_ranges(parameters: &WgpuLayerParameters, tile: VisibleTile) -> [Range; 3] {
+    let projected = globe_projection_tile(parameters, tile);
+    let n = f64::from(1_u32 << tile.z);
+    let left = projected.x as f64 / n;
+    let right = (projected.x as f64 + 1.0) / n;
+    let mut x = [left, right];
+    if active_globe(parameters) && parameters.projection_transition <= 0.999 {
+        let center = parameters.longitude / 360.0 + 0.5;
+        // Descendants can choose a different nearest wrap from their parent.
+        // Enclose both choices when this node crosses the antipodal wrap cut.
+        if left < center - 0.5 {
+            x[1] += 1.0;
+        }
+        if right > center + 0.5 {
+            x[0] -= 1.0;
+        }
+    }
+    [x, [f64::from(tile.y) / n, f64::from(tile.y + 1) / n], [0.0; 2]]
+}
+
+/// A spherical cap encloses the *entire* curved tile, not just its corners.
+/// The latitude/longitude path bounds angular distance by the sum of its arcs.
+fn sphere_ranges(tile: VisibleTile) -> [Range; 3] {
+    let bounds = tile.canonical().bounds();
+    let latitude = ((bounds.north() + bounds.south()) * 0.5).to_radians();
+    let longitude = ((bounds.west() + bounds.east()) * 0.5).to_radians();
+    let radius = ((bounds.north() - bounds.south() + bounds.east() - bounds.west()) * 0.5)
+        .to_radians()
+        .min(std::f64::consts::PI);
+    let chord = 2.0 * (radius * 0.5).sin();
+    let center = [longitude.sin() * latitude.cos(), latitude.sin(), longitude.cos() * latitude.cos()];
+    center.map(|value| [(value - chord).max(-1.0), (value + chord).min(1.0)])
+}
+
+fn linear_range(plane: [f64; 4], ranges: &[Range; 3]) -> Range {
+    let mut result = [plane[3]; 2];
+    for (coefficient, [low, high]) in plane[..3].iter().zip(ranges) {
+        result[0] += (coefficient * low).min(coefficient * high);
+        result[1] += (coefficient * low).max(coefficient * high);
+    }
+    result
+}
+
+fn product_range(a: Range, b: Range) -> Range {
+    let products = [a[0] * b[0], a[0] * b[1], a[1] * b[0], a[1] * b[1]];
+    [
+        products.into_iter().fold(f64::INFINITY, f64::min),
+        products.into_iter().fold(f64::NEG_INFINITY, f64::max),
+    ]
+}
+
+fn globe_tile_visible(parameters: &WgpuLayerParameters, tile: VisibleTile) -> bool {
+    if !parameters
+        .globe_projection
+        .iter()
+        .chain(&parameters.mercator_projection)
+        .chain(&parameters.globe_clipping_plane)
+        .all(|value| value.is_finite())
+        || !parameters.depth_offset.is_finite()
+    {
+        return true;
+    }
+    let sphere = sphere_ranges(tile);
+    let mercator = globe_mercator_ranges(parameters, tile);
+    // Native snaps to the full globe path above 0.999, before interpolation.
+    let blend = if parameters.projection_transition > 0.999 {
+        1.0
+    } else {
+        parameters.projection_transition
+    };
+    for (row, sign) in [(0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0), (3, 0.0)] {
+        let plane = |matrix: &[f64; 16]| std::array::from_fn(|axis| matrix[axis * 4 + 3] + sign * matrix[axis * 4 + row]);
+        let globe = linear_range(plane(&parameters.globe_projection), &sphere);
+        let flat = linear_range(plane(&parameters.mercator_projection), &mercator);
+        if globe[1] * blend + flat[1] * (1.0 - blend) < -1e-8 {
+            return false;
+        }
+    }
+    // During blending native changes horizon depth, not a hard hemisphere
+    // discard. Omitting depth rejection there deliberately retains extra tiles.
+    blend < 1.0 || globe_depth_visible(parameters, &sphere)
+}
+
+fn globe_depth_visible(parameters: &WgpuLayerParameters, sphere: &[Range; 3]) -> bool {
+    let w = linear_range(std::array::from_fn(|axis| parameters.globe_projection[axis * 4 + 3]), sphere);
+    let horizon = linear_range(parameters.globe_clipping_plane, sphere);
+    let far = product_range(horizon, w);
+    let near = product_range([1.0 - horizon[1], 1.0 - horizon[0]], w);
+    // Native Z = (1 - horizon) * W - depth_offset, with WebGPU 0 <= Z <= W.
+    !(far[1] + parameters.depth_offset < -1e-8 || near[1] - parameters.depth_offset < -1e-8)
+}
+
 pub fn parent_uv(tile: Tile, ancestor: Tile) -> [f32; 4] {
     let scale = 1 << (tile.z - ancestor.z);
     let size = 1.0 / scale as f32;
@@ -229,6 +396,10 @@ pub fn tile_matrix(projection: &[f64; 16], zoom: f64, tile: VisibleTile) -> [[f3
 }
 
 #[cfg(test)]
+#[path = "raster_globe_tiles_tests.rs"]
+mod globe_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{collections::HashSet, path::Path};
 
@@ -248,7 +419,7 @@ mod tests {
         Ok(RasterSource::open(path)?.remove(0))
     }
 
-    fn coverage_parameters() -> WgpuLayerParameters {
+    pub(super) fn coverage_parameters() -> WgpuLayerParameters {
         WgpuLayerParameters {
             width: 512.0,
             height: 512.0,
@@ -256,6 +427,12 @@ mod tests {
             longitude: 0.0,
             zoom: 0.0,
             projection: [0.0; 16],
+            mercator_projection: [0.0; 16],
+            globe: false,
+            projection_transition: 0.0,
+            globe_projection: [0.0; 16],
+            globe_clipping_plane: [0.0; 4],
+            depth_offset: 0.0,
             color_format: 0,
             depth_format: 0,
             depth_test: false,
@@ -312,17 +489,7 @@ mod tests {
         let path = dir.path().join("coverage.tif");
         crate::raster_source::test_support::write_raster(&path, 4326, 1)?;
         let source = RasterSource::open(&path)?.remove(0);
-        let mut parameters = WgpuLayerParameters {
-            width: 512.0,
-            height: 512.0,
-            latitude: 0.0,
-            longitude: 0.0,
-            zoom: 0.0,
-            projection: [0.0; 16],
-            color_format: 0,
-            depth_format: 0,
-            depth_test: false,
-        };
+        let mut parameters = coverage_parameters();
         let low = visible_tiles(&parameters, &source);
         assert_eq!(low.len(), 4, "Only tiles overlapping the raster should be scheduled");
         parameters.longitude = 360.0;

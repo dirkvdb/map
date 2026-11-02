@@ -895,7 +895,30 @@ pub mod file_source {
 #[cxx::bridge(namespace = "mln::bridge")]
 /// Core FFI definitions and types for the MapLibre bridge.
 pub mod ffi {
-    /// Camera projection (world pixels) and active WebGPU attachments.
+    /// Native 2D raster projections and active WebGPU attachments.
+    ///
+    /// Matrices are column-major and already use WebGPU clip coordinates (Z in
+    /// 0..W); do not apply an OpenGL depth conversion. For tile-local UV in 0..1,
+    /// normalized Mercator XY is `(tile_xy + uv) / 2^tile_z`, with world wrap
+    /// added to X. Native tile coordinates in 0..8192 use `uv = position / 8192`.
+    ///
+    /// Globe inputs come from native `TransformState::getProjectionData`, not
+    /// from a Mercator camera approximation. For longitude λ and latitude φ in
+    /// radians, the unit sphere is `(sin(λ) cos(φ), sin(φ), cos(λ) cos(φ))`:
+    /// +X is 90°E, +Y is north, and +Z is (0°, 0°). Tessellate surface geometry
+    /// before projecting; a four-corner raster quad cannot follow the sphere.
+    ///
+    /// Match native `shaders/webgpu/common.hpp::interpolateProjection`: first
+    /// compute `g = globe_projection * vec4(sphere, 1)`, then replace its Z with
+    /// `(1 - (dot(sphere, plane.xyz) + plane.w)) * g.w - depth_offset`. Return
+    /// `g` when `projection_transition > 0.999`; otherwise blend Mercator and
+    /// globe homogeneous XYW by `projection_transition`, and blend Z from zero
+    /// to `g.z` by `clamp((projection_transition - 0.2) / 0.8, 0, 1)`. Divide
+    /// by W only afterwards. This is the surface-raster path, not 3D depth.
+    /// See [`crate::style::WgpuCustomLayer`] for the corresponding shader.
+    ///
+    /// Convert these fields to shader uniforms explicitly; the FFI struct's
+    /// f64 arrays and bool do not have WGSL uniform-buffer layout.
     #[cfg(feature = "wgpu")]
     #[derive(Debug, Clone)]
     struct WgpuLayerParameters {
@@ -909,13 +932,35 @@ pub mod ffi {
         longitude: f64,
         /// Map zoom, with a 512-pixel world at zoom zero.
         zoom: f64,
-        /// Column-major world-pixel-to-clip matrix, including layer depth.
+        /// World-pixel-to-clip Mercator matrix, including layer depth.
+        /// The world width is `512 * 2^zoom`; retained for existing flat layers.
         projection: [f64; 16],
+        /// Normalized-Mercator-XY-to-clip fallback, including layer depth.
+        /// Multiply by `vec4(mercator_xy, 0, 1)` for a surface raster.
+        mercator_projection: [f64; 16],
+        /// Whether native is using the globe shader variant (not just style type).
+        globe: bool,
+        /// Native blend amount: 0 = Mercator, 1 = globe. Zero when `globe` is false.
+        /// Use this value rather than deriving a transition from camera zoom.
+        projection_transition: f64,
+        /// Unit-sphere-to-clip matrix while `globe` is true; otherwise identical
+        /// to `mercator_projection`. Native 2D shaders replace its projected Z.
+        globe_projection: [f64; 16],
+        /// Sphere horizon plane: `dot(sphere, xyz) + w < 0` is the hidden side.
+        /// All zeros in Mercator mode. Blend horizon depth, not a hard discard,
+        /// during the transition to match native raster clipping.
+        globe_clipping_plane: [f64; 4],
+        /// Native sublayer-zero clip-Z offset (not NDC Z). Already included in
+        /// both Mercator matrices; subtract once from globe horizon Z instead.
+        /// Independent of `depth_test`, since globe uses Z for horizon clipping.
+        depth_offset: f64,
         /// WebGPU C ABI color attachment format.
         color_format: u32,
         /// WebGPU C ABI depth/stencil attachment format, or zero if absent.
         depth_format: u32,
         /// Whether native layer ordering requires depth testing for this pass.
+        /// Use LessEqual without depth writes when true; otherwise disable both.
+        /// Globe surface layers use painter's order, with Z still clipping the horizon.
         depth_test: bool,
     }
 
@@ -1259,6 +1304,8 @@ pub mod ffi {
         fn takeImage(self: Pin<&mut RenderRequest>) -> UniquePtr<CxxString>;
         /// Sets debug visualization flags.
         fn setDebugFlags(self: Pin<&mut MapRenderer>, flags: MapDebugOptions);
+        /// Sets the current style's projection to globe or Mercator.
+        fn setGlobe(self: Pin<&mut MapRenderer>, globe: bool);
         /// Sets the camera's world-edge constraints.
         fn setConstrainMode(self: Pin<&mut MapRenderer>, mode: ConstrainMode);
         /// Jumps to the requested camera options.

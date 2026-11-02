@@ -14,6 +14,7 @@ struct Draw {
     clamp_colors: vec4<u32>,
     extrusion: vec4<f32>,
     geometry: vec4<u32>,
+    projection: ProjectionUniform,
 };
 
 @group(0) @binding(0) var<uniform> draw: Draw;

@@ -26,7 +26,7 @@ use crate::raster_source::RasterSource;
 use crate::shortcuts::key_binding;
 use crate::vector_source::VectorSource;
 
-gpui_kit::actions!(map, [ZoomIn, ZoomOut, PanLeft, PanRight, PanUp, PanDown, ToggleTileBoundaries]);
+gpui_kit::actions!(map, [ZoomIn, ZoomOut, PanLeft, PanRight, PanUp, PanDown, ToggleTileBoundaries, ToggleGlobe]);
 
 pub fn init(cx: &mut App) -> anyhow::Result<()> {
     let workspace = workspace_key_bindings(cx)?;
@@ -47,6 +47,7 @@ fn workspace_key_bindings(cx: &App) -> anyhow::Result<Vec<gpui_kit::KeyBinding>>
         key_binding("secondary-l", ToggleRasterControls, Some("RasterWorkspace"), cx),
         key_binding("secondary-shift-l", crate::log_output::ToggleLogs, Some("RasterWorkspace"), cx),
         key_binding("secondary-shift-d", ToggleTileBoundaries, Some("RasterWorkspace"), cx),
+        key_binding("secondary-shift-g", ToggleGlobe, Some("RasterWorkspace"), cx),
     ]
     .into_iter()
     .collect()
@@ -158,6 +159,7 @@ struct RenderKey {
     reduce_motion: bool,
     basemap: BasemapStyle,
     tile_boundaries: bool,
+    globe: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -173,6 +175,7 @@ pub struct MapView {
     camera: MapCamera,
     requested: Option<RenderKey>,
     tile_boundaries: bool,
+    globe: bool,
     raster_panel: Entity<RasterPanel>,
     log_output: Option<Entity<crate::log_output::LogOutput>>,
     background: Entity<SelectState<Vec<BackgroundChoice>>>,
@@ -239,6 +242,7 @@ impl MapView {
             camera: MapCamera::default(),
             requested: None,
             tile_boundaries: false,
+            globe: false,
             raster_panel,
             log_output: None,
             background,
@@ -423,6 +427,7 @@ impl MapView {
         self.viewport == Some(frame.viewport)
             && frame.basemap == self.selected_basemap(cx)
             && frame.tile_boundaries == self.tile_boundaries
+            && frame.globe == self.globe
             && self.raster.as_ref().map(|source| source.metadata().id) == frame.raster_layer_id
             && self.playback.as_ref().map(PlaybackRequest::revision) == frame.playback.map(PlaybackFrame::revision)
             && self.vector.as_ref().map(|source| source.id()) == frame.vector_layer_id
@@ -470,14 +475,16 @@ impl MapView {
             reduce_motion,
             basemap,
             tile_boundaries: self.tile_boundaries,
+            globe: self.globe,
         };
         if self.requested.as_ref() == Some(&key) {
             return;
         }
         self.requested = Some(key);
-        let Some(renderer) = &self.renderer else {
+        let Some(renderer) = &mut self.renderer else {
             return;
         };
+        renderer.set_globe(self.globe);
         self.error = None;
         let source = self
             .raster
@@ -534,6 +541,14 @@ impl MapView {
                 .update(cx, |state, cx| state.set_selected_index(Some(IndexPath::default().row(next)), window, cx));
             self.request_render(cx);
         }
+    }
+
+    fn toggle_globe(&mut self, cx: &mut Context<Self>) {
+        self.globe = !self.globe;
+        self.coast = None;
+        self.drag = None;
+        self.request_render(cx);
+        cx.notify();
     }
 
     fn toggle_tile_boundaries(&mut self, cx: &mut Context<Self>) {
@@ -1099,6 +1114,7 @@ impl Render for MapView {
             .on_action(cx.listener(|view, _: &ClearRasters, window, cx| view.raster_panel.update(cx, |panel, cx| panel.clear(window, cx))))
             .on_action(cx.listener(|view, _: &ToggleRasterControls, window, cx| view.raster_panel.update(cx, |panel, cx| panel.toggle_controls(window, cx))))
             .on_action(cx.listener(|view, _: &ToggleTileBoundaries, _, cx| view.toggle_tile_boundaries(cx)))
+            .on_action(cx.listener(|view, _: &ToggleGlobe, _, cx| view.toggle_globe(cx)))
             .on_action(cx.listener(|view, _: &crate::log_output::ToggleLogs, window, cx| view.toggle_logs(window, cx)))
             .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
                 log::info!(target: "map::vector_load", "stage=file-drop paths={:?}", paths.0);
@@ -1152,6 +1168,30 @@ mod tests {
         cx.quit();
         cx.update(|cx| assert!(view.read(cx).renderer.is_none()));
         assert!(frames.is_closed(), "App shutdown must join the native renderer before returning");
+    }
+
+    #[gpui_kit::test]
+    fn globe_mode_toggles_from_the_keyboard_without_moving_the_camera(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx).unwrap();
+        });
+        let (view, handle) = open_test_map(size(px(800.), px(600.)), cx);
+        for globe in [true, false] {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let camera = view.read(cx).camera;
+                assert_eq!(view.read(cx).globe, !globe);
+                window.press("secondary-shift-g", cx);
+                let map = view.read(cx);
+                assert_eq!(map.globe, globe);
+                assert_eq!(map.requested.as_ref().unwrap().globe, globe);
+                assert_eq!(map.camera, camera);
+                assert!(map.focus.is_focused(window));
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
     }
 
     #[gpui_kit::test]
@@ -1940,6 +1980,7 @@ mod tests {
                         vector_layer_id: None,
                         settled: false,
                         tile_boundaries: false,
+                        globe: false,
                         image: Err(anyhow::anyhow!("Network unavailable")),
                     },
                     window,
@@ -1965,6 +2006,7 @@ mod tests {
                         vector_layer_id: None,
                         settled: false,
                         tile_boundaries: false,
+                        globe: false,
                         image: Ok(Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(32, 32))]))),
                     },
                     window,
@@ -3207,6 +3249,7 @@ mod tests {
                                 vector_layer_id: None,
                                 settled: false,
                                 tile_boundaries: false,
+                                globe: false,
                                 image: Ok(image.clone()),
                             },
                             window,
@@ -4505,6 +4548,7 @@ mod tests {
                         vector_layer_id: None,
                         settled: false,
                         tile_boundaries: false,
+                        globe: false,
                         image: Ok(obsolete),
                     },
                     window,
@@ -4558,6 +4602,7 @@ mod tests {
                 viewport: map.viewport.unwrap(),
                 basemap: expected,
                 tile_boundaries: false,
+                globe: false,
                 raster_layer_id: None,
                 vector_layer_id: None,
                 settled: false,
@@ -4580,6 +4625,7 @@ mod tests {
                 settled: false,
                 image: Err(anyhow::anyhow!("Obsolete basemap failed")),
                 tile_boundaries: false,
+                globe: false,
             },
             window,
             cx,
@@ -4624,6 +4670,7 @@ mod tests {
                 vector_layer_id: Some(old_id),
                 settled: false,
                 tile_boundaries: map.tile_boundaries,
+                globe: map.globe,
                 image: Ok(image.clone()),
             },
             window,
@@ -4639,6 +4686,7 @@ mod tests {
                 vector_layer_id: Some(current_id),
                 settled: false,
                 tile_boundaries: map.tile_boundaries,
+                globe: map.globe,
                 image: Ok(image.clone()),
             },
             window,
@@ -4864,6 +4912,7 @@ mod tests {
                 vector_layer_id: None,
                 settled: false,
                 tile_boundaries: false,
+                globe: false,
                 image: Ok(image.clone()),
             },
             window,

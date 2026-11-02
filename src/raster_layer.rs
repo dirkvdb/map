@@ -17,6 +17,7 @@ use crate::multiband_layer::MultibandLayer;
 use crate::raster_composite::{PaletteOpacity, RasterComposite};
 use crate::raster_extrusion_animation::ExtrusionAnimation;
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest};
+use crate::raster_projection::ProjectionUniform;
 use crate::raster_source::{NumericTile, RasterSource};
 use crate::raster_tiles::{MAX_PENDING_TILES, TileWorkers, VisibleTile, extrusion_view, parent_uv, tile_matrix, transition_tiles, visible_tiles};
 
@@ -64,6 +65,7 @@ struct DrawUniform {
     extrusion: [f32; 4],
     // X/Y strides, traversal flags, previous/current averaging bits.
     geometry: [u32; 4],
+    projection: ProjectionUniform,
 }
 
 struct TileTexture {
@@ -617,13 +619,16 @@ impl RasterLayer {
             current_height > 0.0 && source.is_extrusion_averaged(),
         ];
         let flags = u32::from(averaging[0]) | (u32::from(averaging[1]) << 1);
-        let geometry = geometry::with_averaging(geometry::plan(&matrix, [parameters.width, parameters.height], volume, opaque), flags, blend);
+        let projection = ProjectionUniform::new(parameters, visible_tile);
+        let plan = geometry::projected_plan(parameters, &matrix, volume, opaque);
+        let geometry = geometry::with_averaging(plan, flags, blend);
 
         self.queue.write_buffer(
             &draw.uniform,
             0,
             bytemuck::bytes_of(&DrawUniform {
                 matrix,
+                projection,
                 uv,
                 previous_uv,
                 range: [range.0, range.1],
@@ -641,7 +646,7 @@ impl RasterLayer {
             }),
         );
         pass.set_bind_group(0, &draw.bindings, &[]);
-        draw_pixels(pass, extrusion, geometry, &pipeline.extrusion_indices);
+        draw_pixels(pass, extrusion, geometry, &pipeline.extrusion_indices, projection);
     }
 
     fn draw_debug_tiles(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
@@ -659,9 +664,9 @@ impl RasterLayer {
             // Draw after every raster quad so neighboring tiles cannot cover
             // the grid or labels. Debug visibility is independent of opacity.
             pass.set_pipeline(debug_pipeline);
-            for draw in self.draws.values() {
+            for (tile, draw) in &self.draws {
                 pass.set_bind_group(0, &draw.bindings, &[]);
-                pass.draw(0..6, 0..1);
+                pass.draw(0..ProjectionUniform::new(parameters, *tile).vertex_count(), 0..1);
             }
         }
     }
@@ -849,7 +854,15 @@ fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wg
         } else {
             "Numeric raster shader"
         }),
-        source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", include_str!("raster_sample.wgsl"), entry_points).into()),
+        source: wgpu::ShaderSource::Wgsl(
+            format!(
+                "{}\n{}\n{}",
+                include_str!("raster_projection.wgsl"),
+                include_str!("raster_sample.wgsl"),
+                entry_points
+            )
+            .into(),
+        ),
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(if extruded { "Numeric raster extrusion" } else { "Numeric raster" }),
@@ -990,12 +1003,12 @@ pub(crate) fn create_extrusion_indices(device: &wgpu::Device) -> wgpu::Buffer {
     })
 }
 
-pub(crate) fn draw_pixels(pass: &mut wgpu::RenderPass<'_>, extrusion: [f32; 4], geometry: [u32; 4], indices: &wgpu::Buffer) {
+pub(crate) fn draw_pixels(pass: &mut wgpu::RenderPass<'_>, extrusion: [f32; 4], geometry: [u32; 4], indices: &wgpu::Buffer, projection: ProjectionUniform) {
     if extrusion[3] > 0.0 {
         pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
         pass.draw_indexed(0..EXTRUSION_INDICES.len() as u32, 0, 0..geometry::instance_count(extrusion, geometry));
     } else {
-        pass.draw(0..6, 0..1);
+        pass.draw(0..projection.vertex_count(), 0..1);
     }
 }
 

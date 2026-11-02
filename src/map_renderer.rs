@@ -37,6 +37,7 @@ pub struct MapFrame {
     pub viewport: Viewport,
     pub basemap: BasemapStyle,
     pub tile_boundaries: bool,
+    pub globe: bool,
     pub raster_layer_id: Option<tiler::LayerId>,
     /// Requested source identity, not evidence that this frame contains its geometry.
     pub vector_layer_id: Option<u64>,
@@ -66,6 +67,7 @@ struct RenderRequest {
     reduce_motion: bool,
     basemap: BasemapStyle,
     tile_boundaries: bool,
+    globe: bool,
     enqueued_at: Option<Instant>,
 }
 
@@ -119,11 +121,16 @@ pub struct MapRenderer {
     pending_query: async_channel::Receiver<Option<FeatureQuery>>,
     feature_results: async_channel::Receiver<FeatureQueryResult>,
     unconstrained_camera: bool,
+    globe: bool,
 }
 
 impl MapRenderer {
     pub fn new() -> Result<Self> {
         Self::start_worker(None)
+    }
+
+    pub fn set_globe(&mut self, globe: bool) {
+        self.globe = globe;
     }
 
     /// Static extent previews need off-world margins and must retain their fitted center.
@@ -175,6 +182,7 @@ impl MapRenderer {
             pending_query,
             feature_results,
             unconstrained_camera: false,
+            globe: false,
         })
     }
 
@@ -207,6 +215,7 @@ impl MapRenderer {
                 reduce_motion,
                 basemap,
                 tile_boundaries,
+                globe: self.globe,
                 enqueued_at: log::log_enabled!(target: "map::vector_load", log::Level::Info).then(Instant::now),
             })
             .context("Map rendering thread stopped")?;
@@ -320,6 +329,7 @@ fn run_renderer(
             viewport: current_request.map.viewport,
             basemap: current_request.basemap,
             tile_boundaries: current_request.tile_boundaries,
+            globe: current_request.globe,
             raster_layer_id: current_request.raster.as_ref().map(|source| source.metadata().id),
             vector_layer_id: current_request.vector.as_ref().map(|source| source.id()),
             settled,
@@ -531,6 +541,7 @@ struct NativeMap {
     viewport: Viewport,
     camera: Option<MapCamera>,
     unconstrained_camera: bool,
+    globe: bool,
     device: wgpu::Device,
     queue: wgpu::Queue,
     idle: Rc<Cell<bool>>,
@@ -605,6 +616,7 @@ impl NativeMap {
             viewport,
             camera: None,
             unconstrained_camera: false,
+            globe: false,
             readback: GpuReadback::new(&device),
             device,
             queue,
@@ -648,6 +660,7 @@ impl NativeMap {
         };
         wait_until_ready(&run_loop, Instant::now() + Duration::from_secs(30), || style.is_ready())?;
         style.finish().context("Could not load the background map style")?;
+        self.renderer.set_globe(self.globe);
         self.basemap = basemap;
         // Loading a style removes its sources and layers, not the native camera.
         // Reset only attachment bookkeeping so overlays are reinstalled without
@@ -669,6 +682,7 @@ impl NativeMap {
             numeric.set_debug(request.tile_boundaries);
         }
         self.set_basemap(request.basemap)?;
+        self.set_globe(request.globe);
         self.set_unconstrained_camera(request.unconstrained_camera);
         self.renderer.set_debug_flags(if request.tile_boundaries {
             MapDebugOptions::TileBorders
@@ -687,6 +701,16 @@ impl NativeMap {
         self.set_vector(request.vector.clone(), request.opacity, &request.vector_color)?;
         self.apply_request(request.map);
         Ok(())
+    }
+
+    fn set_globe(&mut self, globe: bool) {
+        if self.globe == globe {
+            return;
+        }
+        self.globe = globe;
+        self.renderer.set_globe(globe);
+        self.idle.set(false);
+        self.needs_frame.set(true);
     }
 
     fn set_raster(&mut self, raster: Option<Arc<RasterSource>>, opacity: f32) -> Result<()> {
@@ -997,6 +1021,10 @@ fn wait_until_ready(run_loop: &RunLoopHandle, deadline: Instant, is_ready: impl 
 }
 
 #[cfg(test)]
+#[path = "map_renderer_globe_tests.rs"]
+mod globe_tests;
+
+#[cfg(test)]
 #[path = "map_renderer_playback_tests.rs"]
 mod playback_tests;
 
@@ -1016,6 +1044,44 @@ mod tests {
         r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#202020"}}]}"##;
     const LIGHT_STYLE: &str =
         r##"{"version":8,"center":[120,45],"zoom":12,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#f0f0f0"}}]}"##;
+
+    #[test]
+    #[ignore = "requires a wgpu-compatible graphics device; local GeoJSON style, no network"]
+    fn globe_projection_changes_pixels_and_survives_style_reload() -> Result<()> {
+        let style = r##"{
+            "version":8,
+            "sources":{"shape":{"type":"geojson","data":{
+                "type":"Feature","properties":{},"geometry":{
+                    "type":"Polygon","coordinates":[[[-40,0],[40,0],[40,50],[-40,50],[-40,0]]]
+                }
+            }}},
+            "layers":[
+                {"id":"background","type":"background","paint":{"background-color":"#202020"}},
+                {"id":"shape","type":"fill","source":"shape","paint":{"fill-color":"#ff00ff"}}
+            ]
+        }"##;
+        let viewport = Viewport {
+            width: NonZeroU32::new(256).unwrap(),
+            height: NonZeroU32::new(256).unwrap(),
+            scale: 1.0,
+        };
+        let request = MapRequest {
+            viewport,
+            camera: MapCamera::default(),
+        };
+        let mut map = NativeMap::with_style(viewport, Some(style))?;
+        let mercator = map.render(request)?;
+        let camera_updates = map.camera_updates;
+        map.set_globe(true);
+        let globe = map.render(request)?;
+        assert_ne!(globe.as_raw(), mercator.as_raw(), "Projection must change rendered geometry");
+        map.load_style(BasemapStyle::Light, Some(style))?;
+        assert_eq!(map.render(request)?.as_raw(), globe.as_raw(), "Style reload must retain globe projection");
+        map.set_globe(false);
+        assert_eq!(map.render(request)?.as_raw(), mercator.as_raw(), "Toggling off must restore Mercator");
+        assert_eq!(map.camera_updates, camera_updates, "Projection changes must retain the camera");
+        Ok(())
+    }
 
     #[test]
     fn basemap_style_urls() {
@@ -1301,6 +1367,7 @@ mod tests {
             pending_query,
             feature_results,
             unconstrained_camera: false,
+            globe: false,
         };
         let map = MapRequest {
             viewport: Viewport {

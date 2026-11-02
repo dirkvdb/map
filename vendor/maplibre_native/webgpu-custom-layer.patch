@@ -2,7 +2,7 @@ diff --git a/include/mln/style/layers/webgpu/custom_layer_render_parameters.hpp 
 new file mode 100644
 --- /dev/null
 +++ b/include/mln/style/layers/webgpu/custom_layer_render_parameters.hpp
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,22 @@
 +#pragma once
 +
 +#include <mln/style/layers/custom_layer_render_parameters.hpp>
@@ -17,6 +17,9 @@ new file mode 100644
 +    uint32_t colorFormat;
 +    uint32_t depthStencilFormat;
 +    bool depthTest;
++    // Clip-Z shift used by native 2D globe shaders, even with depth testing disabled.
++    // Rebuild the native archive and installed headers together when changing this struct.
++    double depthOffset;
 +
 +    explicit CustomLayerRenderParameters(const mln::PaintParameters&);
 +};
@@ -46,8 +49,9 @@ diff --git a/src/mln/gfx/drawable_custom_layer_host_tweaker.cpp b/src/mln/gfx/dr
 diff --git a/src/mln/style/layers/custom_layer_render_parameters.cpp b/src/mln/style/layers/custom_layer_render_parameters.cpp
 --- a/src/mln/style/layers/custom_layer_render_parameters.cpp
 +++ b/src/mln/style/layers/custom_layer_render_parameters.cpp
-@@ -2,6 +2,12 @@
+@@ -3,7 +3,13 @@
  #include <mln/renderer/paint_parameters.hpp>
+ #include <mln/tile/tile_id.hpp>
  #include <mln/util/mat4.hpp>
  
 +#if MLN_RENDER_BACKEND_WEBGPU
@@ -59,7 +63,7 @@ diff --git a/src/mln/style/layers/custom_layer_render_parameters.cpp b/src/mln/s
  namespace mln {
  namespace style {
  
-@@ -23,3 +29,28 @@
+@@ -31,3 +37,27 @@
  
  } // namespace style
  } // namespace mln
@@ -76,14 +80,13 @@ diff --git a/src/mln/style/layers/custom_layer_render_parameters.cpp b/src/mln/s
 +    depthStencilFormat = static_cast<uint32_t>(backend.getDepthStencilFormat());
 +    // Native matrices are built bottom-to-top during upload, whereas the draw
 +    // pass numbers currentLayer top-to-bottom. Use the upload index for depth.
-+    projectionMatrix = parameters.transformParams.alignedProjMatrix;
-+    depthTest = parameters.currentLayer >= parameters.opaquePassCutoff;
-+    if (depthTest) {
-+        const auto depthIndex = parameters.layerGroupCount - 1 - parameters.currentLayer;
-+        projectionMatrix[14] -= (1 + depthIndex) *
-+                                mln::PaintParameters::numSublayers *
-+                                mln::PaintParameters::depthEpsilon;
-+    }
++    projectionMatrix = parameters.state.isChanging() ? parameters.transformParams.projMatrix
++                                                    : parameters.transformParams.alignedProjMatrix;
++    depthTest = !globe && parameters.currentLayer >= parameters.opaquePassCutoff;
++    const auto depthIndex = parameters.layerGroupCount - 1 - parameters.currentLayer;
++    depthOffset = (1 + depthIndex) * mln::PaintParameters::numSublayers *
++                  mln::PaintParameters::depthEpsilon;
++    projectionMatrix[14] -= depthOffset;
 +}
 +
 +} // namespace mln::style::webgpu
@@ -91,7 +94,7 @@ diff --git a/src/mln/style/layers/custom_layer_render_parameters.cpp b/src/mln/s
 diff --git a/platform/default/src/mln/layermanager/layer_manager.cpp b/platform/default/src/mln/layermanager/layer_manager.cpp
 --- a/platform/default/src/mln/layermanager/layer_manager.cpp
 +++ b/platform/default/src/mln/layermanager/layer_manager.cpp
-@@ -79,7 +79,7 @@
+@@ -78,7 +78,7 @@
  #if !defined(MBGL_LAYER_HEATMAP_DISABLE_ALL)
      addLayerType(std::make_unique<HeatmapLayerFactory>());
  #endif
@@ -103,7 +106,7 @@ diff --git a/platform/default/src/mln/layermanager/layer_manager.cpp b/platform/
 diff --git a/src/mln/renderer/paint_parameters.hpp b/src/mln/renderer/paint_parameters.hpp
 --- a/src/mln/renderer/paint_parameters.hpp
 +++ b/src/mln/renderer/paint_parameters.hpp
-@@ -139,6 +139,7 @@
+@@ -146,6 +146,7 @@
  
  public:
      uint32_t currentLayer;
@@ -114,7 +117,7 @@ diff --git a/src/mln/renderer/paint_parameters.hpp b/src/mln/renderer/paint_para
 diff --git a/src/mln/renderer/renderer_impl.cpp b/src/mln/renderer/renderer_impl.cpp
 --- a/src/mln/renderer/renderer_impl.cpp
 +++ b/src/mln/renderer/renderer_impl.cpp
-@@ -264,6 +264,7 @@
+@@ -265,6 +265,7 @@
      }
  
      orchestrator.processChanges();

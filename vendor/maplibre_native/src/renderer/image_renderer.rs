@@ -373,6 +373,16 @@ impl<S> ImageRenderer<S> {
         self
     }
 
+    /// Set the current style's projection to globe (`true`) or Mercator (`false`).
+    ///
+    /// Globe blends into Mercator between zoom levels 11 and 12. Tile renderers
+    /// and native builds without `MLN_WITH_GLOBE` always render Mercator.
+    /// Loading another style replaces this setting; call this after the style
+    /// has finished loading. Continuous renderers request a new frame normally.
+    pub fn set_globe(&mut self, globe: bool) {
+        self.instance.pin_mut().setGlobe(globe);
+    }
+
     /// Set the renderer output size.
     pub fn set_map_size(&mut self, size: Size) {
         self.instance.pin_mut().setSize(&size);

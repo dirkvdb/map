@@ -3617,8 +3617,6 @@ dependencies = [
 [[package]]
 name = "webgpu-shim"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e039f59b537f8cfbfc5508130ce499067e2fb4fd9ec247f59c904c6e2fcaaf4c"
 dependencies = [
  "bindgen",
  "cxx",

@@ -10,6 +10,15 @@ const CLIP_EPSILON: f64 = 1e-6;
 const MAX_STRIDE: u32 = 16;
 const TARGET_PIXELS: f64 = 0.5;
 
+/// Curved globe cells cannot use the affine Mercator LOD or traversal estimate.
+/// Keep their source detail; optional averaging is applied independently.
+pub fn projected_plan(parameters: &WgpuLayerParameters, matrix: &[[f32; 4]; 4], extrusion: [f32; 4], opaque: bool) -> [u32; 4] {
+    if parameters.globe && parameters.projection_transition > 0.0 {
+        return [1, 1, 0, 0];
+    }
+    plan(matrix, [parameters.width, parameters.height], extrusion, opaque)
+}
+
 /// Plan `[stride_x, stride_y, order_flags, 0]` for a column-major tile matrix.
 ///
 /// `extrusion` is `[source_nx, source_ny, maximum_height_meters, enabled]`.

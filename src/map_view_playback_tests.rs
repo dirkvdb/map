@@ -78,6 +78,7 @@ impl Harness {
                 viewport: view.viewport.unwrap(),
                 basemap: basemap_style(cx),
                 tile_boundaries: view.tile_boundaries,
+                globe: view.globe,
                 raster_layer_id: view.raster.as_ref().map(|source| source.metadata().id),
                 vector_layer_id: None,
                 settled: true,
@@ -146,6 +147,7 @@ fn requested_key(view: &MapView) -> RenderKey {
         reduce_motion: key.reduce_motion,
         basemap: key.basemap,
         tile_boundaries: key.tile_boundaries,
+        globe: key.globe,
     }
 }
 

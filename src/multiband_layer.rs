@@ -32,6 +32,7 @@ use crate::raster_composite::{PaletteOpacity, RasterComposite};
 use crate::raster_extrusion_animation::ExtrusionAnimation;
 use crate::raster_layer::geometry;
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest, PlaybackStyle, validate_bands};
+use crate::raster_projection::ProjectionUniform;
 use crate::raster_source::RasterSource;
 use crate::raster_tiles::{VisibleTile, extrusion_view, tile_matrix, visible_tiles};
 use clock::{BandFade, DEFAULT_WINDOW, Endpoints, PlaybackClock, endpoints, next_window, window_range, window_start};
@@ -56,6 +57,7 @@ struct DrawUniform {
     outgoing_range: [f32; 2],
     // Outgoing temporal fraction, extra array layer, reserved, averaging bit.
     outgoing: [f32; 4],
+    projection: ProjectionUniform,
 }
 
 struct DrawTile {
@@ -740,19 +742,16 @@ fn paint_draw(
         data.outgoing[1] = 0.0;
     }
     data.layers[3] = debug_status;
-    data.geometry = geometry::with_averaging(
-        geometry::plan(
-            &data.matrix,
-            [parameters.width, parameters.height],
-            data.extrusion,
-            pipeline.opaque(data.parameters[1], data.parameters[0]) && data.outgoing[0] <= 0.0,
-        ),
-        data.geometry[3],
-        data.parameters[0],
+    let plan = geometry::projected_plan(
+        parameters,
+        &data.matrix,
+        data.extrusion,
+        pipeline.opaque(data.parameters[1], data.parameters[0]) && data.outgoing[0] <= 0.0,
     );
+    data.geometry = geometry::with_averaging(plan, data.geometry[3], data.parameters[0]);
     queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&data));
     pass.set_bind_group(0, &draw.bindings, &[]);
-    crate::raster_layer::draw_pixels(pass, data.extrusion, data.geometry, &pipeline.extrusion_indices);
+    crate::raster_layer::draw_pixels(pass, data.extrusion, data.geometry, &pipeline.extrusion_indices, data.projection);
 }
 
 fn adaptive_window_size(current: usize, maximum: usize, bytes_per_band: usize, tile_count: usize) -> usize {
@@ -806,6 +805,7 @@ fn draw_uniform(
         extrusion: crate::raster_layer::extrusion_uniform(parameters, sources[0], [pixels; 2], if enabled { height } else { 0.0 }),
         geometry: geometry::with_averaging([0; 4], averaging_flags(style, sources, enabled), frame.fraction),
         matrix: tile_matrix(&parameters.projection, parameters.zoom, tile),
+        projection: ProjectionUniform::new(parameters, tile),
         scale: [scales[0].scale as f32, scales[0].offset as f32],
         next_scale: [scales[1].scale as f32, scales[1].offset as f32],
         range: [ranges[0].0, ranges[0].1],
@@ -1005,7 +1005,15 @@ fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wg
     };
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(if extruded { "Multiband extrusion shader" } else { "Multiband shader" }),
-        source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", include_str!("multiband_sample.wgsl"), entry_points).into()),
+        source: wgpu::ShaderSource::Wgsl(
+            format!(
+                "{}\n{}\n{}",
+                include_str!("raster_projection.wgsl"),
+                include_str!("multiband_sample.wgsl"),
+                entry_points
+            )
+            .into(),
+        ),
     });
     let blend = if extruded {
         wgpu::BlendState::REPLACE
@@ -1085,6 +1093,12 @@ mod tests {
             longitude: 0.0,
             zoom: 2.0,
             projection: [1.0 / 128.0, 0.0, 0.0, 0.0, 0.0, -1.0 / 128.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -8.0, 8.0, 0.0, 1.0],
+            mercator_projection: [0.0; 16],
+            globe: false,
+            projection_transition: 0.0,
+            globe_projection: [0.0; 16],
+            globe_clipping_plane: [0.0; 4],
+            depth_offset: 0.0,
             color_format: 0x16,
             depth_format: 0,
             depth_test: false,
@@ -1608,7 +1622,7 @@ mod tests {
 
     #[test]
     fn uniform_layout_matches_wgsl_alignment() {
-        assert_eq!(std::mem::size_of::<DrawUniform>(), 192);
+        assert_eq!(std::mem::size_of::<DrawUniform>(), 304);
     }
 
     #[test]

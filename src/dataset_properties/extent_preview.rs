@@ -126,6 +126,7 @@ mod tests {
             },
             basemap: BasemapStyle::Light,
             tile_boundaries: false,
+            globe: false,
             raster_layer_id: None,
             vector_layer_id: None,
             settled,

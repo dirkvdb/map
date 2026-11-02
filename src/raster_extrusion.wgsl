@@ -2,6 +2,7 @@ struct Vertex {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) color: vec4<f32>,
     @location(1) local_position: vec3<f32>,
+    @location(2) horizon: f32,
 };
 
 // One instance per displayed cell: eight indexed corners, top and four walls.
@@ -24,7 +25,10 @@ fn extruded_vertex(@builtin(vertex_index) ix: u32, @builtin(instance_index) inst
     // Aligned nearest samples keep LOD deterministic, with no raw-tile reload.
     let sample = extrusion_sample((start + end) * 0.5 / size);
     var out: Vertex;
-    out.position = draw.matrix * vec4(mix(start, end, local.xy) / size, local.z * sample.height, 1.0);
+    let uv = mix(start, end, local.xy) / size;
+    let height = local.z * sample.height;
+    out.position = project_volume(uv, height);
+    out.horizon = globe_horizon(uv, height);
     out.color = sample.color;
     out.local_position = local;
     if sample.color.a <= 0.0 {
@@ -43,6 +47,6 @@ fn extruded_fragment(in: Vertex) -> @location(0) vec4<f32> {
     let light = vec3(-0.45, -0.7, 1.0);
     let illumination = clamp(0.6 + 0.4 * dot(normal, light), 0.0, 1.0);
     // Shade premultiplied RGB only; opacity and nodata depth behavior are unchanged.
-    if in.color.a <= 0.0 { discard; }
+    if in.color.a <= 0.0 || globe_hidden(in.horizon) { discard; }
     return vec4(in.color.rgb * illumination, in.color.a);
 }

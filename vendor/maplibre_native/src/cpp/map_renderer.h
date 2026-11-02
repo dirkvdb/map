@@ -6,6 +6,7 @@
 #include <mln/gfx/renderer_backend.hpp>
 #include <mln/style/image.hpp>
 #include <mln/style/layer.hpp>
+#include <mln/style/projection.hpp>
 #include <mln/map/map.hpp>
 #include <mln/map/map_observer.hpp>
 #include <mln/map/map_options.hpp>
@@ -313,6 +314,13 @@ public:
 
     void setDebugFlags(mln::MapDebugOptions debugFlags) {
         map->setDebug(debugFlags);
+    }
+
+    void setGlobe(bool globe) {
+        auto projection = std::make_unique<mln::style::Projection>();
+        projection->setType(mln::ProjectionDefinition(globe ? mln::ProjectionType::Globe
+                                                          : mln::ProjectionType::Mercator));
+        map->getStyle().setProjection(std::move(projection));
     }
 
     void setConstrainMode(mln::ConstrainMode mode) {

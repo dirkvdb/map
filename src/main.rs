@@ -18,6 +18,7 @@ mod raster_extrusion_animation;
 mod raster_layer;
 mod raster_panel;
 mod raster_playback;
+mod raster_projection;
 mod raster_source;
 mod raster_tiles;
 mod recent_files;
@@ -33,7 +34,7 @@ gpui_kit::actions!(app, [Quit]);
 
 // env_logger matches target prefixes, so exclude third-party crates whose
 // names start with an allowed crate name (notably maplibre_native and geojson).
-const DEFAULT_LOG_FILTER: &str = "off,map=warn,geo=warn,inf=warn,tiler=warn,maplibre_native=off,geo_types=off,geojson=off,geos=off";
+const DEFAULT_LOG_FILTER: &str = "off,map=info,geo=ingo,inf=warn,tiler=warn,maplibre_native=warn,geo_types=off,geojson=off,geos=off";
 
 fn main() {
     logging_builder()

@@ -5,13 +5,10 @@ struct Vertex {
 
 @vertex
 fn vertex(@builtin(vertex_index) ix: u32) -> Vertex {
-    let corners = array<vec2<f32>, 6>(
-        vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
-        vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0),
-    );
+    let uv = raster_vertex_uv(ix);
     var out: Vertex;
-    out.position = draw.matrix * vec4(corners[ix], 0.0, 1.0);
-    out.uv = corners[ix];
+    out.position = project_surface(uv);
+    out.uv = uv;
     return out;
 }
 

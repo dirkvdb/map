@@ -22,7 +22,9 @@ type Plane = [f64; 4];
 /// zoom and the projection's actual pixels-per-meter scale, independently of the
 /// coverage budget, cached ancestors, and rendered grid. Coarsening changes only
 /// coverage, never bar height. At zoom zero the budget may still be exceeded;
-/// unwrapped copies do not count against the canonical budget.
+/// unwrapped copies do not count against the canonical budget. Active globe
+/// coverage uses canonical tiles and skips surface clipping, since raised bars
+/// can be visible beyond the ground frustum and sphere horizon.
 ///
 /// Unusable or unbounded projections fall back to a finite camera-centered viewport
 /// (at most 1024 world copies). A fixed traversal budget also permits conservative
@@ -32,6 +34,9 @@ pub fn visible_tiles(parameters: &WgpuLayerParameters, sources: &[(&RasterSource
         return Vec::new();
     };
     let bounds: Vec<LatLonBounds> = sources.iter().map(|(source, _)| source.metadata().bounds.into()).collect();
+    if super::active_globe(parameters) {
+        return super::globe_tiles(parameters, z, &bounds, tile_limit, false);
+    }
     let view = View::new(parameters, maximum_height(parameters, sources));
     loop {
         if let Some(mut tiles) = view.coverage(z, &bounds, tile_limit) {
@@ -53,9 +58,10 @@ pub fn maximum_height(parameters: &WgpuLayerParameters, sources: &[(&RasterSourc
 
 /// Conservatively test a retained tile's full [ground, `maxheight`] AABB.
 /// `maxheight` is physical meters, unlike the style heights passed to [`visible_tiles`].
-/// Non-finite projection/height or unsupported zoom inputs fail open; this helper never enumerates tiles.
+/// Active globe, non-finite projection/height, or unsupported zoom inputs fail
+/// open; this helper never enumerates tiles.
 pub fn tile_visible(parameters: &WgpuLayerParameters, tile: VisibleTile, maxheight: f64) -> bool {
-    if !(0..=22).contains(&tile.z) || !maxheight.is_finite() {
+    if super::active_globe(parameters) || !(0..=22).contains(&tile.z) || !maxheight.is_finite() {
         return true;
     }
     let origin = camera_origin(parameters);
@@ -128,7 +134,7 @@ impl View {
     }
 }
 
-fn push_children(pending: &mut Vec<VisibleTile>, tile: VisibleTile) {
+pub(super) fn push_children(pending: &mut Vec<VisibleTile>, tile: VisibleTile) {
     for y in 0..2 {
         for x in 0..2 {
             pending.push(VisibleTile {

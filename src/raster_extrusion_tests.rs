@@ -225,6 +225,7 @@ fn uniform() -> DrawUniform {
         clamp_colors: [0; 4],
         extrusion: [2.0, 2.0, 0.5, 1.0],
         geometry: [0; 4],
+        projection: ProjectionUniform::zeroed(),
     }
 }
 
@@ -264,7 +265,7 @@ fn gpu_extrusion_omits_nodata_out_of_range_and_transparent_palette_without_occlu
             pass.set_pipeline(&pipeline.extrusion_pipeline);
             for index in order {
                 pass.set_bind_group(0, &draws[index].bindings, &[]);
-                draw_pixels(pass, uniform().extrusion, uniform().geometry, &pipeline.extrusion_indices);
+                draw_pixels(pass, uniform().extrusion, uniform().geometry, &pipeline.extrusion_indices, uniform().projection);
             }
         })
     };
@@ -310,7 +311,7 @@ fn gpu_extrusion_parent_uv_and_outgoing_snapshot_keep_pixel_color_on_walls() -> 
         let image = paint_depth(&device, &queue, |pass| {
             pass.set_pipeline(&pipeline.extrusion_pipeline);
             pass.set_bind_group(0, &draw.bindings, &[]);
-            draw_pixels(pass, data.extrusion, data.geometry, &pipeline.extrusion_indices);
+            draw_pixels(pass, data.extrusion, data.geometry, &pipeline.extrusion_indices, data.projection);
         })?;
         assert_eq!(image.get_pixel(32, 22).0, [80, 80, 80, 255], "Raised top must extend beyond ground footprint");
         assert_eq!(image.get_pixel(32, 54).0, [26, 26, 26, 255], "South wall must shade the sampled pixel color");
@@ -399,7 +400,7 @@ fn render_tiles(device: &wgpu::Device, queue: &wgpu::Queue, pipeline: &RasterPip
             &pipeline.pipeline
         });
         pass.set_bind_group(0, &draw.bindings, &[]);
-        draw_pixels(pass, data.extrusion, data.geometry, &pipeline.extrusion_indices);
+        draw_pixels(pass, data.extrusion, data.geometry, &pipeline.extrusion_indices, data.projection);
     })
 }
 
@@ -639,7 +640,7 @@ fn gpu_extrusion_traversal_flags_cover_an_odd_grid_without_changing_colors() -> 
         paint_depth(&device, &queue, |pass| {
             pass.set_pipeline(&pipeline.extrusion_pipeline);
             pass.set_bind_group(0, &draw.bindings, &[]);
-            draw_pixels(pass, data.extrusion, data.geometry, &pipeline.extrusion_indices);
+            draw_pixels(pass, data.extrusion, data.geometry, &pipeline.extrusion_indices, data.projection);
         })
     };
     let reference = render(0)?;

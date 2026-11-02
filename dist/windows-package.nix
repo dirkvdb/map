@@ -49,9 +49,9 @@ let
   patchWindowsCrate =
     name: patch:
     let
-      package =
-        lib.findFirst (package: package.name == name) (throw "${name} is missing from Cargo.lock")
-          (builtins.fromTOML (builtins.readFile ../Cargo.lock)).package;
+      package = lib.findFirst (
+        package: package.name == name
+      ) (throw "${name} is missing from Cargo.lock") (fromTOML (builtins.readFile ../Cargo.lock)).package;
     in
     pkgs.applyPatches {
       name = "map-${name}-${package.version}";

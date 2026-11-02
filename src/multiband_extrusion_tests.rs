@@ -209,7 +209,7 @@ fn gpu_extrusion_multiband_interpolates_values_and_omits_invalid_bars() -> Resul
     let image = paint_depth(&device, &queue, |pass| {
         pass.set_pipeline(&pipeline.extrusion_pipeline);
         pass.set_bind_group(0, &draw.bindings, &[]);
-        crate::raster_layer::draw_pixels(pass, data.extrusion, data.geometry, &pipeline.extrusion_indices);
+        crate::raster_layer::draw_pixels(pass, data.extrusion, data.geometry, &pipeline.extrusion_indices, data.projection);
     })?;
     assert_eq!(image.get_pixel(16, 16).0, [80, 80, 80, 255]);
     assert_eq!(image.get_pixel(16, 48).0, [20, 20, 20, 255]);
@@ -298,7 +298,7 @@ fn render_bands(
             &pipeline.pipeline
         });
         pass.set_bind_group(0, &draw.bindings, &[]);
-        crate::raster_layer::draw_pixels(pass, data.extrusion, data.geometry, &pipeline.extrusion_indices);
+        crate::raster_layer::draw_pixels(pass, data.extrusion, data.geometry, &pipeline.extrusion_indices, data.projection);
     })
 }
 

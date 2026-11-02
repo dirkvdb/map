@@ -44,6 +44,7 @@ fn deliver_frame(view: &Entity<MapView>, source: u64, settled: bool, image: anyh
                 viewport: view.viewport.unwrap(),
                 basemap: basemap_style(cx),
                 tile_boundaries: view.tile_boundaries,
+                globe: view.globe,
                 raster_layer_id: None,
                 vector_layer_id: Some(source),
                 settled,

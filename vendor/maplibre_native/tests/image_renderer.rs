@@ -71,6 +71,45 @@ fn continuous_renderer_requests_frame_after_update() {
     tick_until_ready(|| requested.get());
 }
 
+#[rstest]
+#[case::globe(true)]
+#[case::mercator(false)]
+fn set_globe_requests_frame_after_projection_change(#[case] globe: bool) {
+    let mut renderer = ImageRendererBuilder::new().build_continuous_renderer();
+    let requested = Rc::new(Cell::new(false));
+    renderer.set_render_requested_callback({
+        let requested = Rc::clone(&requested);
+        move || requested.set(true)
+    });
+    renderer.set_globe(!globe);
+    tick_until_ready(|| requested.get());
+    requested.set(false);
+
+    renderer.set_globe(globe);
+
+    tick_until_ready(|| requested.get());
+}
+
+// The WebGPU backend needs a host-provided device and queue to render.
+#[cfg(not(feature = "wgpu"))]
+#[test]
+fn set_globe_changes_rendering_and_restores_mercator() {
+    let mut renderer = static_renderer();
+    renderer
+        .load_style_from_json_str(include_str!("fixtures/test-style.json"))
+        .wait()
+        .expect("test style should load");
+    let mercator = renderer.render_static(&test_camera()).expect("Mercator should render");
+
+    renderer.set_globe(true);
+    let globe = renderer.render_static(&test_camera()).expect("globe should render");
+    assert_ne!(globe.as_image(), mercator.as_image());
+
+    renderer.set_globe(false);
+    let restored = renderer.render_static(&test_camera()).expect("Mercator should render again");
+    assert_eq!(restored.as_image(), mercator.as_image());
+}
+
 #[cfg(feature = "json")]
 #[test]
 fn query_rendered_features_returns_empty_for_no_layers_before_rendering() {
