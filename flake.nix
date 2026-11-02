@@ -84,8 +84,6 @@
           buildInputs =
             with pkgs;
             [
-              fontconfig.dev
-              vulkan-headers
               pkg-mod-gdal
               pkg-mod-proj
               pkg-mod-curl
@@ -95,13 +93,15 @@
               pkg-mod-sqlite
               pkg-mod-openssl
               pkg-mod-zlib-compat
+              fontconfig.dev
+              vulkan-headers
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux (
-              linuxRuntimeDeps
-              ++ [
+              [
                 pkgs.pkg-mod-libuv
                 libuvPkgConfig
               ]
+              ++ linuxRuntimeDeps
             )
             ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.apple-sdk_15 ];
 
