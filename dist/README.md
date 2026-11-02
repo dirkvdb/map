@@ -3,8 +3,15 @@
 Packaging uses devenv and the static `pkg-mod-*` dependencies from the geo
 overlay. `dist/maplibre-native.nix` builds cacheable MapLibre Native outputs
 from its locked source revision with the wgpu backend and checked patches.
-Rust consumes the cached build prefix through `MLN_NATIVE_BUILD`. Linux and
-Windows package configs supply their own target-specific `maplibreNativeBuild`
+The derivation merges the core and its bundled internal libraries into
+`lib/libmbgl-core-amalgam.a` using build-host LLVM archive tools for Linux,
+macOS, and MinGW. Rust requires and links that archive through `MLN_NATIVE_BUILD`;
+the prefix metadata declares `library = "mbgl-core-amalgam"`. Split-archive
+prefixes are rejected rather than silently used. WGPU remains Rust-owned, and
+PNG/JPEG/WebP, SQLite, curl, zlib, and libuv remain external dependencies selected
+by `MLN_STATIC_DEPS=1`. This deliberately avoids upstream's full-amalgam merger,
+which requires a separate native WGPU and does not implement MinGW amalgamation.
+Linux and Windows package configs supply their own target-specific `maplibreNativeBuild`
 prefix, replacing the native shell's cached build; macOS requires the shell's
 `MLN_NATIVE_BUILD` and uses the same static overlay dependencies with
 `MLN_STATIC_DEPS=1`.

@@ -43,6 +43,7 @@ let
     "vendor/expected-lite/include"
     "vendor/webgpu-cpp"
   ];
+  archiveTools = pkgs.buildPackages.llvmPackages.llvm;
   archives = [
     "mbgl-core"
     "mbgl-harfbuzz"
@@ -103,6 +104,9 @@ stdenv.mkDerivation {
     "-DMLN_WEBGPU_IMPL_WGPU=ON"
 
     "-DMLN_USE_BUILTIN_ICU=ON"
+    # Upstream's merger requires a separate native WGPU and does not support
+    # MinGW. Merge internal archives below instead; WGPU stays Rust-owned and
+    # SQLite stays external so MapLibre and GDAL share one implementation.
     "-DMLN_CREATE_AMALGAMATION=OFF"
     "-DMLN_WITH_SANITIZER=OFF"
     "-DPYTHON_EXECUTABLE=${pkgs.buildPackages.python3}/bin/python3"
@@ -121,11 +125,17 @@ stdenv.mkDerivation {
   installPhase = ''
     runHook preInstall
     mkdir -p "$out/lib" "$out/include" "$out/source" "$out/share/maplibre-native"
+    printf 'CREATE %s/lib/libmbgl-core-amalgam.a\n' "$out" > amalgam.mri
+    # installPhase leaves the build directory before installCheckPhase runs.
+    : > "$TMPDIR/amalgam-input-members.txt"
     ${lib.concatMapStringsSep "\n" (archive: ''
       archive=$(find . -name 'lib${archive}.a' -type f -print -quit)
       test -n "$archive"
-      cp "$archive" "$out/lib/"
+      printf 'ADDLIB %s\n' "$archive" >> amalgam.mri
+      ${archiveTools}/bin/llvm-ar t "$archive" >> "$TMPDIR/amalgam-input-members.txt"
     '') archives}
+    printf 'SAVE\nEND\n' >> amalgam.mri
+    ${archiveTools}/bin/llvm-ar -M < amalgam.mri
     cp -R webgpu-cpp/. "$out/include/"
     cp ${webgpuHeader} "$out/include/webgpu.h"
     # Upstream's generated shim otherwise refers to the temporary build tree.
@@ -138,6 +148,7 @@ stdenv.mkDerivation {
     '') includeRoots}
     cat > "$out/share/maplibre-native/build.toml" <<'EOF'
     backend = "wgpu"
+    library = "mbgl-core-amalgam"
     target = "${platform.rust.rustcTarget}"
     release = "${release}"
     ndebug = true
@@ -147,7 +158,12 @@ stdenv.mkDerivation {
   doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
-    ${lib.concatMapStringsSep "\n" (archive: ''test -s "$out/lib/lib${archive}.a"'') archives}
+    test -s "$out/lib/libmbgl-core-amalgam.a"
+    ${archiveTools}/bin/llvm-ar t "$out/lib/libmbgl-core-amalgam.a" > amalgam-members.txt
+    test -s amalgam-members.txt
+    sort "$TMPDIR/amalgam-input-members.txt" > amalgam-expected.txt
+    sort amalgam-members.txt > amalgam-actual.txt
+    cmp amalgam-expected.txt amalgam-actual.txt
     test -s "$out/include/webgpu.hpp"
     test -s "$out/include/webgpu.h"
     test -s "$out/source/include/mln/map/map.hpp"
@@ -159,7 +175,7 @@ stdenv.mkDerivation {
   '';
   passthru = { inherit release revision webgpuHeader; };
   meta = {
-    description = "MapLibre Native wgpu core with Map's custom-layer patches";
+    description = "MapLibre Native wgpu internal amalgam with Map's custom-layer patches";
     license = lib.licenses.bsd2;
     platforms = lib.platforms.linux ++ lib.platforms.darwin ++ lib.platforms.windows;
   };

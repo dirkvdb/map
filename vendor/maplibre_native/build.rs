@@ -1,10 +1,9 @@
 //! File for defining how we download and link against `MapLibre Native`.
 //! Set `MLN_CORE_LIBRARY_PATH` and `MLN_CORE_LIBRARY_HEADERS_PATH` environment variables to use a local version of maplibre
 //!
-//! If you don't use the AMALGAM library define the env variable `MLN_CORE_LIBRARY_NO_AMALGAM` (value does not matter).
-//! In this case all dependent libraries get linked manually
-//!
-//! IMPORTANT: The library path must point to the amalgam library which contains all the dependent libraries if `MLN_CORE_LIBRARY_NO_AMALGAM` is not set!
+//! Set `MLN_CORE_LIBRARY_USE_AMALGAM=1` to build a full amalgam from source.
+//! Precompiled cores also use a full amalgam; otherwise dependent libraries are linked manually.
+//! `MLN_CORE_LIBRARY_PATH` must point to the full amalgam archive for precompiled cores.
 //!
 //! Set `MLN_CMAKE_CXX_LAUNCHER` to forward a compiler launcher (e.g. `ccache`/`sccache`) to `CMAKE_CXX_COMPILER_LAUNCHER` when building from source.
 //!
@@ -16,8 +15,12 @@
 
 //! Set `MLN_NATIVE_BUILD` to a prebuilt Nix install prefix (lib/, source/, include/).
 //! Its share/maplibre-native/build.toml must match the WGPU backend, Rust TARGET,
-//! package metadata release, and ndebug=true. This mode overrides source/precompiled
-//! selection and never uses an amalgam.
+//! package metadata release, ndebug=true, and library="mbgl-core-amalgam". This mode
+//! overrides source/precompiled selection and requires lib/libmbgl-core-amalgam.a.
+//! Unlike an upstream full amalgam, this archive bundles only internal dependencies:
+//! HarfBuzz, FreeType, parsedate, csscolorparser, bundled ICU, mlt, FastPFor, and
+//! nunicode (except on Darwin). PNG/JPEG/WebP, SQLite, curl, zlib, and libuv remain
+//! external, even without MLN_STATIC_DEPS; WGPU remains Rust-owned.
 //!
 //! Set `MLN_STATIC_DEPS=1` for macOS/Linux/MinGW packaging with static pkg-config dependencies.
 //! All non-system libraries, including transitive dependencies, must have archives.
@@ -28,7 +31,7 @@
 //! Ubuntu:
 //!     - `sudo apt install glslang-dev glslang-tools libpng-dev libjpeg-turbo8-dev libuv1-dev libwebp-dev ccache`
 //!
-//! To build the amalgam library [armerge](https://github.com/tux3/armerge) is required:
+//! To build the upstream full amalgam library [armerge](https://github.com/tux3/armerge) is required:
 //!     - `cargo install armerge`
 //!     - `sudo apt install llvm` llvm-objcopy required
 use downloader::{Download, Downloader};
@@ -37,7 +40,7 @@ use std::process::Command;
 use std::{env, fs};
 
 const MLN_REPOSITORY_URL: &str = "https://github.com/maplibre/maplibre-native.git";
-const MLN_COMMIT: &str = "core-a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b";
+const MLN_COMMIT: &str = "android-v2026.10.19-globe";
 
 const BRIDGE_RS: &str = "src/bridge.rs";
 const BRIDGE_CPP_DIR: &str = "src/cpp";
@@ -317,6 +320,11 @@ fn resolve_mln_core() -> (PathBuf, Vec<PathBuf>) {
     let base = extracted_path.join("vendor").join("maplibre-native-base");
     let deps = base.join("deps");
     let include_dirs = vec![
+        extracted_path.join("vendor/icu/include"),
+        extracted_path.join("src"),
+        extracted_path.join("vendor/metal-cpp"),
+        extracted_path.join("vendor/webgpu-cpp"),
+        extracted_path.join("webgpu-cpp"),
         base.join("include"),
         deps.join("geometry.hpp").join("include"),
         deps.join("geojson.hpp").join("include"),
@@ -434,7 +442,12 @@ fn validate_native_metadata(
     }
     let metadata: toml::Table =
         metadata.parse().map_err(|error| format!("Invalid build.toml: {error}"))?;
-    for (key, expected) in [("backend", "wgpu"), ("target", target), ("release", release)] {
+    for (key, expected) in [
+        ("backend", "wgpu"),
+        ("target", target),
+        ("release", release),
+        ("library", "mbgl-core-amalgam"),
+    ] {
         let actual =
             metadata.get(key).ok_or_else(|| format!("build.toml: missing required field {key}"))?;
         if actual.as_str() != Some(expected) {
@@ -456,21 +469,18 @@ fn validate_native_metadata(
 fn consume_native_build(
     prefix: &Path,
     backend: GraphicsApi,
+    target: &str,
+    release: &str,
 ) -> Result<Info, Box<dyn std::error::Error>> {
     let metadata_path = prefix.join("share/maplibre-native/build.toml");
     println!("cargo:rerun-if-changed={}", metadata_path.display());
     let metadata = fs::read_to_string(&metadata_path)
         .map_err(|error| format!("Failed to read {}: {error}", metadata_path.display()))?;
-    validate_native_metadata(
-        &metadata,
-        backend,
-        &env::var("TARGET")?,
-        &determine_cargo_toml_information().mln_release,
-    )?;
+    validate_native_metadata(&metadata, backend, target, release)?;
 
     let library_dir = prefix.join("lib");
-    if !library_dir.join("libmbgl-core.a").is_file() {
-        return Err(format!("Missing {}/libmbgl-core.a", library_dir.display()).into());
+    if !library_dir.join("libmbgl-core-amalgam.a").is_file() {
+        return Err(format!("Missing {}/libmbgl-core-amalgam.a", library_dir.display()).into());
     }
     println!("cargo:rerun-if-changed={}", library_dir.display());
     println!("cargo:rustc-link-search=native={}", library_dir.display());
@@ -501,7 +511,7 @@ fn consume_native_build(
         }
         println!("cargo:rerun-if-changed={}", include.display());
     }
-    Ok(Info { lib_name: "mbgl-core".to_owned(), include_dirs })
+    Ok(Info { lib_name: "mbgl-core-amalgam".to_owned(), include_dirs })
 }
 
 fn bundle_precompiled() -> Info {
@@ -873,8 +883,16 @@ fn static_packages(target_os: &str) -> Vec<&'static str> {
     packages
 }
 
+fn link_external_images(full_amalgam: bool, static_deps: bool) {
+    if !full_amalgam && !static_deps {
+        println!("cargo:rustc-link-lib=png");
+        println!("cargo:rustc-link-lib=jpeg");
+        println!("cargo:rustc-link-lib=webp");
+    }
+}
+
 fn link_external_sqlite(amalgam_lib: bool, is_apple: bool, static_deps: bool) {
-    // Amalgams own their SQLite; Apple and static dependency linking already
+    // Only full amalgams own their SQLite; Apple and static dependency linking already
     // select the external library. Other source builds must share GDAL's SQLite
     // rather than exporting a second implementation from mbgl-vendor-sqlite.
     if !amalgam_lib && !is_apple && !static_deps {
@@ -1052,6 +1070,8 @@ fn build_mln() {
 
     let precompiled =
         native_build.is_none() && !env::var("MLN_PRECOMPILE").unwrap_or("0".to_string()).eq("0");
+    // Native builds bundle internal archives only, not the external dependencies
+    // owned by upstream precompiled/source full amalgams.
     let amalgam_lib = native_build.is_none()
         && (precompiled
             || !env::var("MLN_CORE_LIBRARY_USE_AMALGAM").unwrap_or("0".to_string()).eq("0"));
@@ -1093,9 +1113,13 @@ fn build_mln() {
 
     let backend = GraphicsApi::from_selected_features();
     let info = if let Some(prefix) = &native_build {
-        consume_native_build(Path::new(prefix), backend).unwrap_or_else(|error| {
-            panic!("MLN_NATIVE_BUILD={}: {error}", Path::new(prefix).display())
-        })
+        consume_native_build(
+            Path::new(prefix),
+            backend,
+            &env::var("TARGET").expect("TARGET not set"),
+            &determine_cargo_toml_information().mln_release,
+        )
+        .unwrap_or_else(|error| panic!("MLN_NATIVE_BUILD={}: {error}", Path::new(prefix).display()))
     } else if precompiled {
         bundle_precompiled()
     } else if system_lib {
@@ -1119,8 +1143,8 @@ fn build_mln() {
     );
     let is_apple = target_os == "macos" || target_os == "ios";
     let native_link_kind = if static_deps { "static=" } else { "" };
-    if !amalgam_lib {
-        // The dependent libs are not bundled in the core lib, so we have to link manually
+    if !amalgam_lib && native_build.is_none() {
+        // Native internal amalgams and full amalgams already own these libraries.
 
         println!("cargo:rustc-link-lib={native_link_kind}mbgl-harfbuzz");
         println!("cargo:rustc-link-lib={native_link_kind}mbgl-freetype");
@@ -1144,12 +1168,8 @@ fn build_mln() {
             println!("cargo:rustc-link-lib=SPIRV-Tools-opt"); //sudo dnf install  spirv-tools-devel // Required by glslang spirv-tools-devel
             println!("cargo:rustc-link-lib=SPIRV-Tools"); //sudo dnf install  spirv-tools-devel // Required by glslang spirv-tools-devel
         }
-        if !static_deps {
-            println!("cargo:rustc-link-lib=png"); // sudo dnf install libpng-devel
-            println!("cargo:rustc-link-lib=jpeg"); // sudo dnf install libjpeg-turbo-devel
-            println!("cargo:rustc-link-lib=webp"); // sudo dnf install libwebp-devel
-        }
     }
+    link_external_images(amalgam_lib, static_deps);
     if !is_apple && !static_deps {
         println!("cargo:rustc-link-lib=uv"); // sudo dnf install libuv-devel
     }
@@ -1204,6 +1224,7 @@ fn build_mln() {
 
 #[cfg(test)]
 mod native_build_tests {
+    use super::static_dependency_tests::Fixture;
     use super::*;
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -1211,11 +1232,78 @@ mod native_build_tests {
         backend = "wgpu"
         target = "x86_64-unknown-linux-gnu"
         release = "test-release"
+        library = "mbgl-core-amalgam"
         ndebug = true
     "#;
 
     fn validate(metadata: &str) -> Result<(), Box<dyn std::error::Error>> {
         validate_native_metadata(metadata, GraphicsApi::WGPU, TARGET, "test-release")
+    }
+
+    fn native_fixture() -> Fixture {
+        let fixture = Fixture::new();
+        let prefix = fixture.path("primary");
+        fs::create_dir_all(prefix.join("share/maplibre-native")).unwrap();
+        fs::write(prefix.join("share/maplibre-native/build.toml"), METADATA).unwrap();
+        for path in [
+            "source/vendor/icu/include",
+            "source/vendor/webgpu-cpp",
+            "source/include",
+            "source/src",
+            "source/platform/default/include",
+            "source/vendor/maplibre-native-base/include",
+            "source/vendor/maplibre-native-base/deps/variant/include",
+            "source/vendor/maplibre-native-base/deps/geometry.hpp/include",
+            "source/vendor/maplibre-native-base/deps/geojson.hpp/include",
+            "source/vendor/metal-cpp",
+            "source/vendor/expected-lite/include",
+            "include",
+        ] {
+            fs::create_dir_all(prefix.join(path)).unwrap();
+        }
+        fixture
+    }
+
+    #[test]
+    fn selects_native_internal_amalgam_without_separate_archives() {
+        let fixture = native_fixture();
+        fs::write(fixture.path("primary/lib/libmbgl-core-amalgam.a"), []).unwrap();
+        let info = consume_native_build(
+            &fixture.path("primary"),
+            GraphicsApi::WGPU,
+            TARGET,
+            "test-release",
+        )
+        .unwrap();
+        assert_eq!(info.lib_name, "mbgl-core-amalgam");
+    }
+
+    #[test]
+    fn rejects_non_amalgam_archive_even_with_valid_metadata() {
+        let fixture = native_fixture();
+        fs::write(fixture.path("primary/lib/libmbgl-core.a"), []).unwrap();
+        let error = consume_native_build(
+            &fixture.path("primary"),
+            GraphicsApi::WGPU,
+            TARGET,
+            "test-release",
+        )
+        .err()
+        .expect("non-amalgam archive must not satisfy native mode");
+        assert!(error.to_string().contains("libmbgl-core-amalgam.a"));
+    }
+
+    #[test]
+    fn rejects_directory_named_like_native_amalgam_archive() {
+        let fixture = native_fixture();
+        fs::create_dir(fixture.path("primary/lib/libmbgl-core-amalgam.a")).unwrap();
+        assert!(consume_native_build(
+            &fixture.path("primary"),
+            GraphicsApi::WGPU,
+            TARGET,
+            "test-release",
+        )
+        .is_err());
     }
 
     #[test]
@@ -1265,6 +1353,14 @@ mod native_build_tests {
     }
 
     #[test]
+    fn rejects_old_non_amalgam_library() {
+        assert!(validate(&METADATA.replace("mbgl-core-amalgam", "mbgl-core"))
+            .unwrap_err()
+            .to_string()
+            .contains("library"));
+    }
+
+    #[test]
     fn rejects_debug_core_abi() {
         assert!(validate(&METADATA.replace("true", "false"))
             .unwrap_err()
@@ -1280,6 +1376,7 @@ mod native_build_tests {
             ("\"wgpu\"", "true", "backend"),
             ("\"x86_64-unknown-linux-gnu\"", "42", "target"),
             ("\"test-release\"", "[]", "release"),
+            ("\"mbgl-core-amalgam\"", "true", "library"),
         ] {
             assert!(validate(&METADATA.replace(value, replacement))
                 .unwrap_err()
@@ -1290,7 +1387,7 @@ mod native_build_tests {
 
     #[test]
     fn rejects_missing_metadata_fields() {
-        for field in ["backend", "target", "release", "ndebug"] {
+        for field in ["backend", "target", "release", "library", "ndebug"] {
             let error = validate(&METADATA.replace(field, "unknown")).unwrap_err().to_string();
             assert!(error.contains(field) && error.contains("missing"), "{error}");
         }
@@ -1304,10 +1401,10 @@ mod static_dependency_tests {
 
     // Compile build.rs with rustc --test and its cached build dependencies. The test
     // harness does not call main(), CMake, or build_bridge(); only pkg-config runs.
-    struct Fixture(PathBuf);
+    pub(super) struct Fixture(PathBuf);
 
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
             let root = env::temp_dir().join(format!(
                 "mln-static-deps-{}-{}-{}",
@@ -1323,7 +1420,7 @@ mod static_dependency_tests {
             Self(root)
         }
 
-        fn path(&self, relative: &str) -> PathBuf {
+        pub(super) fn path(&self, relative: &str) -> PathBuf {
             self.0.join(relative)
         }
 
