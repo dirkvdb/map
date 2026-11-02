@@ -20,6 +20,7 @@ import package_linux as packaging
 ROOT = Path("/tmp/Map Project").resolve()
 TARGET = "x86_64-unknown-linux-gnu"
 CONFIG = {
+    "arch": "x86_64",
     "target": TARGET,
     "maplibreNativeBuild": "/nix/store/portable-maplibre-native",
     "hostCc": "/nix/store/native-toolchain/bin/cc",
@@ -43,6 +44,7 @@ class PackageEnvironmentTests(unittest.TestCase):
         env = packaging.package_environment(CONFIG, {}, ROOT)
         work = ROOT / "dist/build/appimage"
         expected = {
+            "ARCH": CONFIG["arch"],
             "CC": CONFIG["cc"],
             "CXX": CONFIG["cxx"],
             "AR": CONFIG["ar"],
@@ -73,9 +75,18 @@ class PackageEnvironmentTests(unittest.TestCase):
         for name, value in expected.items():
             with self.subTest(name=name):
                 self.assertEqual(env[name], value)
-        for name in ("CC", "CXX", "AR", "CXXSTDLIB"):
+        for name in ("CC", "CXX", "AR", "CXXSTDLIB", "CFLAGS", "CXXFLAGS"):
             for target in (TARGET, TARGET.replace("-", "_")):
                 self.assertEqual(env[f"{name}_{target}"], expected[name])
+
+    def test_target_linker_adapter_does_not_replace_native_compilers_or_host_linker(self):
+        config = {**CONFIG, "linker": "/nix/store/map-linux-target-linker"}
+        env = packaging.package_environment(config, {}, ROOT)
+        self.assertEqual(env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")[-1],
+                         f"-Clinker={config['linker']}")
+        self.assertEqual(env["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"], config["hostCc"])
+        self.assertEqual(env["CC"], config["cc"])
+        self.assertEqual(env["CXX"], config["cxx"])
 
     def test_isolates_native_nix_pkg_config_vcpkg_and_search_paths(self):
         removed = {
@@ -93,7 +104,7 @@ class PackageEnvironmentTests(unittest.TestCase):
             "PKG_CONFIG_ALLOW_CROSS", "CMAKE_TOOLCHAIN_FILE", "GDAL_HOME",
             "GDAL_STATIC", "MLN_NATIVE_BUILD", "MLN_STATIC_DEPS", "MLN_PRECOMPILE", "CARGO_TARGET_DIR",
             "TMPDIR", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
-            "CFLAGS", "CXXFLAGS", "CMAKE_PREFIX_PATH",
+            "CFLAGS", "CXXFLAGS", "CMAKE_PREFIX_PATH", "ARCH",
         }
         inherited = {name: "/native/should-not-leak" for name in removed | replaced}
         inherited.update({"HOME": "/home/map", "MLN_LOCAL_REPOSITORY": "/source/maplibre"})
@@ -239,14 +250,78 @@ class PackageEnvironmentTests(unittest.TestCase):
         self.assertEqual(env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")[-1], f"-Clinker={CONFIG['cc']}")
         self.assertEqual(env["LIBCLANG_PATH"], inherited["LIBCLANG_PATH"])
 
+    def test_aarch64_toolchain_overrides_inherited_arch_linkers_and_flags(self):
+        target = "aarch64-unknown-linux-gnu"
+        config = {**CONFIG, "arch": "aarch64", "target": target,
+                  "includePaths": ["/portable include", "/portable/include"]}
+        inherited = {
+            "ARCH": "x86_64", "CFLAGS": "--target=x86_64-linux-gnu",
+            "CXXFLAGS": "--target=x86_64-linux-gnu",
+            "CFLAGS_aarch64-unknown-linux-gnu": "--target=aarch64-linux-gnu.2.40",
+            "CXXFLAGS_aarch64-unknown-linux-gnu": "--target=aarch64-linux-gnu.2.40",
+            "CFLAGS_aarch64_unknown_linux_gnu": "-I/inherited/c/include",
+            "CXXFLAGS_aarch64_unknown_linux_gnu": "-I/inherited/cxx/include",
+            "HOST_CFLAGS": "--target=aarch64-linux-gnu.2.40 -I/host/c/include",
+            "HOST_CXXFLAGS": "--target=aarch64-linux-gnu.2.40 -I/host/cxx/include",
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER": "/inherited/cc",
+            "RUSTFLAGS": "-Clinker=/inherited/cc",
+        }
+        original = inherited.copy()
+        with patch.object(packaging.platform, "machine", return_value="aarch64"):
+            env = packaging.package_environment(config, inherited, ROOT)
+        self.assertEqual(inherited, original)
+        self.assertEqual(env["ARCH"], "aarch64")
+        self.assertNotIn("HOST_CFLAGS", env)
+        self.assertNotIn("HOST_CXXFLAGS", env)
+        for name in ("CFLAGS", "CXXFLAGS"):
+            self.assertEqual(env[f"{name}_{target}"], env[name])
+            self.assertEqual(env[f"{name}_{target.replace('-', '_')}"], env[name])
+            self.assertEqual(packaging.shlex.split(env[name]), [
+                "-target", "aarch64-linux-gnu.2.28",
+                "-isystem/portable include", "-isystem/portable/include",
+            ])
+        for name, value in (("CC", config["cc"]), ("CXX", config["cxx"]),
+                            ("AR", config["ar"]), ("CXXSTDLIB", "c++")):
+            self.assertEqual(env[name], value)
+            self.assertEqual(env[f"{name}_{target}"], value)
+            self.assertEqual(env[f"{name}_{target.replace('-', '_')}"], value)
+        self.assertEqual(env["CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"], config["hostCc"])
+        self.assertEqual(env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")[-1], f"-Clinker={config['cc']}")
+
     def test_rejects_unsupported_hosts_before_preparing_environment(self):
-        for system, machine in (("Darwin", "x86_64"), ("Linux", "aarch64")):
+        for system, machine in (("Darwin", "x86_64"), ("Darwin", "aarch64"),
+                                ("Linux", "armv7l"), ("Linux", "riscv64")):
             with self.subTest(system=system, machine=machine):
                 with patch.object(packaging.platform, "system", return_value=system), \
                      patch.object(packaging.platform, "machine", return_value=machine), \
                      patch.object(packaging, "tool_environment") as tools:
-                    with self.assertRaisesRegex(ValueError, "requires x86_64 Linux"):
+                    with self.assertRaisesRegex(ValueError, "requires x86_64 or aarch64 Linux"):
                         packaging.package_environment(CONFIG, {}, ROOT)
+                tools.assert_not_called()
+
+    def test_rejects_unsupported_config_arch_before_preparing_environment(self):
+        with patch.object(packaging, "tool_environment") as tools:
+            with self.assertRaisesRegex(ValueError, "Unsupported Linux package architecture: armv7l"):
+                packaging.package_environment({**CONFIG, "arch": "armv7l"}, {}, ROOT)
+        tools.assert_not_called()
+
+    def test_config_arch_and_target_must_match_native_host(self):
+        cases = (
+            ("x86_64", "aarch64", "aarch64-unknown-linux-gnu"),
+            ("aarch64", "x86_64", TARGET),
+            ("x86_64", "x86_64", "aarch64-unknown-linux-gnu"),
+            ("aarch64", "aarch64", TARGET),
+            ("x86_64", "aarch64", TARGET),
+            ("aarch64", "x86_64", "aarch64-unknown-linux-gnu"),
+            ("aarch64", "aarch64", "aarch64-unknown-linux-musl"),
+            ("x86_64", "x86_64", "x86_64-pc-windows-gnu"),
+        )
+        for host, arch, target in cases:
+            with self.subTest(host=host, arch=arch, target=target), \
+                 patch.object(packaging.platform, "machine", return_value=host), \
+                 patch.object(packaging, "tool_environment") as tools:
+                with self.assertRaisesRegex(ValueError, f"arch/target must match native host {host}"):
+                    packaging.package_environment({**CONFIG, "arch": arch, "target": target}, {}, ROOT)
                 tools.assert_not_called()
 
 
@@ -268,26 +343,31 @@ class BuildInputsTests(unittest.TestCase):
             ["devenv", "build", "outputs.linux-package"], cwd=self.root, env=env,
             check=True, capture_output=False, stdout=subprocess.PIPE, text=True)
 
-    def test_prepares_isolated_tmp_and_cross_cmake_toolchain(self):
+    def test_prepares_isolated_tmp_and_native_cmake_toolchain(self):
         work = self.root / "dist/build/appimage"
         gdal = self.root / "portable-gdal"
         (gdal / "lib").mkdir(parents=True)
         (gdal / "lib/libgdal.a").write_bytes(b"!<arch>\n")
-        packaging.prepare_build({
-            "CARGO_TARGET_DIR": str(work / "target"), "TMPDIR": str(work / "tmp"),
-            "GDAL_HOME": str(gdal),
-        })
-        self.assertTrue((work / "tmp").is_dir())
-        self.assertEqual((work / "toolchain.cmake").read_text(),
-                         "set(CMAKE_SYSTEM_NAME Linux)\n"
-                         "set(CMAKE_SYSTEM_PROCESSOR x86_64)\n"
-                         "set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)\n")
+        for arch in ("x86_64", "aarch64"):
+            with self.subTest(arch=arch), \
+                 patch.object(packaging.platform, "system", return_value="Linux"), \
+                 patch.object(packaging.platform, "machine", return_value=arch):
+                config = {**CONFIG, "arch": arch, "target": f"{arch}-unknown-linux-gnu",
+                          "gdal": str(gdal)}
+                env = packaging.package_environment(config, {"ARCH": "incorrect"}, self.root)
+                packaging.prepare_build(env)
+                self.assertTrue((work / "tmp").is_dir())
+                self.assertEqual((work / "toolchain.cmake").read_text(),
+                                 "set(CMAKE_SYSTEM_NAME Linux)\n"
+                                 f"set(CMAKE_SYSTEM_PROCESSOR {arch})\n"
+                                 "set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)\n")
 
     def test_missing_portable_static_gdal_is_actionable(self):
         with self.assertRaisesRegex(ValueError, "Portable GDAL static archive is missing"):
             packaging.prepare_build({
                 "CARGO_TARGET_DIR": str(self.root / "target"),
                 "TMPDIR": str(self.root / "tmp"), "GDAL_HOME": str(self.root / "missing"),
+                "ARCH": CONFIG["arch"],
             })
 
 
@@ -321,15 +401,26 @@ class MainTests(unittest.TestCase):
         self.bundle.assert_not_called()
 
     def test_default_builds_requested_linux_target_before_bundling(self):
-        with patch.object(sys, "argv", ["package_linux.py"]), \
-             contextlib.redirect_stdout(io.StringIO()):
-            packaging.main()
-        env = self.prepare.call_args.args[0]
-        self.run.assert_called_once_with(
-            ["cargo", "build", "--release", "--locked", "--bin", "map", "--target", TARGET],
-            cwd=ROOT, env=env, check=True)
-        self.bundle.assert_called_once_with(
-            Path(env["CARGO_TARGET_DIR"]) / TARGET / "release/map", CONFIG, ROOT, env)
+        for arch in ("x86_64", "aarch64"):
+            target = f"{arch}-unknown-linux-gnu"
+            config = {**CONFIG, "arch": arch, "target": target}
+            self.load.return_value = config
+            self.prepare.reset_mock()
+            self.run.reset_mock()
+            self.bundle.reset_mock()
+            with self.subTest(arch=arch), \
+                 patch.object(packaging.platform, "machine", return_value=arch), \
+                 patch.object(sys, "argv", ["package_linux.py"]), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                packaging.main()
+            env = self.prepare.call_args.args[0]
+            self.assertEqual(env["ARCH"], arch)
+            self.prepare.assert_called_once_with(env)
+            self.run.assert_called_once_with(
+                ["cargo", "build", "--release", "--locked", "--bin", "map", "--target", target],
+                cwd=ROOT, env=env, check=True)
+            self.bundle.assert_called_once_with(
+                Path(env["CARGO_TARGET_DIR"]) / target / "release/map", config, ROOT, env)
 
     def test_errors_exit_nonzero_with_linux_packaging_context(self):
         errors = (
@@ -393,12 +484,37 @@ class MainTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("MAP_RUN_NATIVE_TESTS") == "1", "requires Nix native tools")
 class NativeLinkerTests(unittest.TestCase):
+    def test_portable_toolchain_links_rust_for_native_target(self):
+        project = Path(__file__).resolve().parents[2]
+        config = packaging.load_config(project, dict(os.environ))
+        with tempfile.TemporaryDirectory(prefix="map portable linker probe ") as temporary:
+            root = Path(temporary)
+            env = packaging.package_environment(config, dict(os.environ), root)
+            packaging.prepare_build(env)
+            source = root / "probe.rs"
+            source.write_text('fn main() { println!("portable linker probe"); }\n')
+            binary = root / "probe"
+            result = subprocess.run(
+                ["rustc", str(source), "--crate-name", "probe", "--target", config["target"],
+                 *env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f"), "-o", str(binary)],
+                env=env, capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            elf = subprocess.run(
+                [config["tools"]["readelf"], "-l", str(binary)], env=env,
+                check=True, capture_output=True, text=True, timeout=60,
+            )
+            self.assertNotRegex(elf.stdout, r"Requesting program interpreter: /nix/store/")
+            self.assertRegex(elf.stdout, r"Requesting program interpreter: /lib[^\s\]]*/ld-linux")
+
     def test_host_libcxx_links_and_loads_without_inherited_library_paths(self):
         compiler = os.environ.get("MAP_PACKAGE_HOST_LINKER")
         self.assertIsNotNone(compiler, "run native tests inside devenv shell")
         with tempfile.TemporaryDirectory(prefix="map host libcxx probe ") as temporary:
             root = Path(temporary)
-            env = packaging.package_environment(CONFIG, dict(os.environ), root)
+            arch = packaging.platform.machine()
+            config = {**CONFIG, "arch": arch, "target": f"{arch}-unknown-linux-gnu"}
+            env = packaging.package_environment(config, dict(os.environ), root)
             env.pop("LD_LIBRARY_PATH", None)
             Path(env["TMPDIR"]).mkdir(parents=True)
             binary = root / "probe"
@@ -455,15 +571,14 @@ class NativeLinkerTests(unittest.TestCase):
                 )
                 wrapper.chmod(0o755)
                 linkers[name] = str(wrapper)
-            config = {**CONFIG, "target": host, "hostCc": linkers["native"],
+            config = {**CONFIG, "arch": host.split("-")[0], "target": host, "hostCc": linkers["native"],
                       "cc": linkers["portable"]}
             inherited = dict(os.environ)
             for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
                 inherited.pop(name, None)
             # Exercise same-triple Cargo behavior on any Linux developer machine;
             # the stand-in target linker forwards to the native linker, not Zig.
-            with patch.object(packaging.platform, "machine", return_value="x86_64"):
-                env = packaging.package_environment(config, inherited, root)
+            env = packaging.package_environment(config, inherited, root)
             Path(env["TMPDIR"]).mkdir(parents=True)
             result = subprocess.run(
                 ["cargo", "build", "--release", "--offline", "--target", host],

@@ -6,6 +6,19 @@
   hostLinker,
 }:
 let
+  arch = pkgs.stdenv.hostPlatform.parsed.cpu.name;
+  artifacts =
+    {
+      x86_64 = {
+        appimagetoolHash = "04ws94q71bwskmhizhwmaf41ma4wabvfgjgkagr8wf3vakgv866r";
+        runtimeHash = "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d";
+      };
+      aarch64 = {
+        appimagetoolHash = "06nl3ckryw91wf0iicrhlr1lkd2z5gzhyd41ppxvj12f18qmil69";
+        runtimeHash = "0i3lv1j8d9yqssh2i97idmdg9xx11jgdairkdpzw1ikwj77xzjq0";
+      };
+    }
+    .${arch};
   ui = import ./linux-ui.nix { inherit inputs pkgs lib; };
   targetPkgs = ui.uiPkgs;
   maplibreNative = import ./maplibre-native.nix { pkgs = targetPkgs; };
@@ -49,25 +62,46 @@ let
   '';
   compiler = targetPkgs.stdenv.cc;
   prefix = compiler.targetPrefix;
+  # rustc passes this erratum workaround to AArch64 linkers, but Zig's driver
+  # rejects it. Keep the adapter target-only; host build scripts use hostLinker.
+  rustLinker =
+    if arch == "aarch64" then
+      pkgs.writeShellScript "map-linux-target-linker" ''
+        args=()
+        for arg in "$@"; do
+          if [[ "$arg" != "-Wl,--fix-cortex-a53-843419" ]]; then
+            args+=("$arg")
+          fi
+        done
+        exec ${compiler}/bin/${prefix}cc "''${args[@]}"
+      ''
+    else
+      "${compiler}/bin/${prefix}cc";
   appimagetool = pkgs.appimageTools.wrapType2 {
     pname = "appimagetool";
     version = "12";
     src = pkgs.fetchurl {
-      url = "https://github.com/AppImage/AppImageKit/releases/download/12/appimagetool-x86_64.AppImage";
-      sha256 = "04ws94q71bwskmhizhwmaf41ma4wabvfgjgkagr8wf3vakgv866r";
+      url = "https://github.com/AppImage/AppImageKit/releases/download/12/appimagetool-${arch}.AppImage";
+      sha256 = artifacts.appimagetoolHash;
     };
     extraPkgs = packages: [ packages.squashfsTools ];
   };
 in
-assert lib.assertMsg pkgs.stdenv.hostPlatform.isx86_64
-  "AppImage packaging currently supports x86_64 Linux";
+assert lib.assertMsg (
+  pkgs.stdenv.hostPlatform.isLinux
+  && builtins.elem arch [
+    "x86_64"
+    "aarch64"
+  ]
+) "AppImage packaging supports x86_64 and aarch64 Linux";
 pkgs.writeText "map-linux-package.json" (
   builtins.toJSON {
-    target = "x86_64-unknown-linux-gnu";
+    target = targetPkgs.stdenv.hostPlatform.rust.rustcTarget;
     maplibreNativeBuild = "${maplibreNative}";
-    arch = "x86_64";
+    inherit arch;
     glibc = "2.28";
     hostCc = "${hostLinker}";
+    linker = "${rustLinker}";
     cc = "${compiler}/bin/${prefix}cc";
     cxx = "${compiler}/bin/${prefix}c++";
     ar = "${compiler}/bin/${prefix}ar";
@@ -89,9 +123,9 @@ pkgs.writeText "map-linux-package.json" (
     composeData = "${targetPkgs.libx11}/share/X11/locale";
     # Use the upstream static bootstrap, not AppImageKit 12's host-zlib runtime.
     runtime = "${pkgs.fetchurl {
-      name = "appimage-runtime-x86_64-20251108";
-      url = "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64";
-      sha256 = "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d";
+      name = "appimage-runtime-${arch}-20251108";
+      url = "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-${arch}";
+      sha256 = artifacts.runtimeHash;
     }}";
     runtimeClosure = "${pkgs.closureInfo { rootPaths = uiLibraries; }}/store-paths";
     runtimeLibraries = [

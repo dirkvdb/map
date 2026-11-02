@@ -13,7 +13,7 @@ from pathlib import Path
 SYSTEM_SONAMES = frozenset({
     "libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1",
     "libresolv.so.2", "libutil.so.1", "libanl.so.1", "libBrokenLocale.so.1",
-    "ld-linux-x86-64.so.2",
+    "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1",
 })
 GPU_DRIVERS = (
     "*_dri.so", "libvulkan_*.so*", "libnvidia*.so*", "libcuda.so*",
@@ -21,6 +21,11 @@ GPU_DRIVERS = (
     "libgallium*.so*",
 )
 GLIBC_LIMIT = (2, 28)
+ELF_MACHINES = {"Advanced Micro Devices X86-64": "x86_64", "AArch64": "aarch64"}
+ELF_INTERPRETERS = {
+    "x86_64": "/lib64/ld-linux-x86-64.so.2",
+    "aarch64": "/lib/ld-linux-aarch64.so.1",
+}
 
 
 def run(command, root, env, timeout=60):
@@ -47,7 +52,7 @@ def tool_environment(env):
         part for part in env.get("PATH", os.defpath).split(os.pathsep)
         if part and "sccache" not in part.lower()
     )
-    clean.update({"LC_ALL": "C", "ARCH": "x86_64"})
+    clean["LC_ALL"] = "C"
     return clean
 
 
@@ -59,7 +64,7 @@ def runtime_library_dirs(closure):
         package = Path(line)
         if not package.is_absolute() or not str(package).startswith("/nix/store/"):
             raise ValueError(f"Invalid runtimeClosure store path: {line!r}")
-        for suffix in ("lib", "lib64", "lib/x86_64-linux-gnu"):
+        for suffix in ("lib", "lib64", "lib/x86_64-linux-gnu", "lib/aarch64-linux-gnu"):
             directory = package / suffix
             # The closure also retains build-tool glibc. Injecting it breaks
             # distro shells/ldd by mixing Nix libc with the host dynamic loader.
@@ -72,11 +77,12 @@ def runtime_library_dirs(closure):
 
 def parse_elf(output):
     """Parse locale-independent, wide readelf header/dynamic/version output."""
-    if not re.search(r"Class:\s+ELF64\b", output) or not re.search(
-        r"Machine:\s+Advanced Micro Devices X86-64\b", output
-    ):
-        raise ValueError("Expected an x86_64 ELF64 file")
+    machine = re.search(r"^\s*Machine:\s+([^\n]+)", output, re.MULTILINE)
+    arch = ELF_MACHINES.get(machine[1].strip()) if machine else None
+    if not re.search(r"Class:\s+ELF64\b", output) or arch is None:
+        raise ValueError("Expected an x86_64 or aarch64 ELF64 file")
     return {
+        "arch": arch,
         "needed": re.findall(r"\(NEEDED\).*?\[([^\]]+)\]", output),
         "sonames": re.findall(r"\(SONAME\).*?\[([^\]]+)\]", output),
         "rpaths": [entry for value in re.findall(
@@ -87,17 +93,27 @@ def parse_elf(output):
     }
 
 
-def check_elf(info, path, *, relocated=True):
+def check_elf_architecture(info, path, arch):
+    if arch not in ELF_INTERPRETERS or info["arch"] != arch:
+        raise ValueError(f"{path}: expected {arch} ELF64, found {info['arch']} ELF64")
+
+
+def check_glibc_versions(info, path):
     for version in info["glibc"]:
         if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", version) or tuple(
             int(part) for part in version.split(".")
         ) > GLIBC_LIMIT:
             raise ValueError(f"{path}: unsupported GLIBC_{version}; maximum is GLIBC_2.28")
+
+
+def check_elf(info, path, *, relocated=True, arch="x86_64"):
+    check_elf_architecture(info, path, arch)
+    check_glibc_versions(info, path)
     for name in info["needed"] + info["sonames"]:
         if "/" in name:
             raise ValueError(f"{path}: nonportable absolute/path-based ELF dependency: {name}")
     for interpreter in info["interpreters"]:
-        if interpreter != "/lib64/ld-linux-x86-64.so.2":
+        if interpreter != ELF_INTERPRETERS[info["arch"]]:
             raise ValueError(f"{path}: nonportable ELF interpreter: {interpreter}")
     if relocated:
         for rpath in info["rpaths"]:
@@ -106,8 +122,10 @@ def check_elf(info, path, *, relocated=True):
 
 
 def read_elf(path, tools, root, env):
-    return parse_elf(run([tools["readelf"], "--wide", "--file-header", "--program-headers",
+    info = parse_elf(run([tools["readelf"], "--wide", "--file-header", "--program-headers",
                           "--dynamic", "--version-info", path], root, env))
+    check_elf_architecture(info, path, env.get("ARCH", "x86_64"))
+    return info
 
 
 def elf_files(appdir):
@@ -129,7 +147,7 @@ def audit_appdir(appdir, tools, root, env):
     libdir = appdir / "usr/lib"
     for path in files:
         info = read_elf(path, tools, root, env)
-        check_elf(info, path, relocated=False)
+        check_elf(info, path, relocated=False, arch=env.get("ARCH", "x86_64"))
         for name in [path.name, *info["sonames"]]:
             if name in SYSTEM_SONAMES or any(Path(name).match(pattern) for pattern in GPU_DRIVERS):
                 raise ValueError(f"Must not bundle host glibc/GPU driver: {path} ({name})")
@@ -142,7 +160,7 @@ def audit_appdir(appdir, tools, root, env):
 
     for path in files:
         info = read_elf(path, tools, root, env)
-        check_elf(info, path)
+        check_elf(info, path, arch=env.get("ARCH", "x86_64"))
         search = [Path(entry.replace("$ORIGIN", str(path.parent))).resolve()
                   for entry in info["rpaths"]]
 
@@ -157,23 +175,8 @@ def audit_appdir(appdir, tools, root, env):
                 raise ValueError(f"{path}: dependency not bundled/resolvable: {needed}")
 
 
-def build_appimage(binary: Path, config: dict, root: Path, env: dict) -> Path:
-    """Collect with linuxdeploy, audit the AppDir, then run wrapped AppImageKit 12."""
-    root = Path(root).resolve()
-    binary = Path(binary).resolve()
-    if config["arch"] != "x86_64" or str(config["glibc"]) != "2.28":
-        raise ValueError("Only x86_64 / glibc 2.28 AppImages are supported")
-    tools = config["tools"]
-    for name in ("linuxdeploy", "appimagetool", "patchelf", "readelf", "magick"):
-        if not Path(tools[name]).is_absolute() or not os.access(tools[name], os.X_OK):
-            raise ValueError(f"Missing absolute executable tool path: {name}={tools[name]}")
-    clean = tool_environment(env)
-    check_elf(read_elf(binary, tools, root, clean), binary, relocated=False)
-    collector_env = {**clean, "LD_LIBRARY_PATH": os.pathsep.join(
-        runtime_library_dirs(config["runtimeClosure"])
-    )}
-    appdir = root / "dist/build/appimage/Map.AppDir"
-    output = root / "dist/build/devenv/release/bundle/appimage/Map-x86_64.AppImage"
+def prepare_appdir(appdir, output, config, root, env):
+    """Replace the staging directory and install architecture-independent assets."""
     if appdir.is_symlink():
         raise ValueError(f"Refusing to replace an AppDir symlink: {appdir}")
     if appdir.exists():
@@ -188,7 +191,7 @@ def build_appimage(binary: Path, config: dict, root: Path, env: dict) -> Path:
     share = appdir / "usr/share"
     icon = share / "icons/hicolor/256x256/apps/map.png"
     icon.parent.mkdir(parents=True)
-    run([tools["magick"], root / "data/icon.png", "-resize", "256x256", icon], root, clean)
+    run([config["tools"]["magick"], root / "data/icon.png", "-resize", "256x256", icon], root, env)
     certificates = share / "map/certs/ca-bundle.crt"
     certificates.parent.mkdir(parents=True)
     ca = Path(config["caBundle"])
@@ -200,7 +203,28 @@ def build_appimage(binary: Path, config: dict, root: Path, env: dict) -> Path:
         (Path(config["composeData"]), share / "X11/locale"),
     ):
         shutil.copytree(source, destination)
+    return icon
 
+
+def build_appimage(binary: Path, config: dict, root: Path, env: dict) -> Path:
+    """Collect with linuxdeploy, audit the AppDir, then run wrapped AppImageKit 12."""
+    root = Path(root).resolve()
+    binary = Path(binary).resolve()
+    arch = config["arch"]
+    if arch not in ELF_INTERPRETERS or str(config["glibc"]) != "2.28":
+        raise ValueError("Only x86_64 or aarch64 / glibc 2.28 AppImages are supported")
+    tools = config["tools"]
+    for name in ("linuxdeploy", "appimagetool", "patchelf", "readelf", "magick"):
+        if not Path(tools[name]).is_absolute() or not os.access(tools[name], os.X_OK):
+            raise ValueError(f"Missing absolute executable tool path: {name}={tools[name]}")
+    clean = {**tool_environment(env), "ARCH": arch}
+    check_elf(read_elf(binary, tools, root, clean), binary, relocated=False, arch=arch)
+    collector_env = {**clean, "LD_LIBRARY_PATH": os.pathsep.join(
+        runtime_library_dirs(config["runtimeClosure"])
+    )}
+    appdir = root / "dist/build/appimage/Map.AppDir"
+    output = root / f"dist/build/devenv/release/bundle/appimage/Map-{arch}.AppImage"
+    icon = prepare_appdir(appdir, output, config, root, clean)
     command = [tools["linuxdeploy"], "--appdir", appdir, "--executable", binary,
                "--desktop-file", root / "dist/map.desktop", "--icon-file", icon]
     for library in config["runtimeLibraries"]:
@@ -226,7 +250,7 @@ def build_appimage(binary: Path, config: dict, root: Path, env: dict) -> Path:
     if stat.S_IMODE(output.stat().st_mode) != 0o755:
         raise ValueError(f"AppImage must have mode 755: {output}")
     runtime = read_elf(output, tools, root, clean)
-    check_elf(runtime, output)
+    check_elf(runtime, output, arch=arch)
     for needed in runtime["needed"]:
         if needed not in SYSTEM_SONAMES:
             raise ValueError(f"AppImage runtime needs a non-glibc host library: {needed}")

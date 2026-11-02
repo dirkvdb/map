@@ -23,31 +23,45 @@ def load_config(root, env):
     return json.loads(Path(outputs["outputs.linux-package"]).read_text())
 
 
-def package_environment(config, environ, root):
-    if platform.system() != "Linux" or platform.machine() != "x86_64":
-        raise ValueError("AppImage packaging currently requires x86_64 Linux")
-    required = ("target", "hostCc", "cc", "cxx", "ar", "pkgConfigPath", "libraryPath",
+def validate_config(config):
+    host_arch = platform.machine()
+    if platform.system() != "Linux" or host_arch not in ("x86_64", "aarch64"):
+        raise ValueError("AppImage packaging requires x86_64 or aarch64 Linux")
+    required = ("arch", "target", "hostCc", "cc", "cxx", "ar", "pkgConfigPath", "libraryPath",
                 "gdal", "glibc", "cmakePrefixPath", "maplibreNativeBuild")
     missing = [key for key in required if not isinstance(config.get(key), str) or not config[key]]
     if missing:
         raise ValueError("Missing Linux package configuration: " + ", ".join(missing))
+    if config["arch"] not in ("x86_64", "aarch64"):
+        raise ValueError(f"Unsupported Linux package architecture: {config['arch']}")
+    if config["arch"] != host_arch or config["target"] != f"{host_arch}-unknown-linux-gnu":
+        raise ValueError(
+            f"Linux package arch/target must match native host {host_arch}: "
+            f"arch={config['arch']}, target={config['target']} (cross-architecture builds are unsupported)"
+        )
+
+
+def package_environment(config, environ, root):
+    validate_config(config)
     env = tool_environment(environ)
     for key in list(env):
         if key.startswith(("NIX_CFLAGS_", "NIX_LDFLAGS", "NIX_CC_WRAPPER_FLAGS_SET",
                            "NIX_BINTOOLS_WRAPPER_FLAGS_SET", "PKG_CONFIG_", "TARGET_PKG_CONFIG_", "VCPKG_")):
             env.pop(key)
     for key in ("LIBRARY_PATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "CPPFLAGS",
-                "CFLAGS", "CXXFLAGS", "LDFLAGS", "CMAKE_PREFIX_PATH", "CMAKE_INCLUDE_PATH",
+                "CFLAGS", "CXXFLAGS", "HOST_CFLAGS", "HOST_CXXFLAGS",
+                "LDFLAGS", "CMAKE_PREFIX_PATH", "CMAKE_INCLUDE_PATH",
                 "CMAKE_LIBRARY_PATH", "CMAKE_TOOLCHAIN_FILE"):
         env.pop(key, None)
     target = config["target"]
     target_key = target.upper().replace("-", "_")
     work = Path(root).resolve() / "dist/build/appimage"
     native_flags = shlex.join([
-        "-target", f"x86_64-linux-gnu.{config['glibc']}",
+        "-target", f"{config['arch']}-linux-gnu.{config['glibc']}",
         *(f"-isystem{path}" for path in config.get("includePaths", [])),
     ])
     env.update({
+        "ARCH": config["arch"],
         # Empty values also override wrappers configured in Cargo's user config.
         "RUSTC_WRAPPER": "",
         "RUSTC_WORKSPACE_WRAPPER": "",
@@ -83,7 +97,8 @@ def package_environment(config, environ, root):
         "CMAKE_TOOLCHAIN_FILE": str(work / "toolchain.cmake"),
     })
     for key, value in (("CC", config["cc"]), ("CXX", config["cxx"]),
-                       ("AR", config["ar"]), ("CXXSTDLIB", "c++")):
+                       ("AR", config["ar"]), ("CXXSTDLIB", "c++"),
+                       ("CFLAGS", native_flags), ("CXXFLAGS", native_flags)):
         env[f"{key}_{target.replace('-', '_')}"] = value
         env[f"{key}_{target}"] = value
     flags = (environ["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
@@ -91,7 +106,7 @@ def package_environment(config, environ, root):
     flags.extend(f"-Lnative={path}" for path in config["libraryPath"].split(":") if path)
     # With explicit --target, rustflags apply only to target code. Cargo appends
     # them after its configured linker, so this overrides it only for that code.
-    flags.append(f"-Clinker={config['cc']}")
+    flags.append(f"-Clinker={config.get('linker', config['cc'])}")
     env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
     env.pop("RUSTFLAGS", None)
     return env
@@ -102,7 +117,7 @@ def prepare_build(env):
     Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
     (work / "toolchain.cmake").write_text(
         "set(CMAKE_SYSTEM_NAME Linux)\n"
-        "set(CMAKE_SYSTEM_PROCESSOR x86_64)\n"
+        f"set(CMAKE_SYSTEM_PROCESSOR {env['ARCH']})\n"
         "set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)\n"
     )
     if not (Path(env["GDAL_HOME"]) / "lib/libgdal.a").is_file():

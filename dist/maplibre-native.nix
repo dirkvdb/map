@@ -9,7 +9,7 @@ let
   source = pkgs.fetchgit {
     url = "https://github.com/maplibre/maplibre-native.git";
     rev = revision;
-    hash = "sha256-pxqKzTRjXTKUoRmLynlIojKYx5dNwlTRjcHGuZplwXo=";
+    hash = "sha256-YwsjItM8ZcV4oD+CD7KkxbFNq7yDra6f1pbZks38yf0=";
     fetchSubmodules = true;
   };
   webgpuHeader = pkgs.fetchurl {
@@ -61,7 +61,7 @@ assert lib.assertMsg (
 ) "MapLibre Native builds support Linux, macOS, and MinGW";
 stdenv.mkDerivation {
   pname = "maplibre-native-map-wgpu";
-  version = builtins.substring 0 7 revision;
+  version = lib.removePrefix "android-v" revision;
   src = source;
   patches = [
     ../vendor/maplibre_native/bundled-icu.patch

@@ -18,12 +18,13 @@ prefix, replacing the native shell's cached build; macOS requires the shell's
 
 - macOS app: `dist/build/devenv/release/bundle/osx/Map.app`
 - macOS DMG: `dist/build/devenv/release/bundle/dmg/Map.dmg`
-- Linux AppImage output: `dist/build/devenv/release/bundle/appimage/Map-x86_64.AppImage`
+- Linux AppImage output: `dist/build/devenv/release/bundle/appimage/Map-{x86_64,aarch64}.AppImage`
 - Windows executable: `dist/build/devenv/release/bundle/windows/Map.exe`
 
-All three CI jobs install Nix and devenv pinned to `v2.4.0`, and pull from the
+All distribution CI jobs install Nix and devenv pinned to `v2.4.0`, and pull from the
 `geo-overlay`, `devenv`, and `cachix` binary caches without pushing. Linux CI
-and local `just appimage` use the same `scripts/package_linux.py` pipeline;
+builds on native x86_64 and ARM64 runners, and local `just appimage` uses the
+same `scripts/package_linux.py` pipeline;
 neither uses mise or vcpkg. A first package build can take significantly longer
 than incremental builds. Windows CI cross-compiles on Ubuntu with the same
 `scripts/package_windows.py` pipeline as `just exe`, tests resource embedding,
@@ -103,11 +104,17 @@ dependencies. GitHub Actions and Intel macOS builds still require validation.
 
 ## Local Linux build
 
-Requires x86_64 Linux, Nix, devenv, and `just`:
+Requires x86_64 or aarch64 Linux, Nix, devenv, and `just`:
 
 ```sh
 just appimage
 ```
+
+The architecture is selected from the native host: x86_64 produces
+`Map-x86_64.AppImage`, and aarch64 produces `Map-aarch64.AppImage`. Both use
+the glibc 2.28 baseline, target-specific MapLibre Native amalgams, and pinned
+architecture-specific AppImageKit and static runtime downloads. Cross-architecture
+packaging is not supported.
 
 The recipe uses the same command as CI:
 
@@ -151,7 +158,8 @@ failed build. The AppDir root is explicitly mode `755`.
 
 ### CI loader/bootstrap smoke test
 
-After packaging, CI pulls `debian:buster-slim` (glibc 2.28) and runs the test
+After packaging, each native architecture's CI job pulls `debian:buster-slim`
+(glibc 2.28) and runs the test
 with `--network none`, mounting only the artifact directory read-only. The
 AppImage's own bootstrap extracts it under `/tmp` without FUSE. The test checks
 that the extracted root is mode `755`, then runs `ldd` on `usr/bin/map` using
@@ -159,8 +167,9 @@ only its relative RPATHs, without `LD_LIBRARY_PATH`. A failed loader check,
 `not found`, or `/nix/store` in the output fails the job. No host development
 packages or Nix store are mounted into the container.
 
-The local `just appimage` build and this clean non-Nix **loader/bootstrap test**
-have both passed. The application and bundled libraries meet the glibc 2.28 ELF
+The x86_64 local `just appimage` build and this clean non-Nix **loader/bootstrap test**
+have previously passed. ARM64 end-to-end packaging and loader validation remain
+to be confirmed by a complete native build. The application and bundled libraries meet the glibc 2.28 ELF
 checks; the bootstrap is statically linked. This is not a full graphical launch
 or UI-rendering test, which still requires validation with suitable host GPU
 drivers and an X11 or Wayland session.

@@ -1096,8 +1096,8 @@ pub mod ffi {
         Sprite = 9,
         /// Image event.
         Image = 10,
-        /// OpenGL event.
-        OpenGL = 11,
+        /// Graphics backend event.
+        GraphicsBackend = 11,
         /// JNI event.
         JNI = 12,
         /// Android event.

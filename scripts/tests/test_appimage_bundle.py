@@ -19,6 +19,7 @@ packaging = importlib.import_module("scripts.appimage_bundle")
 
 ROOT = Path(__file__).resolve().parents[2]
 HEADER = "ELF Header:\n  Class: ELF64\n  Machine: Advanced Micro Devices X86-64\n"
+ARM_HEADER = "ELF Header:\n  Class: ELF64\n  Machine: AArch64\n"
 DYNAMIC = """
   [Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]
   0x0000000000000001 (NEEDED) Shared library: [libc.so.6]
@@ -134,6 +135,7 @@ class AppRunTests(unittest.TestCase):
 class ElfGuardTests(unittest.TestCase):
     def test_parses_wide_readelf_output_and_accepts_baseline(self):
         info = packaging.parse_elf(HEADER + DYNAMIC)
+        self.assertEqual(info["arch"], "x86_64")
         self.assertEqual(info["needed"], ["libc.so.6", "libxkbcommon.so.0"])
         self.assertEqual(info["rpaths"], ["$ORIGIN/../lib", "$ORIGIN"])
         self.assertEqual(info["interpreters"], ["/lib64/ld-linux-x86-64.so.2"])
@@ -164,11 +166,43 @@ class ElfGuardTests(unittest.TestCase):
                     packaging.check_elf(info, "lib.so")
                 packaging.check_elf(info, "lib.so", relocated=False)
 
-    def test_rejects_wrong_or_missing_architecture(self):
+    def test_rejects_unsupported_or_missing_architecture(self):
         for output in ("", HEADER.replace("ELF64", "ELF32"),
-                       HEADER.replace("Advanced Micro Devices X86-64", "AArch64")):
-            with self.subTest(output=output), self.assertRaisesRegex(ValueError, "x86_64 ELF64"):
+                       ARM_HEADER.replace("ELF64", "ELF32"),
+                       HEADER.replace("Advanced Micro Devices X86-64", "Intel 80386"),
+                       ARM_HEADER.replace("AArch64", "AArch64 unsupported")):
+            with self.subTest(output=output), self.assertRaisesRegex(ValueError, "ELF64"):
                 packaging.parse_elf(output)
+
+    def test_accepts_aarch64_with_native_loader_and_glibc_baseline(self):
+        output = ARM_HEADER + DYNAMIC.replace("/lib64/ld-linux-x86-64.so.2",
+                                             "/lib/ld-linux-aarch64.so.1")
+        info = packaging.parse_elf(output)
+        self.assertEqual(info["arch"], "aarch64")
+        packaging.check_elf(info, "map", arch="aarch64")
+        with self.assertRaisesRegex(ValueError, "expected x86_64 ELF64"):
+            packaging.check_elf(info, "map")
+
+    def test_rejects_other_architecture_loader_and_nix_loader(self):
+        for arch, header, loader in (
+            ("aarch64", ARM_HEADER, "/lib64/ld-linux-x86-64.so.2"),
+            ("x86_64", HEADER, "/lib/ld-linux-aarch64.so.1"),
+            ("aarch64", ARM_HEADER, "/nix/store/hash-glibc/lib/ld-linux-aarch64.so.1"),
+        ):
+            with self.subTest(arch=arch, loader=loader):
+                info = packaging.parse_elf(header + f"[Requesting program interpreter: {loader}]")
+                with self.assertRaisesRegex(ValueError, "nonportable ELF interpreter"):
+                    packaging.check_elf(info, "map", arch=arch)
+
+    def test_read_elf_rejects_wrong_architecture_against_environment(self):
+        for env, header in (({}, ARM_HEADER), ({"ARCH": "aarch64"}, HEADER),
+                            ({"ARCH": "x86_64"}, ARM_HEADER)):
+            with self.subTest(env=env), patch.object(packaging, "run", return_value=header):
+                with self.assertRaisesRegex(ValueError, "expected .* ELF64"):
+                    packaging.read_elf("map", {"readelf": "/tools/readelf"}, ROOT, env)
+        with patch.object(packaging, "run", return_value=ARM_HEADER):
+            info = packaging.read_elf("map", {"readelf": "/tools/readelf"}, ROOT, {"ARCH": "aarch64"})
+        self.assertEqual(info["arch"], "aarch64")
 
     def test_parses_soname_and_static_elf(self):
         info = packaging.parse_elf(HEADER + "(SONAME) Library soname: [libfoo.so.1]")
@@ -195,9 +229,14 @@ class PackagingTests(unittest.TestCase):
         clean = packaging.tool_environment(env)
         self.assertEqual(env, original)
         self.assertEqual(clean["PATH"], "/tools/bin:/usr/bin")
-        self.assertEqual(clean["ARCH"], "x86_64")
+        self.assertNotIn("ARCH", clean)
         for key in env.keys() - {"PATH"}:
             self.assertNotIn(key, clean)
+
+    def test_tool_environment_preserves_compilation_architecture(self):
+        env = {"ARCH": "aarch64"}
+        self.assertEqual(packaging.tool_environment(env)["ARCH"], "aarch64")
+        self.assertEqual(env, {"ARCH": "aarch64"})
 
     def test_runtime_library_dirs_come_from_closure_not_inherited_environment(self):
         closure = self.root / "store-paths"
@@ -206,8 +245,9 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(packaging.runtime_library_dirs(closure), [])
         with patch.object(Path, "is_dir", return_value=True):
             directories = packaging.runtime_library_dirs(closure)
-        self.assertEqual(len(directories), 6)
+        self.assertEqual(len(directories), 8)
         self.assertEqual(directories[0], "/nix/store/hash-ui/lib")
+        self.assertIn("/nix/store/hash-ui/lib/aarch64-linux-gnu", directories)
         closure.write_text("relative/path\n")
         with self.assertRaisesRegex(ValueError, "store path"):
             packaging.runtime_library_dirs(closure)
@@ -215,13 +255,16 @@ class PackagingTests(unittest.TestCase):
     def test_runtime_library_dirs_exclude_glibc_and_loader_directories(self):
         closure = self.root / "store-paths"
         closure.write_text("/nix/store/hash-ui\n/nix/store/hash-glibc\n")
-        for soname in ("libc.so.6", "ld-linux-x86-64.so.2"):
-            with self.subTest(soname=soname), \
+        for soname, suffix in (("libc.so.6", "lib"), ("ld-linux-x86-64.so.2", "lib"),
+                               ("libc.so.6", "lib/aarch64-linux-gnu"),
+                               ("ld-linux-aarch64.so.1", "lib/aarch64-linux-gnu")):
+            excluded = Path("/nix/store/hash-glibc") / suffix
+            with self.subTest(soname=soname, suffix=suffix), \
                  patch.object(Path, "is_dir", return_value=True), \
                  patch.object(Path, "exists", autospec=True, side_effect=lambda path:
-                              path.name == soname and path.parent == Path("/nix/store/hash-glibc/lib")):
+                              path.name == soname and path.parent == excluded):
                 directories = packaging.runtime_library_dirs(closure)
-            self.assertNotIn("/nix/store/hash-glibc/lib", directories)
+            self.assertNotIn(str(excluded), directories)
             self.assertIn("/nix/store/hash-ui/lib", directories)
 
     def test_audit_patches_rpath_and_rejects_missing_non_glibc_library(self):
@@ -244,8 +287,31 @@ class PackagingTests(unittest.TestCase):
         with patch.object(packaging, "read_elf", side_effect=read), patch.object(packaging, "run"):
             packaging.audit_appdir(self.appdir, {"patchelf": "/tools/patchelf"}, self.root, {})
 
+    def test_audit_accepts_aarch64_and_rejects_mixed_libraries(self):
+        library = self.appdir / "usr/lib/libui.so.1"
+        library.write_bytes(b"\x7fELFfixture")
+        env = {"ARCH": "aarch64"}
+        def read(path, *args):
+            return elf_info(arch="aarch64", needed=["libui.so.1"] if path == self.binary else [],
+                            rpaths=["$ORIGIN", "$ORIGIN/../lib"])
+        with patch.object(packaging, "read_elf", side_effect=read), patch.object(packaging, "run"):
+            packaging.audit_appdir(self.appdir, {"patchelf": "/tools/patchelf"}, self.root, env)
+        for arch, wrong_arch in (("aarch64", "x86_64"), ("x86_64", "aarch64")):
+            def mixed(path, *args):
+                return elf_info(arch=arch if path == self.binary else wrong_arch)
+            with self.subTest(arch=arch), patch.object(packaging, "read_elf", side_effect=mixed):
+                with self.assertRaisesRegex(ValueError, f"expected {arch} ELF64"):
+                    packaging.audit_appdir(self.appdir, {}, self.root, {"ARCH": arch})
+
+    def test_audit_rejects_aarch64_wrong_loader(self):
+        info = elf_info(arch="aarch64", interpreters=["/lib64/ld-linux-x86-64.so.2"])
+        with patch.object(packaging, "read_elf", return_value=info):
+            with self.assertRaisesRegex(ValueError, "nonportable ELF interpreter"):
+                packaging.audit_appdir(self.appdir, {}, self.root, {"ARCH": "aarch64"})
+
     def test_audit_rejects_bundled_glibc_and_host_gpu_drivers(self):
-        for name in ("libc.so.6", "libvulkan_intel.so", "iris_dri.so", "libEGL_mesa.so.0"):
+        for name in ("libc.so.6", "ld-linux-aarch64.so.1", "ld-linux-x86-64.so.2",
+                     "libvulkan_intel.so", "iris_dri.so", "libEGL_mesa.so.0"):
             with self.subTest(name=name):
                 driver = self.appdir / "usr/lib" / name
                 driver.write_bytes(b"\x7fELFfixture")
@@ -260,6 +326,18 @@ class PackagingTests(unittest.TestCase):
             packaging.elf_files(self.appdir)
 
     def test_build_delegates_collection_and_image_generation_to_configured_tools(self):
+        self.check_build("x86_64")
+
+    def test_build_aarch64_uses_validated_architecture_for_tools_and_output(self):
+        self.check_build("aarch64")
+
+    def test_build_rejects_unsupported_architecture_and_glibc(self):
+        for arch, glibc in (("armv7l", "2.28"), ("x86_64", "2.29"), ("aarch64", "2.29")):
+            with self.subTest(arch=arch, glibc=glibc):
+                with self.assertRaisesRegex(ValueError, "Only x86_64 or aarch64 / glibc 2.28"):
+                    packaging.build_appimage(self.binary, {"arch": arch, "glibc": glibc}, self.root, {})
+
+    def check_build(self, arch):
         (self.root / "dist").mkdir()
         for name in ("AppRun", "map.desktop"):
             shutil.copyfile(ROOT / "dist" / name, self.root / "dist" / name)
@@ -276,7 +354,7 @@ class PackagingTests(unittest.TestCase):
             directory.mkdir(parents=True)
             (directory / "data").write_text("fixture")
             directory.chmod(0o555)
-        config = {"arch": "x86_64", "glibc": "2.28", "tools": tools, "caBundle": str(ca),
+        config = {"arch": arch, "glibc": "2.28", "tools": tools, "caBundle": str(ca),
                   "xkbData": str(self.root / "xkb"), "composeData": str(self.root / "compose"),
                   "runtimeClosure": "unused", "runtime": "/portable/runtime",
                   "runtimeLibraries": ["/portable/lib/libui.so.1", "/portable/lib/libEGL.so.1"]}
@@ -293,15 +371,16 @@ class PackagingTests(unittest.TestCase):
             elif command[0] == tools["appimagetool"]:
                 Path(command[-1]).write_bytes(b"\x7fELF AppImage fixture")
             return ""
-        env = {"PATH": os.defpath, "RUSTC_WRAPPER": "sccache", "SCCACHE_DIR": "/cache"}
+        env = {"PATH": os.defpath, "RUSTC_WRAPPER": "sccache", "SCCACHE_DIR": "/cache",
+               "ARCH": "aarch64" if arch == "x86_64" else "x86_64"}
         with patch.object(packaging, "runtime_library_dirs", return_value=["/portable/lib"]), \
              patch.object(packaging, "run", side_effect=run), \
-             patch.object(packaging, "read_elf", return_value=elf_info()):
+             patch.object(packaging, "read_elf", return_value=elf_info(arch=arch)):
             output = packaging.build_appimage(self.binary, config, self.root, env)
             # Rebuilding must also clean data copied from read-only Nix directories.
             output = packaging.build_appimage(self.binary, config, self.root, env)
         appdir = self.root / "dist/build/appimage/Map.AppDir"
-        self.assertEqual(output, self.root / "dist/build/devenv/release/bundle/appimage/Map-x86_64.AppImage")
+        self.assertEqual(output, self.root / f"dist/build/devenv/release/bundle/appimage/Map-{arch}.AppImage")
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o755)
         self.assertEqual(stat.S_IMODE(appdir.stat().st_mode), 0o755)
         self.assertEqual(stat.S_IMODE((appdir / "AppRun").stat().st_mode), 0o755)
@@ -320,7 +399,27 @@ class PackagingTests(unittest.TestCase):
             self.assertIn(flag, collector)
         image_command = next(command for command, _, _ in calls if command[0] == tools["appimagetool"])
         self.assertEqual(image_command[1:3], ["--runtime-file", config["runtime"]])
+        self.check_tool_environments(calls, tools, arch)
+        self.assertNotEqual(env["ARCH"], arch)
+        self.check_build_architecture_mismatches(config, env, run)
+
+    def check_build_architecture_mismatches(self, config, env, run):
+        arch = config["arch"]
+        wrong_arch = "aarch64" if arch == "x86_64" else "x86_64"
+        native = elf_info(arch=arch)
+        wrong = elf_info(arch=wrong_arch)
+        for stage, infos in (("input binary", [wrong]),
+                             ("AppImage runtime", [native, native, native, wrong])):
+            with self.subTest(stage=stage), \
+                 patch.object(packaging, "runtime_library_dirs", return_value=["/portable/lib"]), \
+                 patch.object(packaging, "run", side_effect=run), \
+                 patch.object(packaging, "read_elf", side_effect=infos):
+                with self.assertRaisesRegex(ValueError, f"expected {arch} ELF64"):
+                    packaging.build_appimage(self.binary, config, self.root, env)
+
+    def check_tool_environments(self, calls, tools, arch):
         for command, tool_env, timeout in calls:
+            self.assertEqual(tool_env["ARCH"], arch)
             self.assertNotIn("SCCACHE_DIR", tool_env)
             self.assertNotIn("RUSTC_WRAPPER", tool_env)
             if command[0] != tools["linuxdeploy"]:

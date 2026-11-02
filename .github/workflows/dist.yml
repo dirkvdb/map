@@ -65,7 +65,16 @@ jobs:
           if-no-files-found: error
 
   linux:
-    runs-on: ubuntu-22.04
+    name: Linux AppImage (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     steps:
       - name: Check out repository
@@ -95,7 +104,7 @@ jobs:
           docker run --rm --network none \
             --mount "type=bind,source=${{ github.workspace }}/dist/build/devenv/release/bundle/appimage,target=/artifacts,readonly" \
             --workdir /tmp debian:buster-slim sh -eu -c '
-              /artifacts/Map-x86_64.AppImage --appimage-extract > /tmp/extract.log 2>&1 || {
+              /artifacts/Map-${{ matrix.arch }}.AppImage --appimage-extract > /tmp/extract.log 2>&1 || {
                 cat /tmp/extract.log
                 exit 1
               }
@@ -119,7 +128,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: Map-Linux-${{ runner.arch }}
-          path: dist/build/devenv/release/bundle/appimage/Map-x86_64.AppImage
+          path: dist/build/devenv/release/bundle/appimage/Map-${{ matrix.arch }}.AppImage
           if-no-files-found: error
 
   windows:
