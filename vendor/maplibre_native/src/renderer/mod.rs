@@ -27,6 +27,8 @@ pub use map_observer::{MapLoadError, MapLoadErrorKind, MapObserver};
 pub use resource_options::ResourceOptions;
 pub use run_loop::RunLoopHandle;
 
-pub use crate::bridge::ffi::{EdgeInsets, LatLng, LatLngBounds, MapDebugOptions, MapMode};
+pub use crate::bridge::ffi::{
+    ConstrainMode, EdgeInsets, LatLng, LatLngBounds, MapDebugOptions, MapMode,
+};
 pub use crate::bridge::map_observer::MapObserverCameraChangeMode;
 pub use crate::bridge::{set_log_thread_enabled, ScreenCoordinate, Size};

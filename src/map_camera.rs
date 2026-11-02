@@ -4,6 +4,7 @@ use maplibre_native::{CameraUpdate, LatLng};
 
 const MIN_ZOOM: f64 = 0.0;
 const MAX_ZOOM: f64 = 18.0;
+const PREVIEW_FIT_FRACTION: f64 = 0.8;
 // MapLibre Native's default pitch range, in degrees.
 const MAX_PITCH: f64 = 60.0;
 const PITCH_DEGREES_PER_PIXEL: f64 = 0.5;
@@ -82,6 +83,19 @@ impl MapCamera {
     }
 
     pub fn fit_bounds(bounds: [f64; 4], width: f64, height: f64) -> Self {
+        let mut camera = Self::fit_bounds_with_zoom_floor(bounds, width, height, MIN_ZOOM, 0.85);
+        camera.constrain_to_viewport(height);
+        camera
+    }
+
+    /// Extent previews retain a 10% inset even for full-world bounds.
+    pub(crate) fn fit_bounds_for_extent_preview(bounds: [f64; 4], width: f64, height: f64) -> Self {
+        let narrowest_dimension = width.min(height).max(1.0);
+        let zoom_floor = (narrowest_dimension * PREVIEW_FIT_FRACTION / 512.0).log2();
+        Self::fit_bounds_with_zoom_floor(bounds, width, height, zoom_floor, PREVIEW_FIT_FRACTION)
+    }
+
+    fn fit_bounds_with_zoom_floor(bounds: [f64; 4], width: f64, height: f64, zoom_floor: f64, fit_fraction: f64) -> Self {
         let [west, south, east, north] = bounds;
         let left = (west + 180.0) / 360.0;
         let mut right = (east + 180.0) / 360.0;
@@ -90,18 +104,25 @@ impl MapCamera {
         }
         let top = mercator_y(north);
         let bottom = mercator_y(south);
-        let zoom_x = (width.max(1.0) * 0.85 / (512.0 * (right - left).max(1e-12))).log2();
-        let zoom_y = (height.max(1.0) * 0.85 / (512.0 * (bottom - top).max(1e-12))).log2();
-        let mut camera = Self {
+        let zoom_x = (width.max(1.0) * fit_fraction / (512.0 * (right - left).max(1e-12))).log2();
+        let zoom_y = (height.max(1.0) * fit_fraction / (512.0 * (bottom - top).max(1e-12))).log2();
+        Self {
             x: ((left + right) / 2.0).rem_euclid(1.0),
             y: (top + bottom) / 2.0,
-            zoom: zoom_x.min(zoom_y).clamp(MIN_ZOOM, MAX_ZOOM),
+            zoom: zoom_x.min(zoom_y).clamp(zoom_floor, MAX_ZOOM),
             pitch: 0.0,
             bearing: 0.0,
-            viewport_height: 512.0,
-        };
-        camera.constrain_to_viewport(height);
-        camera
+            viewport_height: height.max(1.0),
+        }
+    }
+
+    /// Native zoom cannot be negative. A larger offscreen image, scaled back down
+    /// for display, preserves the preview's world-space viewport at zoom zero or above.
+    pub(crate) fn for_native_preview_render(mut self) -> (Self, u32) {
+        let render_scale = (-self.zoom).exp2().ceil().max(1.0) as u32;
+        self.zoom = (self.zoom + f64::from(render_scale).log2()).max(MIN_ZOOM);
+        self.viewport_height *= f64::from(render_scale);
+        (self, render_scale)
     }
 
     /// Match MapLibre's default HeightOnly constraint before unprojecting hover
@@ -648,6 +669,16 @@ mod tests {
             let camera = MapCamera::fit_bounds([-180.0, -90.0, 180.0, 90.0], 1200.0, height);
             assert!((camera.world_size() - height.max(512.0)).abs() < 1e-9);
             assert!((camera.y - 0.5).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn extent_preview_keeps_global_bounds_within_eighty_percent_at_any_aspect_ratio() {
+        for (width, height) in [(640.0, 320.0), (320.0, 640.0), (640.0, 640.0)] {
+            let camera = MapCamera::fit_bounds_for_extent_preview([-180.0, -90.0, 180.0, 90.0], width, height);
+            let [left, top, right, bottom] = camera.visible_region(width, height);
+            assert!(1.0 / (right - left) <= PREVIEW_FIT_FRACTION + 1e-6);
+            assert!(1.0 / (bottom - top) <= PREVIEW_FIT_FRACTION + 1e-6);
         }
     }
 

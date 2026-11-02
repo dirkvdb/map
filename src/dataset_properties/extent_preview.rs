@@ -35,6 +35,7 @@ impl ExtentPreview {
     /// caller decides how they are pumped.
     fn request_basemap(map: &ExtentMap, renderer: MapRenderer, window: &Window, cx: &App) -> Option<(MapRenderer, async_channel::Receiver<MapFrame>)> {
         let request = map.basemap_request(window.scale_factor())?;
+        let renderer = renderer.with_unconstrained_camera();
         let basemap = BasemapStyle::default_for_theme(cx);
         if let Err(error) = renderer.render_layer(request, None, 1.0, cx.reduce_motion(), basemap, false) {
             log::warn!("Could not queue the extent preview basemap ({basemap:?}): {error:#}");

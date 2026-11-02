@@ -622,6 +622,12 @@ impl ImageRenderer<Continuous> {
         self.instance.pin_mut().jumpTo(&camera.to_camera_options());
     }
 
+    /// Sets the camera's world-edge constraints. The native default is
+    /// [`ConstrainMode::HeightOnly`](crate::ConstrainMode::HeightOnly).
+    pub fn set_constrain_mode(&mut self, mode: crate::ConstrainMode) {
+        self.instance.pin_mut().setConstrainMode(mode);
+    }
+
     /// Move map by
     pub fn move_by(&mut self, delta: ScreenCoordinate) {
         self.instance.pin_mut().moveBy(&delta);

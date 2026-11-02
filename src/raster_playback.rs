@@ -57,6 +57,7 @@ impl PlaybackStyle {
     }
 
     /// Overrides averaging for all playback bands without rebuilding their sources.
+    #[cfg(test)]
     pub fn with_extrusion_averaging(mut self, enabled: bool) -> Self {
         self.extrusion_averaging = Some(enabled);
         self

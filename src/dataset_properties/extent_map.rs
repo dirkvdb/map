@@ -11,11 +11,15 @@ use gpui_kit::{
 use crate::map_camera::{MapCamera, mercator_y};
 use crate::map_renderer::{MapRequest, Viewport};
 
-/// Logical size of the static basemap render; the 2:1 frame scales it to fit.
+/// Logical display size; native rendering may use a larger offscreen viewport.
 const PREVIEW_WIDTH: NonZeroU32 = NonZeroU32::new(640).unwrap();
 const PREVIEW_HEIGHT: NonZeroU32 = NonZeroU32::new(320).unwrap();
 
 mod annotations;
+
+#[cfg(test)]
+#[path = "extent_map/native_tests.rs"]
+mod native_tests;
 
 /// Native source grid values, not dimensions or resolution of the preview.
 #[derive(Clone, Debug)]
@@ -70,7 +74,7 @@ pub(super) struct ExtentMap {
 impl ExtentMap {
     pub(super) fn new(bounds: [f64; 4]) -> Self {
         let extent = normalized_extent(bounds);
-        let camera = extent.map(|_| MapCamera::fit_bounds(bounds, f64::from(PREVIEW_WIDTH.get()), f64::from(PREVIEW_HEIGHT.get())));
+        let camera = extent.map(|_| MapCamera::fit_bounds_for_extent_preview(bounds, f64::from(PREVIEW_WIDTH.get()), f64::from(PREVIEW_HEIGHT.get())));
         let [west, south, east, north] = bounds;
         let label = if extent.is_some() {
             format!("Map showing dataset extent: west {west:.6}°, south {south:.6}°, east {east:.6}°, north {north:.6}°")
@@ -106,15 +110,16 @@ impl ExtentMap {
         self
     }
 
-    /// The single render that supplies the basemap, at the display's pixel density.
+    /// A native-compatible render, downscaled for display when the preview needs negative zoom.
     pub(super) fn basemap_request(&self, scale: f32) -> Option<MapRequest> {
+        let (camera, render_scale) = self.camera?.for_native_preview_render();
         Some(MapRequest {
             viewport: Viewport {
-                width: PREVIEW_WIDTH,
-                height: PREVIEW_HEIGHT,
+                width: NonZeroU32::new(PREVIEW_WIDTH.get().checked_mul(render_scale)?)?,
+                height: NonZeroU32::new(PREVIEW_HEIGHT.get().checked_mul(render_scale)?)?,
                 scale,
             },
-            camera: self.camera?,
+            camera,
         })
     }
 
@@ -274,14 +279,14 @@ mod tests {
     }
 
     #[test]
-    fn australia_extent_is_centered_and_fills_eighty_five_percent_of_the_frame_height() {
+    fn australia_extent_is_centered_and_fills_eighty_percent_of_the_frame_height() {
         let preview = ExtentMap::new([112., -44., 154., -10.]);
         let map = Bounds::new(point(px(10.), px(20.)), size(px(720.), px(360.)));
         let extent = project_region(relative_region(preview.extent.unwrap(), preview.viewport), map);
         assert!((extent.center().x - map.center().x).abs() < px(0.001));
         assert!((extent.center().y - map.center().y).abs() < px(0.001));
-        assert!((extent.size.height - map.size.height * 0.85).abs() < px(0.01));
-        assert!(extent.size.width < map.size.width * 0.85);
+        assert!((extent.size.height - map.size.height * 0.8).abs() < px(0.01));
+        assert!(extent.size.width < map.size.width * 0.8);
     }
 
     #[test]
@@ -311,30 +316,40 @@ mod tests {
     }
 
     #[test]
-    fn fitting_keeps_wide_tall_tiny_and_dateline_extents_centered_within_the_frame() {
+    fn fitting_keeps_wide_tall_tiny_dateline_and_polar_extents_centered_within_the_frame() {
         for bounds in [
             [-140., 30., -60., 40.],
             [10., -50., 20., 60.],
             [4., 51., 4.0001, 51.0001],
             [170., -10., -170., 10.],
+            [-180., 70., 180., 90.],
+            [-180., -90., 180., -70.],
         ] {
             let preview = ExtentMap::new(bounds);
             let region = relative_region(preview.extent.unwrap(), preview.viewport);
-            assert!(region.size.width.max(region.size.height) <= 0.85 + 1e-6, "Incorrect fit for {bounds:?}");
+            assert!(region.size.width.max(region.size.height) <= 0.8 + 1e-6, "Incorrect fit for {bounds:?}");
             assert!((region.center().x - 0.5).abs() < 1e-6, "Off-centre fit for {bounds:?}");
             assert!((region.center().y - 0.5).abs() < 1e-6, "Off-centre fit for {bounds:?}");
-            assert!(region.left() >= 0.075 - 1e-6 && region.right() <= 0.925 + 1e-6);
-            assert!(region.top() >= 0.075 - 1e-6 && region.bottom() <= 0.925 + 1e-6);
+            assert!(region.left() >= 0.1 - 1e-6 && region.right() <= 0.9 + 1e-6);
+            assert!(region.top() >= 0.1 - 1e-6 && region.bottom() <= 0.9 + 1e-6);
         }
     }
 
     #[test]
-    fn global_extents_span_one_world_at_the_minimum_zoom_and_overflow_the_mercator_caps() {
+    fn global_extents_fit_inside_the_preview_frame() {
         let preview = ExtentMap::new([-180., -90., 180., 90.]);
         let region = relative_region(preview.extent.unwrap(), preview.viewport);
-        assert!((region.size.width - 512. / 640.).abs() < 1e-6, "One world is 512 logical pixels at zoom zero");
+        assert!(
+            (region.size.width - 0.4).abs() < 1e-6,
+            "A full-height world occupies 40% of the 2:1 frame width"
+        );
         assert!((region.center().x - 0.5).abs() < 1e-6 && (region.center().y - 0.5).abs() < 1e-6);
-        assert!(region.top() < 0. && region.bottom() > 1., "The 2:1 frame cannot show the full Mercator height");
+        assert!(region.size.width <= 0.8 + 1e-6 && region.size.height <= 0.8 + 1e-6);
+        assert!(region.left() >= 0.1 - 1e-6 && region.right() <= 0.9 + 1e-6);
+        assert!(
+            region.top() >= 0.1 - 1e-6 && region.bottom() <= 0.9 + 1e-6,
+            "Both latitude edges must remain visible: {region:?}"
+        );
     }
 
     #[test]
@@ -345,19 +360,46 @@ mod tests {
             assert!((extent.size.width - 20. / 360.).abs() < 1e-6);
             let region = relative_region(extent, ExtentMap::new(bounds).viewport);
             assert!((region.center().x - 0.5).abs() < 1e-6, "Dateline extent misplaced for {bounds:?}");
-            assert!((region.size.height - 0.85).abs() < 1e-6);
+            assert!((region.size.height - 0.8).abs() < 1e-6);
         }
     }
 
     #[test]
-    fn basemap_requests_use_the_fixed_preview_viewport_and_the_fitted_camera() {
+    fn local_basemap_requests_use_the_preview_viewport_and_the_fitted_camera() {
         let request = ExtentMap::new([112., -44., 154., -10.]).basemap_request(2.).unwrap();
         assert_eq!(
             (request.viewport.width.get(), request.viewport.height.get(), request.viewport.scale),
             (640, 320, 2.)
         );
-        assert_eq!(request.camera, MapCamera::fit_bounds([112., -44., 154., -10.], 640., 320.));
+        assert_eq!(request.camera, MapCamera::fit_bounds_for_extent_preview([112., -44., 154., -10.], 640., 320.));
         assert!(ExtentMap::new([f64::NAN, 0., 1., 1.]).basemap_request(1.).is_none());
+    }
+
+    #[test]
+    fn native_render_requests_preserve_the_preview_world_viewport() {
+        for bounds in [
+            [-180., -85.140412, 180., 85.051129],
+            [-180., 70., 180., 90.],
+            [-180., -90., 180., -70.],
+            [112., -44., 154., -10.],
+        ] {
+            let preview = ExtentMap::new(bounds);
+            let request = preview.basemap_request(2.).unwrap();
+            let actual = request
+                .camera
+                .visible_region(f64::from(request.viewport.width.get()), f64::from(request.viewport.height.get()));
+            let expected = [
+                preview.viewport.left(),
+                preview.viewport.top(),
+                preview.viewport.right(),
+                preview.viewport.bottom(),
+            ];
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-12, "Native viewport differs from overlay for {bounds:?}");
+            }
+        }
+        let global = ExtentMap::new([-180., -90., 180., 90.]).basemap_request(1.).unwrap();
+        assert_eq!((global.viewport.width.get(), global.viewport.height.get()), (1280, 640));
     }
 
     #[test]

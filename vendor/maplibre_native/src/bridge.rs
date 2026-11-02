@@ -955,6 +955,21 @@ pub mod ffi {
     #[namespace = "mln"]
     #[repr(u32)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// Limits which parts of the world the camera can show.
+    pub enum ConstrainMode {
+        /// Allow off-world space around the map.
+        None,
+        /// Prevent off-world space on the vertical axis (the native default).
+        HeightOnly,
+        /// Prevent off-world space on both axes.
+        WidthAndHeight,
+        /// Constrain the visible screen to configured geographic bounds.
+        Screen,
+    }
+
+    #[namespace = "mln"]
+    #[repr(u32)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     /// Debug visualization options for map rendering.
     pub enum MapDebugOptions {
         /// No debug visualization.
@@ -1100,6 +1115,7 @@ pub mod ffi {
         include!("mln/map/mode.hpp");
 
         type MapMode;
+        type ConstrainMode;
         type MapDebugOptions;
         // The name must be unique but for some reason this is required
         /// Resource configuration options.
@@ -1243,6 +1259,8 @@ pub mod ffi {
         fn takeImage(self: Pin<&mut RenderRequest>) -> UniquePtr<CxxString>;
         /// Sets debug visualization flags.
         fn setDebugFlags(self: Pin<&mut MapRenderer>, flags: MapDebugOptions);
+        /// Sets the camera's world-edge constraints.
+        fn setConstrainMode(self: Pin<&mut MapRenderer>, mode: ConstrainMode);
         /// Jumps to the requested camera options.
         fn jumpTo(self: Pin<&mut MapRenderer>, camera: &FfiCameraOptions);
         /// Moves the camera by the given delta.

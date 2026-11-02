@@ -77,7 +77,7 @@ fn progress_phases_remain_visible_until_a_matching_settled_frame_is_applied(cx: 
         window.render_frame(cx);
         assert_eq!(window.find("vector-load-progress").label(), Some("Converting vectors · 42%"));
         assert_eq!(window.find("vector-load-status").label(), Some("Converting vectors · 42%"));
-        assert!(window.find("vector-load-status").bounds().right() <= window.find("open-settings").bounds().left());
+        assert!(window.find("vector-load-status").bounds().right() <= window.find("fit-dataset-extent").bounds().left());
     })
     .unwrap();
     load.report_preparing();
@@ -147,24 +147,26 @@ fn progress_status_shares_narrow_header_space_without_hiding_actions(cx: &mut Te
             let title = window.find("title-bar").bounds();
             let band = window.find("raster-band").bounds();
             let status = window.find("vector-load-status");
-            let debug = window.find("toggle-tile-boundaries").bounds();
-            let settings = window.find("open-settings").bounds();
+            let background = window.find("background-layer").bounds();
+            let fit = window.find("fit-dataset-extent").bounds();
+            let properties = window.find("open-dataset-properties").bounds();
             assert!(status.visible() && status.bounds().size.width > px(0.0));
             assert!(band.right() <= status.bounds().left());
             assert!(
-                status.bounds().right() <= debug.left(),
+                status.bounds().right() <= background.left(),
                 "Progress cannot overlap header actions at font size {font_size}"
             );
             assert!(
-                debug.right() <= settings.left() && settings.right() <= title.right(),
-                "Header actions must fit at font size {font_size}: title={title:?}, band={band:?}, status={:?}, debug={debug:?}, settings={settings:?}",
+                background.right() <= fit.left() && fit.right() <= properties.left() && properties.right() <= title.right(),
+                "Header actions must fit at font size {font_size}: title={title:?}, band={band:?}, status={:?}, background={background:?}, fit={fit:?}, properties={properties:?}",
                 status.bounds()
             );
             let controls = window.find("window-controls").bounds();
             if controls.size.width > px(0.0) {
-                assert!(settings.right() <= controls.left() && controls.right() <= title.right());
+                assert!(properties.right() <= controls.left() && controls.right() <= title.right());
             }
-            window.click("toggle-tile-boundaries", cx);
+            assert!(window.try_find("toggle-tile-boundaries").is_none());
+            assert!(window.try_find("open-settings").is_none());
             assert!(window.find("vector-load-progress").visible());
         })
         .unwrap();

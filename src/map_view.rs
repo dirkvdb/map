@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::menu::DropdownMenu;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
-use gpui_kit::component::{ActiveTheme, Disableable, IndexPath, Selectable, Sizable, Theme, TitleBar, alert::Alert};
+use gpui_kit::component::{ActiveTheme, Disableable, IndexPath, Sizable, Theme, TitleBar, alert::Alert};
 use gpui_kit::{
     Anchor, App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, Entity, ExternalPaths, FocusHandle, HoverListenerMode, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta,
@@ -862,6 +863,39 @@ impl MapView {
         alerts
     }
 
+    fn render_app_menu(&self) -> impl IntoElement {
+        let has_dataset = self.raster.is_some() || self.vector.is_some();
+        let can_fit = self.source_bounds().is_some();
+        let tile_boundaries = self.tile_boundaries;
+
+        Button::new("application-menu")
+            .small()
+            .ghost()
+            .icon(IconName::Menu)
+            .accessibility_label("Application menu")
+            .tooltip("Application menu")
+            .dropdown_menu(move |menu, window, cx| {
+                menu.submenu("File", window, cx, move |menu, _, _| {
+                    menu.menu("Open Dataset…", Box::new(OpenDataset))
+                        .menu("Open Recent File…", Box::new(crate::recent_files_picker::OpenRecentFiles))
+                        .menu_with_disabled("Clear Datasets", Box::new(ClearRasters), !has_dataset)
+                        .menu("Dataset Properties…", Box::new(crate::dataset_properties::OpenDatasetProperties))
+                })
+                .submenu("View", window, cx, move |menu, _, _| {
+                    menu.menu_with_disabled("Fit Dataset Extent", Box::new(FitRaster), !can_fit)
+                        .menu("Toggle Raster Controls", Box::new(ToggleRasterControls))
+                        .menu_with_check("Debug Mode", tile_boundaries, Box::new(ToggleTileBoundaries))
+                        .menu("Application Logs", Box::new(crate::log_output::ToggleLogs))
+                })
+                .menu("Settings…", Box::new(crate::settings::OpenSettings))
+                .submenu("Help", window, cx, |menu, _, _| {
+                    menu.menu("Keyboard Shortcuts", Box::new(crate::shortcuts::ShowShortcuts))
+                })
+                .separator()
+                .menu("Quit", Box::new(crate::Quit))
+            })
+    }
+
     fn render_title_sources(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -935,17 +969,6 @@ impl MapView {
                     ),
             )
             .child(
-                Button::new("toggle-tile-boundaries")
-                    .small()
-                    .ghost()
-                    .icon(IconName::Bug)
-                    .accessibility_label("Debug mode")
-                    .tooltip_with_action("Debug mode: tile boundaries, tile IDs, and FPS", &ToggleTileBoundaries, Some("RasterWorkspace"))
-                    .selected(self.tile_boundaries)
-                    .toggled(self.tile_boundaries)
-                    .on_click(cx.listener(|view, _, _, cx| view.toggle_tile_boundaries(cx))),
-            )
-            .child(
                 Button::new("fit-dataset-extent")
                     .small()
                     .ghost()
@@ -968,15 +991,6 @@ impl MapView {
                     )
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::dataset_properties::OpenDatasetProperties), cx)),
             )
-            .child(
-                Button::new("open-settings")
-                    .small()
-                    .ghost()
-                    .icon(IconName::Settings)
-                    .accessibility_label("Settings")
-                    .tooltip_with_action("Settings…", &crate::settings::OpenSettings, Some("RasterWorkspace"))
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::settings::OpenSettings), cx)),
-            )
     }
 
     fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -989,6 +1003,13 @@ impl MapView {
                 // Let the shared row shrink within TitleBar's native controls,
                 // rather than sizing its non-shrinking content lane intrinsically.
                 .w_0()
+                .child(
+                    div()
+                        .id("application-menu-container")
+                        .mr_2()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(self.render_app_menu()),
+                )
                 .child(self.render_title_sources(window, cx))
                 .child(self.render_title_actions(window, cx)),
         )
@@ -1113,7 +1134,7 @@ mod vector_timing_tests;
 
 #[cfg(test)]
 mod tests {
-    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use gpui_kit::{AppContext, InputEvent as _, TestAppContext, point, px, size};
 
     use super::*;
@@ -1166,7 +1187,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn title_bar_extent_info_and_settings_buttons_follow_the_requested_order(cx: &mut TestAppContext) {
+    fn title_bar_extent_and_properties_buttons_follow_the_requested_order(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             init(cx).unwrap();
@@ -1181,7 +1202,6 @@ mod tests {
             assert_eq!(fit.label(), Some("Fit dataset extent"));
             assert_eq!(fit.disabled(), Some(true));
             assert!(fit.bounds().right() < button.bounds().left());
-            assert!(button.bounds().right() < window.find("open-settings").bounds().left());
             assert!(window.try_find("dataset-properties").is_none());
             window.click("open-dataset-properties", cx);
         })
@@ -1192,6 +1212,92 @@ mod tests {
             assert!(window.find("dataset-properties").visible());
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn application_menu_separates_actions_into_named_menus(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx).unwrap();
+            cx.set_reduce_motion(true);
+        });
+        let (_view, handle) = open_test_map(size(px(800.), px(600.)), cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("application-menu").label(), Some("Application menu"));
+            assert!(window.find("application-menu").bounds().right() < window.find("open-raster").bounds().left());
+            window.click("application-menu", cx);
+
+            let mut menu = window.within("popup-menu");
+            for (index, label) in [(0, "File"), (1, "View"), (2, "Settings…"), (3, "Help"), (5, "Quit")] {
+                assert_eq!(menu.find(index).label(), Some(label));
+            }
+            menu.hover(1usize, cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(1), |window, _| window.try_find("submenu").is_some())
+            .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(window.within("submenu").find(3usize).label(), Some("Application Logs"));
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(1), |window, _| window.try_find("popup-menu").is_none())
+            .await;
+        cx.update_window(handle.into(), |_, window, _| {
+            assert_eq!(window.find("map-surface").focused(), Some(true));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn application_menu_opens_settings_from_the_top_level(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::appearance::setup_test(None, cx);
+            init(cx).unwrap();
+            cx.set_reduce_motion(true);
+        });
+        let (_view, handle) = open_test_map(size(px(800.), px(600.)), cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("application-menu", cx);
+            assert_eq!(window.within("popup-menu").find(2usize).label(), Some("Settings…"));
+            window.within("popup-menu").click(2usize, cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(1), |window, _| {
+            window.try_find("appearance-settings").is_some()
+        })
+        .await;
+    }
+
+    #[gpui_kit::test]
+    async fn application_menu_dispatches_dataset_properties(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx).unwrap();
+            cx.set_reduce_motion(true);
+        });
+        let (_view, handle) = open_test_map(size(px(800.), px(600.)), cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("application-menu", cx);
+            window.within("popup-menu").hover(0usize, cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(1), |window, _| window.try_find("submenu").is_some())
+            .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            let mut submenu = window.within("submenu");
+            assert_eq!(submenu.find(3usize).label(), Some("Dataset Properties…"));
+            submenu.click(3usize, cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(1), |window, _| {
+            window.try_find("dataset-properties").is_some()
+        })
+        .await;
     }
 
     #[gpui_kit::test]
@@ -2047,8 +2153,6 @@ mod tests {
         let view = view.unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert_eq!(window.find("open-settings").label(), Some("Settings"));
-            assert!(window.find("open-settings").visible());
             window.press("secondary-,", cx);
         })
         .unwrap();
@@ -2312,7 +2416,7 @@ mod tests {
                 width
             })
             .unwrap();
-        check_capped_selector_actions(&view, wide_capped_width, handle.into(), cx);
+        check_capped_selector_actions(wide_capped_width, handle.into(), cx);
     }
 
     #[gpui_kit::test]
@@ -4608,7 +4712,7 @@ mod tests {
         .unwrap();
     }
 
-    fn check_capped_selector_actions(view: &Entity<MapView>, wide_capped_width: Pixels, handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
+    fn check_capped_selector_actions(wide_capped_width: Pixels, handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
         cx.simulate_window_resize(handle, size(px(640.), px(400.)));
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
@@ -4616,27 +4720,21 @@ mod tests {
             let title_bar = window.find("title-bar").bounds();
             let band = window.find("raster-band").bounds();
             let open = window.find("open-raster").bounds();
-            let debug = window.find("toggle-tile-boundaries").bounds();
             let background = window.find("background-layer").bounds();
-            let settings = window.find("open-settings").bounds();
+            let fit = window.find("fit-dataset-extent").bounds();
+            let properties = window.find("open-dataset-properties").bounds();
             assert!(band.size.width < wide_capped_width && band.size.width <= title_bar.size.width * 0.5);
             assert!(open.right() <= band.left() && band.right() < background.left());
-            assert!(background.right() <= debug.left());
-            assert!(debug.right() <= settings.left() && settings.right() <= title_bar.right());
+            assert!(background.right() <= fit.left());
+            assert!(fit.right() <= properties.left() && properties.right() <= title_bar.right());
             let controls = window.find("window-controls").bounds();
             if controls.size.width > px(0.) {
-                assert!(settings.right() <= controls.left() && controls.right() <= title_bar.right());
+                assert!(properties.right() <= controls.left() && controls.right() <= title_bar.right());
             }
-            assert!(window.find("open-raster").visible() && window.find("open-settings").visible());
-            window.click("toggle-tile-boundaries", cx);
-            assert!(view.read(cx).tile_boundaries, "The trailing action must remain clickable after capping");
-            window.click("open-settings", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
-            assert!(window.find("appearance-settings").visible(), "Settings must remain clickable after capping");
+            assert!(window.find("application-menu").visible() && window.find("open-raster").visible());
+            assert!(window.find("fit-dataset-extent").visible() && window.find("open-dataset-properties").visible());
+            assert!(window.try_find("toggle-tile-boundaries").is_none());
+            assert!(window.try_find("open-settings").is_none());
         })
         .unwrap();
     }

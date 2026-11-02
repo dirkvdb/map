@@ -50,6 +50,7 @@ impl Fixture {
     fn render_request(&self, command: PlaybackRequest) -> RenderRequest {
         RenderRequest {
             map: self.map_request(),
+            unconstrained_camera: false,
             raster: Some(self.bands[0].clone()),
             playback: Some(command),
             vector: None,

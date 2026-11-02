@@ -315,6 +315,10 @@ public:
         map->setDebug(debugFlags);
     }
 
+    void setConstrainMode(mln::ConstrainMode mode) {
+        map->setConstrainMode(mode);
+    }
+
     void jumpTo(const FfiCameraOptions& cameraOptions);
 
     void moveBy(const mln::ScreenCoordinate& delta) {

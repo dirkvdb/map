@@ -208,6 +208,7 @@ impl RasterSource {
 
     /// Changes extrusion averaging without altering raw metadata or numeric tile identity.
     /// The setting is retained while extrusion is disabled.
+    #[cfg(test)]
     pub fn with_extrusion_averaging(&self, enabled: bool) -> Result<Arc<Self>> {
         Self::styled(
             self.metadata.clone(),

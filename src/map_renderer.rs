@@ -8,8 +8,8 @@ use anyhow::{Context as _, Result, ensure};
 use gpui_kit::RenderImage;
 use image::RgbaImage;
 use maplibre_native::{
-    AnyLayer, AnySource, Continuous, GeoJson, GeoJsonSource, ImageRenderer, ImageRendererBuilder, MapDebugOptions, RunLoopHandle, ScreenCoordinate, Size,
-    WgpuCustomLayer, WgpuLayerParameters,
+    AnyLayer, AnySource, ConstrainMode, Continuous, GeoJson, GeoJsonSource, ImageRenderer, ImageRendererBuilder, MapDebugOptions, RunLoopHandle,
+    ScreenCoordinate, Size, WgpuCustomLayer, WgpuLayerParameters,
 };
 
 pub use crate::background::BasemapStyle;
@@ -57,6 +57,7 @@ pub enum MapSource {
 #[derive(Clone)]
 struct RenderRequest {
     map: MapRequest,
+    unconstrained_camera: bool,
     raster: Option<Arc<RasterSource>>,
     playback: Option<PlaybackRequest>,
     vector: Option<Arc<VectorSource>>,
@@ -117,11 +118,18 @@ pub struct MapRenderer {
     queries: async_channel::Sender<Option<FeatureQuery>>,
     pending_query: async_channel::Receiver<Option<FeatureQuery>>,
     feature_results: async_channel::Receiver<FeatureQueryResult>,
+    unconstrained_camera: bool,
 }
 
 impl MapRenderer {
     pub fn new() -> Result<Self> {
         Self::start_worker(None)
+    }
+
+    /// Static extent previews need off-world margins and must retain their fitted center.
+    pub(crate) fn with_unconstrained_camera(mut self) -> Self {
+        self.unconstrained_camera = true;
+        self
     }
 
     /// Uses the normal worker with local style JSON, including after DPI changes.
@@ -166,6 +174,7 @@ impl MapRenderer {
             queries,
             pending_query,
             feature_results,
+            unconstrained_camera: false,
         })
     }
 
@@ -189,6 +198,7 @@ impl MapRenderer {
             .context("Map rendering thread stopped")?
             .send(RenderRequest {
                 map,
+                unconstrained_camera: self.unconstrained_camera,
                 raster,
                 playback,
                 vector,
@@ -520,6 +530,7 @@ struct NativeMap {
     basemap: BasemapStyle,
     viewport: Viewport,
     camera: Option<MapCamera>,
+    unconstrained_camera: bool,
     device: wgpu::Device,
     queue: wgpu::Queue,
     idle: Rc<Cell<bool>>,
@@ -593,6 +604,7 @@ impl NativeMap {
             basemap,
             viewport,
             camera: None,
+            unconstrained_camera: false,
             readback: GpuReadback::new(&device),
             device,
             queue,
@@ -657,6 +669,7 @@ impl NativeMap {
             numeric.set_debug(request.tile_boundaries);
         }
         self.set_basemap(request.basemap)?;
+        self.set_unconstrained_camera(request.unconstrained_camera);
         self.renderer.set_debug_flags(if request.tile_boundaries {
             MapDebugOptions::TileBorders
         } else {
@@ -900,6 +913,16 @@ impl NativeMap {
             }
         }
         latest.context("MapLibre did not produce a wgpu texture")
+    }
+
+    fn set_unconstrained_camera(&mut self, unconstrained: bool) {
+        if self.unconstrained_camera == unconstrained {
+            return;
+        }
+        self.renderer
+            .set_constrain_mode(if unconstrained { ConstrainMode::None } else { ConstrainMode::HeightOnly });
+        self.unconstrained_camera = unconstrained;
+        self.camera = None;
     }
 
     fn apply_request(&mut self, request: MapRequest) {
@@ -1277,6 +1300,7 @@ mod tests {
             queries,
             pending_query,
             feature_results,
+            unconstrained_camera: false,
         };
         let map = MapRequest {
             viewport: Viewport {
