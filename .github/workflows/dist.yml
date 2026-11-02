@@ -26,10 +26,6 @@ jobs:
 
       - name: Install Nix
         uses: cachix/install-nix-action@v31
-        with:
-          extra_nix_config: |
-            extra-substituters = https://geo-overlay.cachix.org
-            extra-trusted-public-keys = geo-overlay.cachix.org-1:12l/BhbUaHEG9AacDyJnQd8z96djJu0ESRuizUOs758=
 
       - name: Configure Nix binary caches (read only)
         uses: cachix/cachix-action@v17
@@ -79,10 +75,6 @@ jobs:
 
       - name: Install Nix
         uses: cachix/install-nix-action@v31
-        with:
-          extra_nix_config: |
-            extra-substituters = https://geo-overlay.cachix.org
-            extra-trusted-public-keys = geo-overlay.cachix.org-1:12l/BhbUaHEG9AacDyJnQd8z96djJu0ESRuizUOs758=
 
       - name: Configure Nix binary caches (read only)
         uses: cachix/cachix-action@v17
@@ -142,10 +134,6 @@ jobs:
 
       - name: Install Nix
         uses: cachix/install-nix-action@v31
-        with:
-          extra_nix_config: |
-            extra-substituters = https://geo-overlay.cachix.org
-            extra-trusted-public-keys = geo-overlay.cachix.org-1:12l/BhbUaHEG9AacDyJnQd8z96djJu0ESRuizUOs758=
 
       - name: Configure Nix binary caches (read only)
         uses: cachix/cachix-action@v17
