@@ -6,11 +6,9 @@
       url = "https://github.com/VITObelgium/infra-rs/archive/refs/heads/main.tar.gz";
       flake = false;
     };
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-    pkgs-mod = {
-      url = "github:VITO-RMA/nix-pkgs/main";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+
+    pkgs-mod.url = "github:VITO-RMA/nix-pkgs/main";
+    nixpkgs.follows = "pkgs-mod/nixpkgs";
 
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
