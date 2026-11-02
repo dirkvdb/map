@@ -95,10 +95,6 @@ in
     ];
 
   env = {
-    NIX_CONFIG = ''
-      max-jobs = auto
-      cores = 0
-    '';
     RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
     MLN_NATIVE_BUILD = "${maplibreNative}";
     MLN_STATIC_DEPS = "1";
@@ -165,6 +161,11 @@ in
   };
 
   enterShell = ''
+    NIX_CONFIG="$NIX_CONFIG
+    max-jobs = auto
+    cores = 0"
+    export NIX_CONFIG
+
     skill_dir="$DEVENV_ROOT/.agents/skills/rust-best-practices"
 
     ${pkgs.coreutils}/bin/mkdir -p "$DEVENV_ROOT/.agents/skills"
