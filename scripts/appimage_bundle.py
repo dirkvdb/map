@@ -219,9 +219,12 @@ def build_appimage(binary: Path, config: dict, root: Path, env: dict) -> Path:
             raise ValueError(f"Missing absolute executable tool path: {name}={tools[name]}")
     clean = {**tool_environment(env), "ARCH": arch}
     check_elf(read_elf(binary, tools, root, clean), binary, relocated=False, arch=arch)
-    collector_env = {**clean, "LD_LIBRARY_PATH": os.pathsep.join(
-        runtime_library_dirs(config["runtimeClosure"])
-    )}
+    # The closure retains build tools too. Prefer target libraries over native
+    # libraries with the same SONAME (notably libffi on AArch64).
+    collector_env = {**clean, "LD_LIBRARY_PATH": os.pathsep.join(dict.fromkeys([
+        *filter(None, config["libraryPath"].split(os.pathsep)),
+        *runtime_library_dirs(config["runtimeClosure"]),
+    ]))}
     appdir = root / "dist/build/appimage/Map.AppDir"
     output = root / f"dist/build/devenv/release/bundle/appimage/Map-{arch}.AppImage"
     icon = prepare_appdir(appdir, output, config, root, clean)
@@ -244,8 +247,10 @@ def build_appimage(binary: Path, config: dict, root: Path, env: dict) -> Path:
         raise ValueError(f"AppDir root must have mode 755: {appdir}")
     # This is Nix's wrapType2 entry point, not a raw AppImage: no FUSE or
     # --appimage-extract-and-run bootstrap is needed here.
+    # AppImageKit 12 recognizes ARM64 only under its legacy architecture name.
+    image_arch = {"x86_64": "x86_64", "aarch64": "arm_aarch64"}[arch]
     run([tools["appimagetool"], "--runtime-file", config["runtime"], appdir, output],
-        root, clean, timeout=600)
+        root, {**clean, "ARCH": image_arch}, timeout=600)
     output.chmod(0o755)
     if stat.S_IMODE(output.stat().st_mode) != 0o755:
         raise ValueError(f"AppImage must have mode 755: {output}")

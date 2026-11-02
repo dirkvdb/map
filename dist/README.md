@@ -39,6 +39,9 @@ and rendering have not yet been validated.
 macOS CI retains sccache. AppImage builds explicitly disable Rust compiler
 wrappers and C/C++ compiler launchers; they do not use sccache. Nix binary-cache
 substitution and ordinary incremental Cargo/Ninja builds remain available.
+On AArch64, the target-linker adapter removes rustc's
+`--fix-cortex-a53-843419` option because Zig's driver rejects it; these builds do
+not apply that Cortex-A53 erratum workaround. Native host linking is unchanged.
 
 ## Local macOS build
 

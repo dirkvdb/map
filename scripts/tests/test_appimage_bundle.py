@@ -357,6 +357,7 @@ class PackagingTests(unittest.TestCase):
         config = {"arch": arch, "glibc": "2.28", "tools": tools, "caBundle": str(ca),
                   "xkbData": str(self.root / "xkb"), "composeData": str(self.root / "compose"),
                   "runtimeClosure": "unused", "runtime": "/portable/runtime",
+                  "libraryPath": "/portable target/lib::/portable/lib",
                   "runtimeLibraries": ["/portable/lib/libui.so.1", "/portable/lib/libEGL.so.1"]}
         calls = []
         def run(command, root, env, timeout=60):
@@ -373,7 +374,7 @@ class PackagingTests(unittest.TestCase):
             return ""
         env = {"PATH": os.defpath, "RUSTC_WRAPPER": "sccache", "SCCACHE_DIR": "/cache",
                "ARCH": "aarch64" if arch == "x86_64" else "x86_64"}
-        with patch.object(packaging, "runtime_library_dirs", return_value=["/portable/lib"]), \
+        with patch.object(packaging, "runtime_library_dirs", return_value=["/native/lib", "/portable/lib"]), \
              patch.object(packaging, "run", side_effect=run), \
              patch.object(packaging, "read_elf", return_value=elf_info(arch=arch)):
             output = packaging.build_appimage(self.binary, config, self.root, env)
@@ -391,7 +392,8 @@ class PackagingTests(unittest.TestCase):
             self.assertTrue((appdir / destination).is_file())
         self.assertFalse((appdir / "usr/share/gdal").exists())
         collector, collector_env, timeout = next(call for call in calls if call[0][0] == tools["linuxdeploy"])
-        self.assertEqual(collector_env["LD_LIBRARY_PATH"], "/portable/lib")
+        self.assertEqual(collector_env["LD_LIBRARY_PATH"],
+                         "/portable target/lib:/portable/lib:/native/lib")
         self.assertEqual(timeout, 600)
         self.assertEqual([collector[index + 1] for index, value in enumerate(collector) if value == "--library"],
                          config["runtimeLibraries"])
@@ -419,7 +421,10 @@ class PackagingTests(unittest.TestCase):
 
     def check_tool_environments(self, calls, tools, arch):
         for command, tool_env, timeout in calls:
-            self.assertEqual(tool_env["ARCH"], arch)
+            expected_arch = arch
+            if command[0] == tools["appimagetool"]:
+                expected_arch = {"x86_64": "x86_64", "aarch64": "arm_aarch64"}[arch]
+            self.assertEqual(tool_env["ARCH"], expected_arch)
             self.assertNotIn("SCCACHE_DIR", tool_env)
             self.assertNotIn("RUSTC_WRAPPER", tool_env)
             if command[0] != tools["linuxdeploy"]:
