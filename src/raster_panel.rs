@@ -3334,6 +3334,14 @@ mod tests {
             assert_eq!(panel.read(cx).extrusion_height.read(cx).value().end(), height);
             window.click("raster-extrude-pixels", cx);
             assert_eq!(panel.read(cx).extrusion(), (false, height));
+            window.click("raster-min", cx);
+            for _ in 0..20 {
+                if window.find("raster-extrude-pixels").focused() == Some(true) {
+                    break;
+                }
+                window.press("tab", cx);
+            }
+            assert_eq!(window.find("raster-extrude-pixels").focused(), Some(true));
             window.press("space", cx);
             assert_eq!(panel.read(cx).extrusion(), (true, height));
         })
@@ -3444,8 +3452,9 @@ mod tests {
             assert!(window.try_find("raster-extrusion-height").is_none());
             window.click("raster-extrude-pixels", cx);
             window.render_frame(cx);
+            window.scroll("raster-extrude-pixels", ScrollDelta::Lines(point(0.0, -30.0)), cx);
             assert!(window.find("raster-extrusion-height").visible());
-            window.scroll("raster-range-card", ScrollDelta::Lines(point(0.0, 5.0)), cx);
+            window.scroll("raster-extrusion-height", ScrollDelta::Lines(point(0.0, 5.0)), cx);
             assert!(window.find("raster-max").visible());
         })
         .unwrap();

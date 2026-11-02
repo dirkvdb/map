@@ -2892,13 +2892,13 @@ mod tests {
     fn assert_right_band_pane_layout(window: &Window) {
         let layers = window.find("raster-layers-card").bounds();
         let range = window.find("raster-range-card").bounds();
-        let visualization = window.find("raster-visualization-card").bounds();
+        assert!(window.try_find("raster-visualization-card").is_none());
         let card = window.find("raster-band-controls").bounds();
         let controls = window.find("raster-controls").bounds();
         let map = window.find("map-surface").bounds();
         let gap = window.rem_size() * 0.75;
         // Layout order is meaningful even when upper cards have scrolled out of view.
-        for (above, below) in [(layers, range), (range, visualization), (visualization, card)] {
+        for (above, below) in [(layers, range), (range, card)] {
             assert!(
                 (below.top() - above.bottom() - gap).abs() <= px(1.0),
                 "Peer panes must share gap_3: {above:?}, {below:?}"
@@ -2971,16 +2971,17 @@ mod tests {
     fn check_band_card_scroll(window: &mut Window, cx: &mut App) {
         let layers = window.find("raster-layers-card").bounds();
         let card = window.find("raster-band-controls").bounds();
-        let visualization = window.find("raster-visualization-card").bounds();
-        assert!(
-            layers.top() < window.find("raster-controls").bounds().top(),
-            "The expanded pane must require scrolling"
-        );
+        let range = window.find("raster-range-card").bounds();
+        let overflows = layers.top() < window.find("raster-controls").bounds().top();
         window.scroll("raster-band-controls", ScrollDelta::Lines(point(0.0, 1.0)), cx);
         let shift = window.find("raster-band-controls").bounds().top() - card.top();
-        assert!(shift > px(0.0), "Wheel input over the band card must scroll the shared panel");
+        if overflows {
+            assert!(shift > px(0.0), "Wheel input over the band card must scroll the shared panel");
+        } else {
+            assert_eq!(shift, px(0.0), "A pane that fits must not scroll");
+        }
         assert!((window.find("raster-layers-card").bounds().top() - layers.top() - shift).abs() <= px(1.0));
-        assert!((window.find("raster-visualization-card").bounds().top() - visualization.top() - shift).abs() <= px(1.0));
+        assert!((window.find("raster-range-card").bounds().top() - range.top() - shift).abs() <= px(1.0));
         // Restore the bottom before dragging or clicking, including in the short window.
         reveal_right_band_controls(window, cx);
         assert_right_band_controls_contained(window);
