@@ -89,7 +89,11 @@ stdenv.mkDerivation {
     libuvPkgConfig
   ]
   ++ lib.optionals platform.isLinux [ pkgs.libglvnd ]
-  ++ lib.optionals platform.isDarwin [ pkgs.apple-sdk_15 ];
+  ++ lib.optionals platform.isDarwin [
+    pkgs.apple-sdk_15
+    # Upstream rejects Nix's default macOS 14.0 deployment target.
+    (pkgs.darwinMinVersionHook "14.3")
+  ];
   # Match the existing source build: generate the native wrapper from its
   # vendored header. Do not set MLN_WEBGPU_IMPL_FFI_BUNDLED_WEBGPU_HEADER (even
   # OFF selects the external header); native wgpu.h has an older extension API.
