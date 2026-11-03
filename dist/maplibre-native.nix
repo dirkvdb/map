@@ -8,7 +8,7 @@ let
   source = pkgs.fetchgit {
     url = "https://github.com/maplibre/maplibre-native.git";
     rev = revision;
-    hash = "sha256-YwsjItM8ZcV4oD+CD7KkxbFNq7yDra6f1pbZks38yf0=";
+    hash = "sha256-cnYXK/95yP2jYd/ECQGlsd1i0mZ/FmwlebPIqw56OaE=";
     fetchSubmodules = true;
   };
   webgpuHeader = pkgs.fetchurl {
