@@ -33,8 +33,8 @@ use gpui_kit::{App, AppContext, Bounds, QuitMode, Window, WindowBounds, WindowOp
 gpui_kit::actions!(app, [Quit]);
 
 // env_logger matches target prefixes, so exclude third-party crates whose
-// names start with an allowed crate name (notably maplibre_native and geojson).
-const DEFAULT_LOG_FILTER: &str = "off,map=info,geo=ingo,inf=warn,tiler=warn,maplibre_native=warn,geo_types=off,geojson=off,geos=off";
+// names start with an allowed crate name (notably geo_types, geojson and geos).
+const DEFAULT_LOG_FILTER: &str = "off,map=info,geo=info,inf=warn,tiler=warn,maplibre_native=warn,geo_types=off,geojson=off,geos=off";
 
 fn main() {
     logging_builder()
@@ -117,26 +117,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn console_logging_defaults_to_map_and_infra_warnings_and_errors() {
+    fn console_logging_defaults_to_info_for_map_and_geo_and_warn_for_infra_and_maplibre() {
         let logger = logging_builder().parse_filters(DEFAULT_LOG_FILTER).build();
-        for target in [
-            "map",
-            "map::map_renderer",
-            "map::vector_load",
-            "geo",
-            "geo::gdalinterop",
-            "inf",
-            "tiler::tileio",
+        for (target, max_level) in [
+            ("map", Level::Info),
+            ("map::map_renderer", Level::Info),
+            ("map::vector_load", Level::Info),
+            ("geo", Level::Info),
+            ("geo::gdalinterop", Level::Info),
+            ("inf", Level::Warn),
+            ("tiler::tileio", Level::Warn),
+            ("maplibre_native", Level::Warn),
+            ("maplibre_native::bridge", Level::Warn),
         ] {
-            for (level, enabled) in [
-                (Level::Error, true),
-                (Level::Warn, true),
-                (Level::Info, false),
-                (Level::Debug, false),
-                (Level::Trace, false),
-            ] {
+            for level in [Level::Error, Level::Warn, Level::Info, Level::Debug, Level::Trace] {
                 let metadata = log::Metadata::builder().target(target).level(level).build();
-                assert_eq!(logger.enabled(&metadata), enabled, "Unexpected default for {target} at {level}");
+                assert_eq!(logger.enabled(&metadata), level <= max_level, "Unexpected default for {target} at {level}");
             }
         }
     }
@@ -145,7 +141,6 @@ mod tests {
     fn console_logging_silences_other_crates_by_default_including_prefix_collisions() {
         let logger = logging_builder().parse_filters(DEFAULT_LOG_FILTER).build();
         for target in [
-            "maplibre_native::bridge",
             "geojson",
             "geo_types",
             "geos",
