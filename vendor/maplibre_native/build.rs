@@ -40,7 +40,7 @@ use std::process::Command;
 use std::{env, fs};
 
 const MLN_REPOSITORY_URL: &str = "https://github.com/maplibre/maplibre-native.git";
-const MLN_COMMIT: &str = "android-v2026.10.19-globe";
+const MLN_COMMIT: &str = "android-v2026.11.2-globe";
 
 const BRIDGE_RS: &str = "src/bridge.rs";
 const BRIDGE_CPP_DIR: &str = "src/cpp";

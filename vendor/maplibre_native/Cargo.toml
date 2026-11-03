@@ -43,7 +43,7 @@ repository = "https://github.com/maplibre/maplibre-native-rs"
 
 [package.metadata.mln]
 repo = "maplibre/maplibre-native"
-release = "android-v2026.10.19-globe"
+release = "android-v2026.11.2-globe"
 
 [features]
 default = [
