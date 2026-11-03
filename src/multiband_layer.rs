@@ -34,7 +34,7 @@ use crate::raster_layer::geometry;
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest, PlaybackStyle, validate_bands};
 use crate::raster_projection::ProjectionUniform;
 use crate::raster_source::RasterSource;
-use crate::raster_tiles::{VisibleTile, extrusion_view, tile_matrix, visible_tiles};
+use crate::raster_tiles::{VisibleTile, active_globe, extrusion_view, tile_matrix, visible_tiles};
 use clock::{BandFade, DEFAULT_WINDOW, Endpoints, PlaybackClock, endpoints, next_window, window_range, window_start};
 use tiles::{CachedWindow, MAX_CACHE_ENTRIES, MAX_GRID_BYTES, MAX_JOBS, MAX_VISIBLE_TILES, WindowKey, WindowTexture, WindowWorkers};
 
@@ -76,7 +76,7 @@ struct RetainedFrame {
 }
 
 struct MultibandPipeline {
-    formats: (u32, u32, bool),
+    formats: (u32, u32, bool, bool),
     pipeline: wgpu::RenderPipeline,
     extrusion_pipeline: wgpu::RenderPipeline,
     extrusion_indices: wgpu::Buffer,
@@ -330,7 +330,7 @@ impl MultibandLayer {
         let now = Instant::now();
         let Some(request) = self.extrusion_request(now) else { return };
         let extruded = playback_height(&request) > 0.0;
-        if !extruded || (parameters.depth_format != 0 && !self.needs_compositing(&request)) {
+        if !extruded || (parameters.depth_format != 0 && !active_globe(parameters) && !self.needs_compositing(&request)) {
             self.composite = None;
             self.render_content(pass, parameters, &request, now);
             return;
@@ -604,7 +604,12 @@ impl MultibandLayer {
     }
 
     fn prepare_pipeline(&mut self, parameters: &WgpuLayerParameters) {
-        let formats = (parameters.color_format, parameters.depth_format, parameters.depth_test);
+        let formats = (
+            parameters.color_format,
+            parameters.depth_format,
+            parameters.depth_test,
+            active_globe(parameters),
+        );
         if self.pipeline.as_ref().is_none_or(|pipeline| pipeline.formats != formats) {
             self.draws.clear();
             self.retained = None;
@@ -851,7 +856,7 @@ impl MultibandPipeline {
         self.palette_opaque && opacity >= 1.0 && (blend <= 0.0 || blend >= 1.0)
     }
 
-    fn new(device: &wgpu::Device, formats: (u32, u32, bool)) -> Self {
+    fn new(device: &wgpu::Device, formats: (u32, u32, bool, bool)) -> Self {
         let layout = create_layout(device);
         let pipeline = create_pipeline(device, formats, &layout, false);
         let palette = device.create_texture(&wgpu::TextureDescriptor {
@@ -992,7 +997,7 @@ fn create_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wgpu::BindGroupLayout, extruded: bool) -> wgpu::RenderPipeline {
+fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool, bool), layout: &wgpu::BindGroupLayout, extruded: bool) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Multiband pipeline layout"),
         bind_group_layouts: &[Some(layout)],
@@ -1020,10 +1025,11 @@ fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wg
     } else {
         wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
     };
-    let depth_compare = match (extruded, formats.2) {
-        (true, _) => wgpu::CompareFunction::Less,
-        (false, true) => wgpu::CompareFunction::LessEqual,
-        (false, false) => wgpu::CompareFunction::Always,
+    let depth_compare = match (extruded, formats.3, formats.2) {
+        (true, true, _) => wgpu::CompareFunction::Greater,
+        (true, false, _) => wgpu::CompareFunction::Less,
+        (false, _, true) => wgpu::CompareFunction::LessEqual,
+        (false, _, false) => wgpu::CompareFunction::Always,
     };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(if extruded { "Multiband raster extrusion" } else { "Multiband raster" }),
@@ -1448,7 +1454,7 @@ mod tests {
     fn gpu_interpolates_scaled_values_before_palette_and_fades_single_invalid_pixels() -> Result<()> {
         let (device, queue) = gpu_device()?;
         // WebGPU's WGPUTextureFormat_RGBA8Unorm, as used by the native host.
-        let pipeline = MultibandPipeline::new(&device, (0x16, 0, false));
+        let pipeline = MultibandPipeline::new(&device, (0x16, 0, false, false));
         let cases = [
             (100.0, false, [0, 255, 0, 255, 0, 64, 0, 64, 0, 191, 0, 191, 0, 0, 0, 0]),
             (200.0, true, [41, 41, 41, 255, 26, 26, 26, 64, 40, 40, 40, 191, 0, 0, 0, 0]),

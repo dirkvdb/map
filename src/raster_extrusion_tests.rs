@@ -36,11 +36,68 @@ fn gpu_extrusion_static_opaque_bypass_releases_targets_without_reloading_tiles()
         assert_eq!((layer.requests, layer.uploads, layer.generation, layer.cache_bytes), counts);
         assert_eq!(layer.cache.len(), layer.coverage.len());
     }
-    assert_eq!(layer.pipeline.as_ref().unwrap().formats, (0x16, 0x30, false));
+    assert_eq!(layer.pipeline.as_ref().unwrap().formats, (0x16, 0x30, false, false));
     layer.previous = Some(PreviousRaster { source, cache: HashMap::new() });
     assert!(layer.needs_compositing(), "Opaque palettes can still fade against missing endpoints");
     paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
     assert!(layer.composite.is_some());
+    Ok(())
+}
+
+pub(crate) fn globe_composite_parameters(transition: f64) -> WgpuLayerParameters {
+    let mut parameters = parameters(0.0);
+    parameters.depth_format = 0x30;
+    parameters.globe = true;
+    parameters.projection_transition = transition;
+    // Orthographic sphere centered on (0°, 0°), with positive native surface Z
+    // away from its exact center. LessEqual against cleared depth 0 rejects it.
+    parameters.globe_projection = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0];
+    parameters.globe_clipping_plane = [0.0, 0.0, 1.0, 0.0];
+    parameters.mercator_projection = std::array::from_fn(|index| parameters.projection[index] * if index < 8 { 512.0 } else { 1.0 });
+    parameters
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_globe_composite_preserves_static_flat_while_replacement_loads() -> Result<()> {
+    let (_directory, bands) = crate::raster_source::test_support::cog_fixture(2)?;
+    let flat = bands[0].restyled(ColorMapPreset::Gray, (0.0, 255.0))?;
+    let raised = bands[1].with_extrusion(true, 2.0)?;
+    let (device, queue) = device()?;
+    let mut layer = RasterLayer::new(device.clone(), queue.clone())?;
+    layer.set_source(Some(flat), 1.0, 1);
+    let texture = upload_tile(&device, &queue, sample_tile([2; 2], &[100.0; 4]));
+    layer.cache_bytes = texture.bytes;
+    layer.cache.insert(
+        Tile { z: 0, x: 0, y: 0 },
+        CachedTile {
+            texture: Some(texture),
+            used: 0,
+        },
+    );
+    let parameters = globe_composite_parameters(1.0);
+    let reference = paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+    assert_eq!(reference.get_pixel(28, 28).0, [100, 100, 100, 255]);
+
+    layer.set_source(Some(raised), 1.0, 1);
+    // Do not poll incoming tiles: the outgoing flat source must stay visible
+    // at blend 0 even though the incoming extrusion selects the private pass.
+    for transition in [1.0, 0.5] {
+        let parameters = globe_composite_parameters(transition);
+        let image = paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+        assert!(layer.composite.is_some(), "The incoming extrusion must select the globe composite");
+        assert!(
+            layer.previous.is_some() && layer.fade_started.is_none(),
+            "The outgoing flat source must still be displayed"
+        );
+        for (x, y) in [(28, 28), (36, 28), (28, 36), (36, 36)] {
+            assert_eq!(
+                image.get_pixel(x, y).0,
+                [100, 100, 100, 255],
+                "Flat fallback disappeared at transition={transition}, pixel=({x}, {y})"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -160,6 +217,15 @@ fn extrusion_height_normalizes_and_sampling_grid_does_not_change_height() -> Res
 }
 
 pub(crate) fn paint_depth(device: &wgpu::Device, queue: &wgpu::Queue, render: impl FnOnce(&mut wgpu::RenderPass<'_>)) -> Result<image::RgbaImage> {
+    paint_depth_with_clear(device, queue, 1.0, render)
+}
+
+pub(crate) fn paint_depth_with_clear(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    clear: f32,
+    render: impl FnOnce(&mut wgpu::RenderPass<'_>),
+) -> Result<image::RgbaImage> {
     let texture = |format| {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Extrusion regression target"),
@@ -195,7 +261,7 @@ pub(crate) fn paint_depth(device: &wgpu::Device, queue: &wgpu::Queue, render: im
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &depth_view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    load: wgpu::LoadOp::Clear(clear),
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -233,7 +299,7 @@ fn uniform() -> DrawUniform {
 #[ignore = "requires a native graphics device"]
 fn gpu_extrusion_omits_nodata_out_of_range_and_transparent_palette_without_occluding() -> Result<()> {
     let (device, queue) = device()?;
-    let pipeline = RasterPipeline::new(&device, (0x16, 0x30, false));
+    let pipeline = RasterPipeline::new(&device, (0x16, 0x30, false, false));
     let palette: Vec<u8> = (0..=255).flat_map(|v| [v, v, v, if v == 200 { 0 } else { 255 }]).collect();
     write_texture(&queue, &pipeline.palettes[0], &palette, 256, 1, 4);
     let front = upload_tile(
@@ -281,7 +347,7 @@ fn gpu_extrusion_omits_nodata_out_of_range_and_transparent_palette_without_occlu
 #[ignore = "requires a native graphics device"]
 fn gpu_extrusion_parent_uv_and_outgoing_snapshot_keep_pixel_color_on_walls() -> Result<()> {
     let (device, queue) = device()?;
-    let pipeline = RasterPipeline::new(&device, (0x16, 0x30, false));
+    let pipeline = RasterPipeline::new(&device, (0x16, 0x30, false, false));
     let palette: Vec<u8> = (0..=255).flat_map(|v| [v, v, v, 255]).collect();
     for texture in &pipeline.palettes {
         write_texture(&queue, texture, &palette, 256, 1, 4);
@@ -369,7 +435,7 @@ pub(crate) fn top_row(image: &image::RgbaImage) -> Option<u32> {
 }
 
 fn height_pipeline(device: &wgpu::Device, queue: &wgpu::Queue) -> RasterPipeline {
-    let pipeline = RasterPipeline::new(device, (0x16, 0x30, false));
+    let pipeline = RasterPipeline::new(device, (0x16, 0x30, false, false));
     let palette: Vec<u8> = (0..=255).flat_map(|v| [v, v, v, 255]).collect();
     for texture in &pipeline.palettes {
         write_texture(queue, texture, &palette, 256, 1, 4);
@@ -581,6 +647,42 @@ fn gpu_extrusion_lighting_preserves_top_colors_and_shades_walls_at_four_azimuths
         let image = render_heights(&device, &queue, &pipeline, data, [255.0, f32::NAN])?;
         // Premultiplied BGRA, matching the native-host readback contract.
         assert_bar_faces(&image, [16, 32, 48, 64], wall);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_lighting_keeps_subpixel_tops_stable_with_varying_clip_w() -> Result<()> {
+    let (device, queue) = device()?;
+    let pipeline = height_pipeline(&device, &queue);
+    write_solid_palette(&queue, &pipeline.palettes[0], [192, 128, 64, 128]);
+    // The top is 1/16 pixel wide at x=32.5, with clip W varying from 1 to 2.
+    // Perspective derivatives can reverse its normal in uncovered helper lanes.
+    let matrix = [
+        [19.0 / 1024.0, 0.0, 0.5, 1.0],
+        [0.0, -0.0625, 0.0, 0.0],
+        [0.0, 0.03125, -0.01, 0.0],
+        [15.0 / 1024.0, 0.0, 0.5, 1.0],
+    ];
+    for height in [0.0, 0.125, 0.5, 1.0] {
+        for (offset, x) in [(-1.0 / 128.0, 32), (0.0, 32), (1.0 / 128.0, 32), (1.0, 33)] {
+            let mut data = DrawUniform {
+                matrix,
+                extrusion: [1.0, 1.0, height, 1.0],
+                ..uniform()
+            };
+            // Translate after perspective division, including the varying W.
+            for column in &mut data.matrix {
+                column[0] += offset / 32.0 * column[3];
+            }
+            let image = render_heights(&device, &queue, &pipeline, data, [255.0; 2])?;
+            assert_eq!(
+                image.get_pixel(x, 32).0,
+                [32, 64, 96, 128],
+                "Top must retain premultiplied BGRA regardless of height={height}, pixel offset={offset}"
+            );
+        }
     }
     Ok(())
 }

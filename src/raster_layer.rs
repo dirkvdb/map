@@ -19,7 +19,7 @@ use crate::raster_extrusion_animation::ExtrusionAnimation;
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest};
 use crate::raster_projection::ProjectionUniform;
 use crate::raster_source::{NumericTile, RasterSource};
-use crate::raster_tiles::{MAX_PENDING_TILES, TileWorkers, VisibleTile, extrusion_view, parent_uv, tile_matrix, transition_tiles, visible_tiles};
+use crate::raster_tiles::{MAX_PENDING_TILES, TileWorkers, VisibleTile, active_globe, extrusion_view, parent_uv, tile_matrix, transition_tiles, visible_tiles};
 
 #[path = "raster_extrusion_geometry.rs"]
 pub(crate) mod geometry;
@@ -45,6 +45,10 @@ mod zoom_tests;
 #[cfg(test)]
 #[path = "raster_extrusion_tests.rs"]
 pub(crate) mod extrusion_tests;
+
+#[cfg(test)]
+#[path = "raster_extrusion_depth_tests.rs"]
+mod extrusion_depth_tests;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -87,7 +91,7 @@ struct DrawTile {
 }
 
 struct RasterPipeline {
-    formats: (u32, u32, bool),
+    formats: (u32, u32, bool, bool),
     pipeline: wgpu::RenderPipeline,
     extrusion_pipeline: wgpu::RenderPipeline,
     extrusion_indices: wgpu::Buffer,
@@ -376,7 +380,7 @@ impl RasterLayer {
             .as_ref()
             .is_some_and(|source| self.extrusion_animation.height(effective_height(source)) > 0.0)
             || self.previous.as_ref().is_some_and(|previous| effective_height(&previous.source) > 0.0);
-        if !extruded || (parameters.depth_format != 0 && !self.needs_compositing()) {
+        if !extruded || (parameters.depth_format != 0 && !active_globe(parameters) && !self.needs_compositing()) {
             self.composite = None;
             self.render_content(pass, parameters, now);
             self.draw_debug_tiles(pass, parameters);
@@ -492,7 +496,12 @@ impl RasterLayer {
     }
 
     fn prepare_pipeline(&mut self, parameters: &WgpuLayerParameters) {
-        let formats = (parameters.color_format, parameters.depth_format, parameters.depth_test);
+        let formats = (
+            parameters.color_format,
+            parameters.depth_format,
+            parameters.depth_test,
+            active_globe(parameters),
+        );
         if self.pipeline.as_ref().is_none_or(|pipeline| pipeline.formats != formats) {
             self.pipeline = Some(RasterPipeline::new(&self.device, formats));
             self.draws.clear();
@@ -656,7 +665,12 @@ impl RasterLayer {
             let debug_pipeline = pipeline.debug_pipeline.get_or_insert_with(|| {
                 create_pipeline(
                     &self.device,
-                    (parameters.color_format, parameters.depth_format, parameters.depth_test),
+                    (
+                        parameters.color_format,
+                        parameters.depth_format,
+                        parameters.depth_test,
+                        active_globe(parameters),
+                    ),
                     &pipeline.layout,
                     "debug_fragment",
                 )
@@ -728,7 +742,7 @@ fn retained_zoom_tiles(displayed: &mut Vec<VisibleTile>, target: Vec<VisibleTile
 }
 
 impl RasterPipeline {
-    fn new(device: &wgpu::Device, formats: (u32, u32, bool)) -> Self {
+    fn new(device: &wgpu::Device, formats: (u32, u32, bool, bool)) -> Self {
         let texture_binding = |binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -836,7 +850,7 @@ fn palette_key(source: &RasterSource) -> (ColorMapPreset, ColorMapDirection) {
     (source.palette(), source.color_map_direction())
 }
 
-fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wgpu::BindGroupLayout, fragment: &str) -> wgpu::RenderPipeline {
+fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool, bool), layout: &wgpu::BindGroupLayout, fragment: &str) -> wgpu::RenderPipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Numeric raster layout"),
         bind_group_layouts: &[Some(layout)],
@@ -883,12 +897,11 @@ fn create_pipeline(device: &wgpu::Device, formats: (u32, u32, bool), layout: &wg
             depth_write_enabled: Some(extruded),
             // Keep the first surface on depth ties; farther walls must not
             // overwrite tops after quantization in native depth attachments.
-            depth_compare: Some(if extruded {
-                wgpu::CompareFunction::Less
-            } else if formats.2 && fragment == "fragment" {
-                wgpu::CompareFunction::LessEqual
-            } else {
-                wgpu::CompareFunction::Always
+            depth_compare: Some(match (extruded, formats.3, formats.2 && fragment == "fragment") {
+                (true, true, _) => wgpu::CompareFunction::Greater,
+                (true, false, _) => wgpu::CompareFunction::Less,
+                (false, _, true) => wgpu::CompareFunction::LessEqual,
+                (false, _, false) => wgpu::CompareFunction::Always,
             }),
             stencil: Default::default(),
             bias: Default::default(),

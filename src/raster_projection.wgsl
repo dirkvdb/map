@@ -52,11 +52,15 @@ fn project_surface(uv: vec2<f32>) -> vec4<f32> {
 fn project_volume(uv: vec2<f32>, height: f32) -> vec4<f32> {
     let flat = draw.matrix * vec4(uv, height, 1.0);
     if !raster_projection_active() { return flat; }
-    // Native 3D keeps matrix Z for genuine depth testing, unlike the surface path.
     let globe = draw.projection.globe_matrix * vec4(raster_globe_sphere(uv, height), 1.0);
+    var position = globe;
     let transition = draw.projection.parameters.x;
-    if transition > 0.999 { return globe; }
-    return mix(flat, globe, transition);
+    if transition <= 0.999 { position = mix(flat, globe, transition); }
+    // Private reversed depth (1/W, clear 0, Greater) avoids independent globe Z/W
+    // rounding and forward-depth quantization choosing distant walls over tops.
+    // Encode after blending, with a near distance of 1 and no finite far plane.
+    position.z = 1.0;
+    return position;
 }
 
 fn globe_horizon(uv: vec2<f32>, height: f32) -> f32 {
@@ -66,7 +70,7 @@ fn globe_horizon(uv: vec2<f32>, height: f32) -> f32 {
 }
 
 fn globe_hidden(horizon: f32) -> bool {
-    // Native's 2D globe does not provide a depth occluder for custom 3D geometry.
+    // Raster volumes use private depth to avoid fighting the native planet mesh.
     // Never hard-clip the horizon during the homogeneous Mercator/globe blend.
     return raster_projection_active() && draw.projection.parameters.x > 0.999 && horizon < 0.0;
 }

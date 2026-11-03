@@ -210,7 +210,7 @@ fn tiles_at_zoom(parameters: &WgpuLayerParameters, z: i32, bounds: &[LatLonBound
     tiles
 }
 
-fn active_globe(parameters: &WgpuLayerParameters) -> bool {
+pub(crate) fn active_globe(parameters: &WgpuLayerParameters) -> bool {
     parameters.globe && parameters.projection_transition > 0.0
 }
 

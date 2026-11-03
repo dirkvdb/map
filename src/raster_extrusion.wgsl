@@ -1,7 +1,9 @@
 struct Vertex {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) color: vec4<f32>,
-    @location(1) local_position: vec3<f32>,
+    // Face coordinates only identify the normal. Perspective extrapolation in
+    // derivative helper lanes can flip it on subpixel triangles.
+    @location(1) @interpolate(linear) local_position: vec3<f32>,
     @location(2) horizon: f32,
 };
 

@@ -3,6 +3,8 @@
 use inf::colormap::{ColorMapDirection, ColorMapPreset, ProcessedColorMap};
 use wgpu::{Device, Queue, RenderPass, TextureFormat, TextureView};
 
+use crate::raster_tiles::active_globe;
+
 /// CPU palette metadata survives switches between host and offscreen pipelines.
 #[derive(Default)]
 pub(crate) struct PaletteOpacity {
@@ -24,14 +26,16 @@ impl PaletteOpacity {
 
 /// Render raster surfaces once offscreen, then apply layer opacity to the visible surface.
 ///
-/// Callers must clear color to transparent and depth to 1.0, store both attachments,
-/// and use `BlendState::REPLACE` in offscreen pipelines. Targets are single-sampled.
+/// Clear color to transparent and depth to 0.0 for active-globe reversed depth,
+/// otherwise 1.0. Store both attachments and use `BlendState::REPLACE` offscreen.
+/// Targets are single-sampled.
 pub(crate) struct RasterComposite {
     pub color: TextureView,
     pub depth: TextureView,
     size: [u32; 2],
     color_format: TextureFormat,
-    host_depth: Option<TextureFormat>,
+    // Host attachment format and whether the composite participates in its depth.
+    host_depth: Option<(TextureFormat, bool)>,
     opacity: wgpu::Buffer,
     bindings: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
@@ -42,7 +46,10 @@ impl RasterComposite {
     pub(crate) fn prepare(target: Option<Self>, device: &Device, parameters: &maplibre_native::WgpuLayerParameters, pixel_ratio: f32) -> Self {
         let size = [parameters.width, parameters.height].map(|value| (value * f64::from(pixel_ratio)).round().max(1.0) as u32);
         let color = maplibre_native::texture_format_from_webgpu(parameters.color_format);
-        let depth = (parameters.depth_format != 0).then(|| maplibre_native::texture_format_from_webgpu(parameters.depth_format));
+        // Globe overlays follow native painter's order. Their private depth
+        // resolves bar occlusion; testing it against the separately tessellated
+        // planet would make ground-level surfaces flicker or disappear.
+        let depth = (parameters.depth_format != 0).then(|| (maplibre_native::texture_format_from_webgpu(parameters.depth_format), !active_globe(parameters)));
         target
             .filter(|target| target.matches(size, color, depth))
             .unwrap_or_else(|| Self::new(device, size, color, depth))
@@ -60,7 +67,9 @@ impl RasterComposite {
         let mut surface_parameters = parameters.clone();
         // WebGPU C ABI WGPUTextureFormat_Depth32Float, matching our private depth target.
         surface_parameters.depth_format = 0x30;
-        surface_parameters.depth_test = true;
+        // Extrusions always test private depth. Flat fallback draws do not write
+        // depth and must not compare native surface Z against reversed depth.
+        surface_parameters.depth_test = !active_globe(parameters);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Shared raster surface"),
@@ -76,7 +85,7 @@ impl RasterComposite {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load: wgpu::LoadOp::Clear(if active_globe(parameters) { 0.0 } else { 1.0 }),
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -89,7 +98,7 @@ impl RasterComposite {
     }
 
     /// Creates targets for a nonzero framebuffer size and the host attachment formats.
-    pub(crate) fn new(device: &Device, size: [u32; 2], color_format: TextureFormat, host_depth: Option<TextureFormat>) -> Self {
+    pub(crate) fn new(device: &Device, size: [u32; 2], color_format: TextureFormat, host_depth: Option<(TextureFormat, bool)>) -> Self {
         let color = create_target(device, size, color_format, "Raster composite color");
         let depth = create_target(device, size, TextureFormat::Depth32Float, "Raster composite depth");
         let opacity = device.create_buffer(&wgpu::BufferDescriptor {
@@ -131,7 +140,7 @@ impl RasterComposite {
     }
 
     /// Whether these targets and the pipeline can be reused for the host framebuffer.
-    pub(crate) fn matches(&self, size: [u32; 2], color_format: TextureFormat, host_depth: Option<TextureFormat>) -> bool {
+    pub(crate) fn matches(&self, size: [u32; 2], color_format: TextureFormat, host_depth: Option<(TextureFormat, bool)>) -> bool {
         self.size == size && self.color_format == color_format && self.host_depth == host_depth
     }
 
@@ -205,7 +214,12 @@ fn create_binding_layout(device: &Device) -> wgpu::BindGroupLayout {
     })
 }
 
-fn create_pipeline(device: &Device, layout: &wgpu::BindGroupLayout, color_format: TextureFormat, host_depth: Option<TextureFormat>) -> wgpu::RenderPipeline {
+fn create_pipeline(
+    device: &Device,
+    layout: &wgpu::BindGroupLayout,
+    color_format: TextureFormat,
+    host_depth: Option<(TextureFormat, bool)>,
+) -> wgpu::RenderPipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Raster composite pipeline layout"),
         bind_group_layouts: &[Some(layout)],
@@ -225,19 +239,27 @@ fn create_pipeline(device: &Device, layout: &wgpu::BindGroupLayout, color_format
             buffers: &[],
         },
         primitive: Default::default(),
-        // Extrusions always test/write depth, like the direct extrusion pipelines,
-        // even when the native pass disables depth testing for flat custom layers.
-        depth_stencil: host_depth.map(|format| wgpu::DepthStencilState {
+        // Match the attachment even when compositing in painter's order. Globe
+        // overlays keep self-occlusion in private depth and leave host depth alone.
+        depth_stencil: host_depth.map(|(format, test)| wgpu::DepthStencilState {
             format,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            depth_write_enabled: Some(test),
+            depth_compare: Some(if test {
+                wgpu::CompareFunction::LessEqual
+            } else {
+                wgpu::CompareFunction::Always
+            }),
             stencil: Default::default(),
             bias: Default::default(),
         }),
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: Some(if host_depth.is_some() { "fragment" } else { "fragment_color" }),
+            entry_point: Some(if host_depth.is_some_and(|(_, test)| test) {
+                "fragment"
+            } else {
+                "fragment_color"
+            }),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: color_format,

@@ -136,7 +136,7 @@ fn assert_solid(image: &image::RgbaImage, mut expected: [u8; 4]) {
 #[ignore = "requires a wgpu-compatible graphics device"]
 fn shared_target_is_draw_order_invariant() -> Result<()> {
     let (device, queue) = device()?;
-    let target = RasterComposite::new(&device, [64; 2], COLOR, Some(DEPTH));
+    let target = RasterComposite::new(&device, [64; 2], COLOR, Some((DEPTH, true)));
     let pipeline = surface_pipeline(&device);
     populate(&device, &queue, &target, &pipeline, &[RED_NEAR, BLUE_FAR]);
     let near_first = paint_depth(&device, &queue, |pass| target.composite(pass, &queue, 0.5))?;
@@ -163,9 +163,29 @@ fn composite_applies_opacity_once_without_host_depth() -> Result<()> {
 
 #[test]
 #[ignore = "requires a wgpu-compatible graphics device"]
+fn globe_composite_keeps_private_occlusion_without_testing_or_writing_planet_depth() -> Result<()> {
+    let (device, queue) = device()?;
+    let target = RasterComposite::new(&device, [64; 2], COLOR, Some((DEPTH, false)));
+    let pipeline = surface_pipeline(&device);
+    populate(&device, &queue, &target, &pipeline, &[BLUE_FAR, RED_NEAR]);
+    // A nearer host surface cannot punch holes in the overlay. Conversely,
+    // compositing must not put private raster depth into the host attachment.
+    for (host, expected) in [(YELLOW_FRONT, [255, 128, 0, 255]), (BLUE_FAR, [0, 255, 0, 255])] {
+        let image = paint_depth(&device, &queue, |pass| {
+            draw(pass, &pipeline, &[host]);
+            target.composite(pass, &queue, 1.0);
+            draw(pass, &pipeline, &[GREEN_MIDDLE]);
+        })?;
+        assert_solid(&image, expected);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a wgpu-compatible graphics device"]
 fn nodata_preserves_host_color_and_does_not_write_depth() -> Result<()> {
     let (device, queue) = device()?;
-    let target = RasterComposite::new(&device, [64; 2], COLOR, Some(DEPTH));
+    let target = RasterComposite::new(&device, [64; 2], COLOR, Some((DEPTH, true)));
     let pipeline = surface_pipeline(&device);
     // Deliberately store zero-alpha color at depth 0.1, rather than merely clearing.
     populate(&device, &queue, &target, &pipeline, &[NODATA_FRONT]);
@@ -187,7 +207,7 @@ fn nodata_preserves_host_color_and_does_not_write_depth() -> Result<()> {
 #[ignore = "requires a wgpu-compatible graphics device"]
 fn zero_opacity_does_not_occlude_later_host_geometry() -> Result<()> {
     let (device, queue) = device()?;
-    let target = RasterComposite::new(&device, [64; 2], COLOR, Some(DEPTH));
+    let target = RasterComposite::new(&device, [64; 2], COLOR, Some((DEPTH, true)));
     let pipeline = surface_pipeline(&device);
     populate(&device, &queue, &target, &pipeline, &[RED_NEAR]);
     let image = paint_depth(&device, &queue, |pass| {
@@ -202,7 +222,7 @@ fn zero_opacity_does_not_occlude_later_host_geometry() -> Result<()> {
 #[ignore = "requires a wgpu-compatible graphics device"]
 fn composite_respects_host_depth_and_accepts_equal_depth() -> Result<()> {
     let (device, queue) = device()?;
-    let target = RasterComposite::new(&device, [64; 2], COLOR, Some(DEPTH));
+    let target = RasterComposite::new(&device, [64; 2], COLOR, Some((DEPTH, true)));
     let pipeline = surface_pipeline(&device);
     populate(&device, &queue, &target, &pipeline, &[RED_NEAR]);
     let cases = [
@@ -224,7 +244,7 @@ fn composite_respects_host_depth_and_accepts_equal_depth() -> Result<()> {
 #[ignore = "requires a wgpu-compatible graphics device"]
 fn composite_writes_sampled_depth_to_occlude_later_host_geometry() -> Result<()> {
     let (device, queue) = device()?;
-    let target = RasterComposite::new(&device, [64; 2], COLOR, Some(DEPTH));
+    let target = RasterComposite::new(&device, [64; 2], COLOR, Some((DEPTH, true)));
     let pipeline = surface_pipeline(&device);
     populate(&device, &queue, &target, &pipeline, &[RED_NEAR]);
     let image = paint_depth(&device, &queue, |pass| {
@@ -240,7 +260,7 @@ fn composite_writes_sampled_depth_to_occlude_later_host_geometry() -> Result<()>
 #[ignore = "requires a wgpu-compatible graphics device"]
 fn composite_preserves_spatial_nodata_and_screen_coordinates() -> Result<()> {
     let (device, queue) = device()?;
-    let target = RasterComposite::new(&device, [64; 2], COLOR, Some(DEPTH));
+    let target = RasterComposite::new(&device, [64; 2], COLOR, Some((DEPTH, true)));
     let pipeline = surface_pipeline(&device);
     populate(&device, &queue, &target, &pipeline, &[RED_TOP_LEFT]);
     let image = paint_depth(&device, &queue, |pass| {
@@ -263,19 +283,20 @@ fn composite_preserves_spatial_nodata_and_screen_coordinates() -> Result<()> {
 #[ignore = "requires a wgpu-compatible graphics device"]
 fn matches_reuses_only_identical_size_and_attachment_formats() -> Result<()> {
     let (device, _queue) = device()?;
-    let target = RasterComposite::new(&device, [64; 2], COLOR, Some(DEPTH));
-    assert!(target.matches([64; 2], COLOR, Some(DEPTH)));
+    let target = RasterComposite::new(&device, [64; 2], COLOR, Some((DEPTH, true)));
+    assert!(target.matches([64; 2], COLOR, Some((DEPTH, true))));
     for (size, color, depth) in [
-        ([32, 64], COLOR, Some(DEPTH)),
-        ([64, 32], COLOR, Some(DEPTH)),
-        ([64; 2], TextureFormat::Bgra8Unorm, Some(DEPTH)),
-        ([64; 2], COLOR, Some(TextureFormat::Depth24Plus)),
+        ([32, 64], COLOR, Some((DEPTH, true))),
+        ([64, 32], COLOR, Some((DEPTH, true))),
+        ([64; 2], TextureFormat::Bgra8Unorm, Some((DEPTH, true))),
+        ([64; 2], COLOR, Some((TextureFormat::Depth24Plus, true))),
+        ([64; 2], COLOR, Some((DEPTH, false))),
         ([64; 2], COLOR, None),
     ] {
         assert!(!target.matches(size, color, depth), "Must rebuild for {size:?}, {color:?}, {depth:?}");
     }
     let resized = RasterComposite::new(&device, [32, 64], TextureFormat::Bgra8Unorm, None);
     assert!(resized.matches([32, 64], TextureFormat::Bgra8Unorm, None));
-    assert!(!resized.matches([32, 64], TextureFormat::Bgra8Unorm, Some(DEPTH)));
+    assert!(!resized.matches([32, 64], TextureFormat::Bgra8Unorm, Some((DEPTH, true))));
     Ok(())
 }

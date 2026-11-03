@@ -1,4 +1,4 @@
-//! Offline native GPU regressions: native GeoJSON geometry is the projection oracle.
+//! Offline native GPU regressions: native GeoJSON checks projection, flat rasters check bar coverage.
 //!
 //! Run explicitly with `cargo test globe_tests -- --ignored --test-threads=1`.
 //! No styles, glyphs, sprites, terrain, or tile URLs are fetched by these tests.
@@ -371,6 +371,149 @@ fn numeric_globe_radial_extrusion_is_visible_after_camera_motion_and_hides_far_s
     }
     assert_empty(&map.render(request(180.0, 0.0, 1.0, 0.0, 37.0))?, "far-side extruded bars");
     Ok(())
+}
+
+fn ground_fixture(band_count: usize, normalized_height: f32) -> Result<Fixture> {
+    let mut fixture = Fixture::new([52.0, 22.0, 55.0, 25.0], band_count)?;
+    // Playback interpolates the raw constants 128 and 224 before normalization.
+    let value = if band_count > 1 { 176.0 } else { 128.0 };
+    let minimum = value - 128.0 * normalized_height;
+    fixture.bands = fixture
+        .bands
+        .iter()
+        .map(|source| {
+            source
+                .restyled(ColorMapPreset::Gray, (minimum, minimum + 128.0))?
+                .with_color_map_direction(inf::colormap::ColorMapDirection::Reversed)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(fixture)
+}
+
+fn ground_image(map: &mut NativeMap, fixture: &Fixture, view: MapRequest, extruded: bool, opacity: f32) -> Result<RgbaImage> {
+    let source = fixture.bands[0].with_extrusion(extruded, 1.0)?;
+    map.set_raster(Some(source), opacity)?;
+    if fixture.bands.len() > 1 {
+        // Override the automatic dataset range so the interpolated constant
+        // really has the requested zero/low-positive normalized height.
+        let style = crate::raster_playback::PlaybackStyle::default()
+            .with_range(fixture.bands[0].range())?
+            .with_extrusion(extruded, 1.0);
+        let playback = PlaybackRequest::new(fixture.bands.clone(), 0.5, 1, false, 1.0, true).with_style(style);
+        map.numeric.borrow_mut().set_playback(Some(playback), opacity)?;
+    }
+    let image = map.render(view)?;
+    if fixture.bands.len() > 1 {
+        let frame = map.numeric.borrow().playback_frame().context("Ground coverage requires a playback frame")?;
+        assert!(!frame.is_buffering(), "Both constant bands must be resident before checking coverage");
+        assert_eq!(frame.position(), 0.5);
+    }
+    Ok(image)
+}
+
+fn flat_ground_interior(image: &RgbaImage, x: u32, y: u32, gray: u8) -> bool {
+    // Erode only the flat reference, never the tested image: an isolated hole
+    // must not exclude itself or its neighbors from the coverage assertion.
+    let radius = EDGE_TOLERANCE;
+    [(x, y), (x - radius, y), (x + radius, y), (x, y - radius), (x, y + radius)]
+        .into_iter()
+        .all(|(x, y)| image.get_pixel(x, y).0[..3].iter().all(|channel| channel.abs_diff(gray) <= 1))
+}
+
+fn ground_coverage_failure(flat: &RgbaImage, volume: &RgbaImage, opacity: f32, normalized_height: f32) -> Option<String> {
+    assert_eq!(flat.dimensions(), volume.dimensions());
+    let expected = (255.0 * opacity + 32.0 * (1.0 - opacity)).round() as u8;
+    let gray = flat.get_pixel(flat.width() / 2, flat.height() / 2)[0];
+    assert!(
+        gray.abs_diff(expected) <= 4,
+        "Flat constant raster's center must be near white: {gray} vs {expected}"
+    );
+    // Positive bars have real walls, whose minimum illumination is 0.32.
+    // Accept that shading, but never a background-colored interior hole.
+    let illumination = if normalized_height > 0.0 { 0.32 } else { 1.0 };
+    let background = 32.0 * (1.0 - opacity);
+    let minimum = ((f32::from(gray) - background) * illumination + background).round() as u8;
+    let samples: Vec<_> = (EDGE_TOLERANCE..flat.height() - EDGE_TOLERANCE)
+        .flat_map(|y| (EDGE_TOLERANCE..flat.width() - EDGE_TOLERANCE).map(move |x| (x, y)))
+        .filter(|&(x, y)| flat_ground_interior(flat, x, y, gray))
+        .collect();
+    assert!(
+        samples.len() > 10_000,
+        "Flat constant raster must have substantial visible interior: {} samples, expected gray={gray}, center={:?}",
+        samples.len(),
+        flat.get_pixel(flat.width() / 2, flat.height() / 2).0
+    );
+    let missing: Vec<_> = samples
+        .iter()
+        .copied()
+        .filter(|&(x, y)| volume.get_pixel(x, y).0[..3].iter().any(|channel| *channel < minimum.saturating_sub(4)))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "missing={}/{} interior pixels; first coordinates/colors: {:?}",
+        missing.len(),
+        samples.len(),
+        missing.iter().take(3).map(|&(x, y)| ((x, y), volume.get_pixel(x, y).0)).collect::<Vec<_>>()
+    ))
+}
+
+fn assert_globe_ground_coverage(band_count: usize, normalized_height: f32) -> Result<()> {
+    let fixture = ground_fixture(band_count, normalized_height)?;
+    let mut map = NativeMap::with_style(request(53.5, 23.5, 8.0, 0.0, 0.0).viewport, Some(tests::DARK_STYLE))?;
+    map.set_globe(true);
+    map.numeric.borrow_mut().set_reduce_motion(true);
+    let mut failures = Vec::new();
+    let views = [8.0, 9.0, 10.0, 11.0, 11.5, 12.0].into_iter().flat_map(|zoom| {
+        [
+            (53.5, 23.5, 0.0, 0.0),
+            (53.5, 23.5, 55.0, 37.0),
+            (53.501, 23.499, 55.25, 37.5),
+            (53.499, 23.501, 54.75, 36.5),
+        ]
+        .map(|(longitude, latitude, pitch, bearing)| request(longitude, latitude, zoom, pitch, bearing))
+    });
+    for view in views {
+        // Globe volumes use private depth at every opacity, while flat rasters
+        // retain the native path. Include both near-opaque and ordinary alpha.
+        for opacity in [1.0, 0.999, 0.5] {
+            let flat = ground_image(&mut map, &fixture, view, false, opacity)?;
+            let volume = ground_image(&mut map, &fixture, view, true, opacity)?;
+            if let Some(failure) = ground_coverage_failure(&flat, &volume, opacity, normalized_height) {
+                failures.push(format!(
+                    "bands={band_count} height={normalized_height} opacity={opacity} camera={:?}: {failure}",
+                    view.camera
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "Globe ground coverage:\n{}", failures.join("\n"));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a wgpu-compatible graphics device; local GeoTIFF only, no network"]
+fn numeric_globe_zero_height_bars_preserve_surface_coverage() -> Result<()> {
+    assert_globe_ground_coverage(1, 0.0)
+}
+
+#[test]
+#[ignore = "requires a wgpu-compatible graphics device; local GeoTIFF only, no network"]
+fn numeric_globe_low_positive_bars_preserve_surface_coverage() -> Result<()> {
+    assert_globe_ground_coverage(1, 1.0 / 1024.0)
+}
+
+#[test]
+#[ignore = "requires a wgpu-compatible graphics device; local multiband GeoTIFF only, no network"]
+fn multiband_globe_zero_height_bars_preserve_surface_coverage() -> Result<()> {
+    assert_globe_ground_coverage(2, 0.0)
+}
+
+#[test]
+#[ignore = "requires a wgpu-compatible graphics device; local multiband GeoTIFF only, no network"]
+fn multiband_globe_low_positive_bars_preserve_surface_coverage() -> Result<()> {
+    assert_globe_ground_coverage(2, 1.0 / 1024.0)
 }
 
 fn assert_visible_extrusion(ground: &RgbaImage, volume: &RgbaImage) {
