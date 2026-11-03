@@ -14,7 +14,7 @@ use maplibre_native::{WgpuCustomLayer, WgpuLayerParameters, texture_format_from_
 use wgpu::util::DeviceExt;
 
 use crate::multiband_layer::MultibandLayer;
-use crate::raster_composite::{PaletteOpacity, RasterComposite};
+use crate::raster_composite::{PaletteOpacity, RasterComposite, RasterDepth};
 use crate::raster_extrusion_animation::ExtrusionAnimation;
 use crate::raster_playback::{PlaybackFrame, PlaybackRequest};
 use crate::raster_projection::ProjectionUniform;
@@ -128,6 +128,7 @@ pub struct RasterLayer {
     opacity: f32,
     pixel_ratio: f32,
     composite: Option<RasterComposite>,
+    private_depth: Option<RasterDepth>,
     compositing: bool,
     palette_opacity: PaletteOpacity,
     generation: u64,
@@ -164,6 +165,7 @@ impl RasterLayer {
             opacity: 1.0,
             pixel_ratio: 1.0,
             composite: None,
+            private_depth: None,
             compositing: false,
             palette_opacity: PaletteOpacity::default(),
             generation: 0,
@@ -367,8 +369,29 @@ impl RasterLayer {
         }
     }
 
+    fn private_depth(&mut self, parameters: &WgpuLayerParameters, size: [u32; 2]) -> Option<wgpu::TextureView> {
+        let now = Instant::now();
+        self.extrusion_animation.advance(now);
+        self.finish_fade(now);
+        let opaque = if let Some(layer) = &mut self.multiband {
+            layer.can_draw_direct(parameters)
+        } else {
+            self.source
+                .as_ref()
+                .is_some_and(|source| self.extrusion_animation.height(effective_height(source)) > 0.0)
+                && !self.needs_compositing()
+        };
+        if !active_globe(parameters) || !opaque {
+            self.private_depth = None;
+            return None;
+        }
+        self.private_depth = Some(RasterDepth::prepare(self.private_depth.take(), &self.device, size));
+        self.private_depth.as_ref().map(|target| target.view.clone())
+    }
+
     fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
         if let Some(layer) = &mut self.multiband {
+            self.composite = None;
             layer.render_scaled(pass, parameters, self.pixel_ratio);
             return;
         }
@@ -380,7 +403,7 @@ impl RasterLayer {
             .as_ref()
             .is_some_and(|source| self.extrusion_animation.height(effective_height(source)) > 0.0)
             || self.previous.as_ref().is_some_and(|previous| effective_height(&previous.source) > 0.0);
-        if !extruded || (parameters.depth_format != 0 && !active_globe(parameters) && !self.needs_compositing()) {
+        if parameters.private_depth || !extruded || (parameters.depth_format != 0 && !active_globe(parameters) && !self.needs_compositing()) {
             self.composite = None;
             self.render_content(pass, parameters, now);
             self.draw_debug_tiles(pass, parameters);
@@ -712,6 +735,10 @@ impl RasterLayerHost {
 }
 
 impl WgpuCustomLayer for RasterLayerHost {
+    fn private_depth(&mut self, parameters: &WgpuLayerParameters, size: [u32; 2]) -> Option<wgpu::TextureView> {
+        self.0.borrow_mut().private_depth(parameters, size)
+    }
+
     fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
         self.0.borrow_mut().render(pass, parameters);
     }
@@ -720,6 +747,7 @@ impl WgpuCustomLayer for RasterLayerHost {
         let mut layer = self.0.borrow_mut();
         layer.pipeline = None;
         layer.composite = None;
+        layer.private_depth = None;
         layer.draws.clear();
         layer.displayed.clear();
         layer.cache.clear();

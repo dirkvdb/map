@@ -44,6 +44,165 @@ fn gpu_extrusion_static_opaque_bypass_releases_targets_without_reloading_tiles()
     Ok(())
 }
 
+fn cached_globe_layer(device: &wgpu::Device, queue: &wgpu::Queue, source: Arc<RasterSource>) -> Result<RasterLayer> {
+    let mut layer = RasterLayer::new(device.clone(), queue.clone())?;
+    layer.set_reduce_motion(true);
+    layer.set_source(Some(source.clone()), 1.0, 1);
+    layer.coverage = layer
+        .view_tiles(&globe_composite_parameters(1.0), &source, None)
+        .iter()
+        .map(|tile| tile.canonical())
+        .collect();
+    for tile in &layer.coverage {
+        let texture = upload_tile(device, queue, sample_tile([2; 2], &[100.0; 4]));
+        layer.cache_bytes += texture.bytes;
+        layer.cache.insert(
+            *tile,
+            CachedTile {
+                texture: Some(texture),
+                used: 0,
+            },
+        );
+    }
+    Ok(layer)
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_globe_private_depth_releases_composite_without_changing_source_or_tiles() -> Result<()> {
+    let (_directory, bands) = crate::raster_source::test_support::cog_fixture(1)?;
+    let source = bands[0].restyled(ColorMapPreset::Gray, (0.0, 255.0))?.with_extrusion(true, 2.0)?;
+    let (device, queue) = device()?;
+    let mut layer = cached_globe_layer(&device, &queue, source.clone())?;
+    let parameters = globe_composite_parameters(1.0);
+    let reference = paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+    assert!(
+        layer.composite.is_some(),
+        "Without bridge confirmation, opaque globe bars still need the fallback"
+    );
+    assert_eq!(reference.get_pixel(28, 28).0, [100, 100, 100, 255]);
+    let counts = (layer.requests, layer.uploads, layer.generation, layer.cache.len(), layer.cache_bytes);
+
+    let depth = layer.private_depth(&parameters, [64; 2]).expect("Opaque globe bars request private depth");
+    assert!(layer.composite.is_some(), "Selection alone must preserve the fallback color/composite targets");
+    assert_eq!(
+        layer.private_depth(&parameters, [64; 2]).unwrap(),
+        depth,
+        "An unchanged framebuffer must reuse its depth view"
+    );
+    assert!(Arc::ptr_eq(layer.source.as_ref().unwrap(), &source));
+    assert_eq!((parameters.private_depth, parameters.depth_format, parameters.depth_test), (false, 0x30, false));
+    let fallback = paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+    assert_eq!(fallback, reference, "A declined depth request must keep the fallback working");
+    assert!(layer.composite.is_some());
+    let mut private = parameters.clone();
+    private.private_depth = true;
+    let image = paint_depth_with_clear(&device, &queue, 0.0, |pass| layer.render(pass, &private))?;
+    assert_eq!(image, reference, "Direct reversed-depth rendering must preserve opaque colors");
+    assert!(layer.composite.is_none());
+    assert_eq!((layer.requests, layer.uploads, layer.generation, layer.cache.len(), layer.cache_bytes), counts);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_globe_private_depth_rejects_opacity_and_outgoing_fades() -> Result<()> {
+    let (_directory, bands) = crate::raster_source::test_support::cog_fixture(2)?;
+    let source = bands[0].restyled(ColorMapPreset::Gray, (0.0, 255.0))?.with_extrusion(true, 2.0)?;
+    let (device, queue) = device()?;
+    let mut layer = cached_globe_layer(&device, &queue, source.clone())?;
+    let parameters = globe_composite_parameters(1.0);
+    assert!(layer.private_depth(&parameters, [64; 2]).is_some());
+    layer.set_source(Some(source.clone()), 0.5, 1);
+    assert!(layer.private_depth(&parameters, [64; 2]).is_none());
+    assert!(layer.private_depth.is_none(), "Transparent rendering must release cached private depth");
+    let image = paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+    assert!(layer.composite.is_some());
+    assert_eq!(image.get_pixel(28, 28).0, [50, 50, 50, 128]);
+
+    layer.set_reduce_motion(false);
+    layer.set_source(Some(bands[1].with_extrusion(true, 2.0)?), 1.0, 1);
+    assert!(layer.previous.is_some());
+    assert!(
+        layer.private_depth(&parameters, [64; 2]).is_none(),
+        "A loading replacement can fade against missing endpoints"
+    );
+    let image = paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+    assert!(layer.composite.is_some());
+    assert_eq!(image.get_pixel(28, 28).0, [100, 100, 100, 255]);
+    layer.fade_started = Some(Instant::now());
+    assert!(
+        layer.private_depth(&parameters, [64; 2]).is_none(),
+        "An active source fade must also stay composited"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_globe_private_depth_rejects_palette_alpha() -> Result<()> {
+    let (_directory, bands) = crate::raster_source::test_support::cog_fixture(1)?;
+    let source = bands[0].restyled(ColorMapPreset::Gray, (0.0, 255.0))?.with_extrusion(true, 2.0)?;
+    let (device, queue) = device()?;
+    let mut layer = cached_globe_layer(&device, &queue, source.clone())?;
+    let parameters = globe_composite_parameters(1.0);
+    paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+    assert!(layer.private_depth(&parameters, [64; 2]).is_some());
+    layer.palette_opacity = PaletteOpacity::translucent_for_test();
+    let pipeline = layer.pipeline.as_mut().unwrap();
+    pipeline.palette_opaque = [false; 2];
+    for palette in &pipeline.palettes {
+        write_texture(&queue, palette, &[100, 100, 100, 128].repeat(256), 256, 1, 4);
+    }
+    assert!(layer.private_depth(&parameters, [64; 2]).is_none());
+    assert!(layer.private_depth.is_none());
+    let image = paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+    assert!(layer.composite.is_some());
+    assert_eq!(image.get_pixel(28, 28).0, [50, 50, 50, 128]);
+    assert!(Arc::ptr_eq(layer.source.as_ref().unwrap(), &source));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_globe_private_depth_tracks_multiband_eligibility_and_releases_when_flat() -> Result<()> {
+    let (_directory, bands) = crate::raster_source::test_support::cog_fixture(2)?;
+    let request = PlaybackRequest::new(bands, 0.0, 1, false, 10.0, true)
+        .with_style(PlaybackStyle::default().with_extrusion(true, 2.0).with_palette(ColorMapPreset::Gray));
+    let (device, queue) = device()?;
+    let mut layer = RasterLayer::new(device, queue)?;
+    let mut parameters = globe_composite_parameters(1.0);
+    for opacity in [1.0, 0.5, 1.0] {
+        layer.set_playback(Some(request.clone()), opacity)?;
+        let before = layer.playback_frame().unwrap();
+        assert_eq!(layer.private_depth(&parameters, [64; 2]).is_some(), opacity == 1.0);
+        assert_eq!(layer.private_depth.is_some(), opacity == 1.0);
+        let after = layer.playback_frame().unwrap();
+        assert_eq!((after.position(), after.revision()), (before.position(), before.revision()));
+    }
+    let original = layer.private_depth.as_ref().unwrap().view.clone();
+    layer.set_pixel_ratio(2.0);
+    let hidpi = layer.private_depth(&parameters, [128; 2]).unwrap();
+    assert_ne!(hidpi, original, "The actual HiDPI attachment size must resize the parent's depth resource");
+    assert_eq!(layer.private_depth(&parameters, [128; 2]).unwrap(), hidpi);
+    parameters.projection_transition = 0.0;
+    assert!(
+        layer.private_depth(&parameters, [128; 2]).is_none(),
+        "The Mercator end of the globe blend must release depth"
+    );
+    assert!(layer.private_depth.is_none());
+    parameters.projection_transition = 0.5;
+    assert_ne!(
+        layer.private_depth(&parameters, [128; 2]).unwrap(),
+        hidpi,
+        "An active globe blend needs a new depth resource"
+    );
+    parameters.globe = false;
+    assert!(layer.private_depth(&parameters, [128; 2]).is_none());
+    assert!(layer.private_depth.is_none());
+    Ok(())
+}
+
 pub(crate) fn globe_composite_parameters(transition: f64) -> WgpuLayerParameters {
     let mut parameters = parameters(0.0);
     parameters.depth_format = 0x30;

@@ -4,6 +4,39 @@ use crate::raster_tiles::test_support::{device, paint};
 use anyhow::Result;
 use wgpu::{Device, Queue, RenderPass, TextureFormat};
 
+impl super::PaletteOpacity {
+    // Synthetic alpha metadata paired with the GPU palette in layer regressions.
+    pub(crate) fn translucent_for_test() -> Self {
+        Self {
+            entries: vec![((inf::colormap::ColorMapPreset::Gray, inf::colormap::ColorMapDirection::Regular), false)],
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a wgpu-compatible graphics device"]
+fn private_depth_target_reuses_actual_attachment_extent_and_resizes() -> Result<()> {
+    let (device, _queue) = device()?;
+    let target = super::RasterDepth::prepare(None, &device, [64; 2]);
+    let original = target.view.clone();
+    assert_eq!(target.size, [64; 2]);
+    let target = super::RasterDepth::prepare(Some(target), &device, [64; 2]);
+    assert_eq!(target.view, original, "Only physical extent should invalidate private depth");
+    // Native truncates odd-sized fractional-scale framebuffers; use its actual
+    // attachment extent rather than independently rounding logical dimensions.
+    let target = super::RasterDepth::prepare(Some(target), &device, [151, 154]);
+    assert_eq!(target.view.texture().size().width, 151);
+    assert_eq!(target.view.texture().size().height, 154);
+    assert_ne!(target.view, original);
+    let resized = target.view.clone();
+    let target = super::RasterDepth::prepare(Some(target), &device, [151, 154]);
+    assert_eq!(target.view, resized);
+    let target = super::RasterDepth::prepare(Some(target), &device, [1; 2]);
+    assert_eq!(target.size, [1; 2]);
+    assert_ne!(target.view, resized);
+    Ok(())
+}
+
 const COLOR: TextureFormat = TextureFormat::Rgba8Unorm;
 const DEPTH: TextureFormat = TextureFormat::Depth32Float;
 const RED_NEAR: u32 = 0;

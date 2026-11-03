@@ -24,6 +24,22 @@ impl PaletteOpacity {
     }
 }
 
+/// Reusable depth-only target for opaque globe bars drawn into native color.
+/// Unlike the transparency composite, this allocates no color texture.
+pub(crate) struct RasterDepth {
+    pub view: TextureView,
+    size: [u32; 2],
+}
+
+impl RasterDepth {
+    pub(crate) fn prepare(target: Option<Self>, device: &Device, size: [u32; 2]) -> Self {
+        target.filter(|target| target.size == size).unwrap_or_else(|| Self {
+            view: create_target(device, size, TextureFormat::Depth32Float, "Raster private depth"),
+            size,
+        })
+    }
+}
+
 /// Render raster surfaces once offscreen, then apply layer opacity to the visible surface.
 ///
 /// Clear color to transparent and depth to 0.0 for active-globe reversed depth,

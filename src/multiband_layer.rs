@@ -326,11 +326,18 @@ impl MultibandLayer {
         self.render_scaled(pass, parameters, 1.0);
     }
 
+    pub(crate) fn can_draw_direct(&mut self, parameters: &WgpuLayerParameters) -> bool {
+        let Some(request) = self.extrusion_request(Instant::now()) else {
+            return false;
+        };
+        active_globe(parameters) && playback_height(&request) > 0.0 && !self.needs_compositing(&request)
+    }
+
     pub fn render_scaled(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters, pixel_ratio: f32) {
         let now = Instant::now();
         let Some(request) = self.extrusion_request(now) else { return };
         let extruded = playback_height(&request) > 0.0;
-        if !extruded || (parameters.depth_format != 0 && !active_globe(parameters) && !self.needs_compositing(&request)) {
+        if parameters.private_depth || !extruded || (parameters.depth_format != 0 && !active_globe(parameters) && !self.needs_compositing(&request)) {
             self.composite = None;
             self.render_content(pass, parameters, &request, now);
             return;
@@ -1108,6 +1115,7 @@ mod tests {
             color_format: 0x16,
             depth_format: 0,
             depth_test: false,
+            private_depth: false,
         }
     }
 

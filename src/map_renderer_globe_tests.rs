@@ -373,6 +373,25 @@ fn numeric_globe_radial_extrusion_is_visible_after_camera_motion_and_hides_far_s
     Ok(())
 }
 
+#[test]
+#[ignore = "requires a native graphics device; local GeoTIFF only, no network"]
+fn retained_raster_host_forwards_private_depth_requests() -> Result<()> {
+    let (device, queue) = crate::raster_tiles::test_support::device()?;
+    let fixture = Fixture::new([52.0, 22.0, 55.0, 25.0], 1)?;
+    let mut layer = RasterLayer::new(device, queue)?;
+    layer.set_reduce_motion(true);
+    layer.set_source(Some(fixture.bands[0].with_extrusion(true, 1.0)?), 1.0, 1);
+    let mut host = RetainedRasterLayerHost(RasterLayerHost::new(Rc::new(RefCell::new(layer))));
+    let mut parameters = crate::raster_layer::extrusion_tests::globe_composite_parameters(1.0);
+    let depth = host
+        .private_depth(&parameters, [151, 154])
+        .expect("Production wrapper must forward the request");
+    assert_eq!([depth.texture().width(), depth.texture().height()], [151, 154]);
+    parameters.globe = false;
+    assert!(host.private_depth(&parameters, [151, 154]).is_none());
+    Ok(())
+}
+
 fn ground_fixture(band_count: usize, normalized_height: f32) -> Result<Fixture> {
     let mut fixture = Fixture::new([52.0, 22.0, 55.0, 25.0], band_count)?;
     // Playback interpolates the raw constants 128 and 224 before normalization.
@@ -475,8 +494,8 @@ fn assert_globe_ground_coverage(band_count: usize, normalized_height: f32) -> Re
         .map(|(longitude, latitude, pitch, bearing)| request(longitude, latitude, zoom, pitch, bearing))
     });
     for view in views {
-        // Globe volumes use private depth at every opacity, while flat rasters
-        // retain the native path. Include both near-opaque and ordinary alpha.
+        // Opaque globe volumes draw straight into native color with private
+        // depth; alpha uses the composite. Flat rasters retain the native path.
         for opacity in [1.0, 0.999, 0.5] {
             let flat = ground_image(&mut map, &fixture, view, false, opacity)?;
             let volume = ground_image(&mut map, &fixture, view, true, opacity)?;

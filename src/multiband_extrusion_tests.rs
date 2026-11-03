@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use super::*;
-use crate::raster_layer::extrusion_tests::{globe_composite_parameters, paint_depth, sample_tile};
+use crate::raster_layer::extrusion_tests::{globe_composite_parameters, paint_depth, paint_depth_with_clear, sample_tile};
 use crate::raster_source::NumericTile;
 use crate::raster_tiles::test_support::device;
 
@@ -52,6 +52,126 @@ fn gpu_extrusion_opaque_bypass_releases_composite_without_reloading_raw_tiles() 
         assert_eq!(layer.composite.is_some(), opacity < 1.0);
         assert_eq!((layer.requests, layer.uploads, layer.generation, layer.cache.len(), layer.cache_bytes), counts);
     }
+    Ok(())
+}
+
+fn cached_globe_playback(device: &wgpu::Device, queue: &wgpu::Queue, request: PlaybackRequest) -> Result<MultibandLayer> {
+    let mut layer = MultibandLayer::new(device.clone(), queue.clone())?;
+    layer.set_playback(request.clone(), 1.0);
+    for tile in layer.view_tiles(&globe_composite_parameters(1.0), &request, &request.bands()[0]) {
+        let data = [80.0, 160.0].map(|value| Some(sample_tile([2; 2], &[value; 4])));
+        let texture = tiles::upload_window(device, queue, data.into(), 2)?;
+        let cached = CachedWindow { texture, used: 0 };
+        layer.cache_bytes += cached.bytes();
+        layer.cache.insert(
+            WindowKey {
+                tile: tile.canonical(),
+                start: 0,
+            },
+            cached,
+        );
+    }
+    Ok(layer)
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_globe_private_depth_releases_composite_without_changing_playback_or_tiles() -> Result<()> {
+    let (_directory, bands) = tiles::cog_fixture(2)?;
+    let request = tests::request(&bands, 0.0, 1).with_style(
+        PlaybackStyle::default()
+            .with_extrusion(true, 2.0)
+            .with_palette(ColorMapPreset::Gray)
+            .with_range((0.0, 255.0))?,
+    );
+    let (device, queue) = device()?;
+    let mut layer = cached_globe_playback(&device, &queue, request.clone())?;
+    let mut parameters = globe_composite_parameters(1.0);
+    let reference = paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+    assert!(layer.composite.is_some(), "Native parameters must keep the fallback even when opaque");
+    // The south wall keeps its 0.32 illumination in the direct pass.
+    assert_eq!(reference.get_pixel(28, 28).0, [26, 26, 26, 255]);
+    let counts = (layer.requests, layer.uploads, layer.generation, layer.cache.len(), layer.cache_bytes);
+    let frame = layer.playback_frame().unwrap();
+    assert!(layer.can_draw_direct(&parameters));
+    assert!(layer.request.as_ref().unwrap().shares_bands(&request));
+    assert_eq!(layer.request.as_ref().unwrap().style().extrusion(), request.style().extrusion());
+
+    parameters.private_depth = true;
+    let image = paint_depth_with_clear(&device, &queue, 0.0, |pass| layer.render_scaled(pass, &parameters, 1.0))?;
+    assert!(layer.composite.is_none());
+    assert_eq!(image, reference);
+    assert_eq!((layer.requests, layer.uploads, layer.generation, layer.cache.len(), layer.cache_bytes), counts);
+    let after = layer.playback_frame().unwrap();
+    assert_eq!((after.position(), after.revision()), (frame.position(), frame.revision()));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_globe_private_depth_rejects_alpha_and_playing_interpolation() -> Result<()> {
+    let (_directory, bands) = tiles::cog_fixture(2)?;
+    let request = tests::request(&bands, 0.0, 1).with_style(
+        PlaybackStyle::default()
+            .with_extrusion(true, 2.0)
+            .with_palette(ColorMapPreset::Gray)
+            .with_range((0.0, 255.0))?,
+    );
+    let (device, queue) = device()?;
+    let mut layer = cached_globe_playback(&device, &queue, request.clone())?;
+    let parameters = globe_composite_parameters(1.0);
+    for (revision, (opacity, position, expected)) in (2..).zip([(0.5, 0.0, [13, 13, 13, 128]), (1.0, 0.5, [38, 38, 38, 255])]) {
+        layer.set_playback(request.clone().with_controls(position, revision, false, 10.0), opacity);
+        assert!(!layer.can_draw_direct(&parameters));
+        let image = paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+        assert!(layer.composite.is_some());
+        assert_eq!(image.get_pixel(28, 28).0, expected);
+    }
+    layer.set_playback(request.with_controls(0.0, 4, true, 10.0), 1.0);
+    assert!(
+        !layer.can_draw_direct(&parameters),
+        "Playing interpolated data may fade nodata even at integer positions"
+    );
+    assert!(layer.request.as_ref().unwrap().is_playing(), "Depth selection must not pause playback");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device"]
+fn gpu_extrusion_globe_private_depth_rejects_multiband_palette_alpha() -> Result<()> {
+    let (_directory, bands) = tiles::cog_fixture(2)?;
+    let request = tests::request(&bands, 0.0, 1).with_style(
+        PlaybackStyle::default()
+            .with_extrusion(true, 2.0)
+            .with_palette(ColorMapPreset::Gray)
+            .with_range((0.0, 255.0))?,
+    );
+    let (device, queue) = device()?;
+    let mut layer = cached_globe_playback(&device, &queue, request)?;
+    let parameters = globe_composite_parameters(1.0);
+    paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+    assert!(layer.can_draw_direct(&parameters));
+    layer.palette_opacity = PaletteOpacity::translucent_for_test();
+    let pipeline = layer.pipeline.as_mut().unwrap();
+    pipeline.palette_opaque = false;
+    queue.write_texture(
+        pipeline.palette.as_image_copy(),
+        &[80, 80, 80, 128].repeat(256),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(1024),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 256,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    assert!(!layer.can_draw_direct(&parameters));
+    let image = paint_depth(&device, &queue, |pass| layer.render(pass, &parameters))?;
+    assert!(layer.composite.is_some());
+    assert_eq!(image.get_pixel(28, 28).0, [13, 13, 13, 128]);
     Ok(())
 }
 
@@ -107,10 +227,18 @@ fn gpu_extrusion_interpolation_and_manual_fades_keep_compositing() -> Result<()>
     let request = tests::request(&bands, 0.5, 1).with_style(PlaybackStyle::default().with_extrusion(true, 2.0).with_palette(ColorMapPreset::Gray));
     layer.set_playback(request.clone(), 1.0);
     tests::load_until_idle(&mut layer)?;
+    assert!(
+        !layer.can_draw_direct(&globe_composite_parameters(1.0)),
+        "Paused interpolation must retain compositing"
+    );
     paint_playback_depth(&mut layer)?;
     assert!(layer.composite.is_some());
     layer.set_playback(request.with_controls(1.0, 2, false, 10.0), 1.0);
     assert!(layer.band_fade.is_some());
+    assert!(
+        !layer.can_draw_direct(&globe_composite_parameters(1.0)),
+        "Manual band fades must retain compositing"
+    );
     paint_playback_depth(&mut layer)?;
     assert!(layer.composite.is_some());
     Ok(())
@@ -136,6 +264,10 @@ fn gpu_extrusion_retained_interpolation_and_fades_keep_compositing() -> Result<(
             fade_from,
         });
         assert!(layer.needs_compositing(&request));
+        assert!(
+            !layer.can_draw_direct(&globe_composite_parameters(1.0)),
+            "Retained interpolation/fades must not request private depth"
+        );
         paint_playback_depth(&mut layer)?;
         assert!(layer.composite.is_some());
     }

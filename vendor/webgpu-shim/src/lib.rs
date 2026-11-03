@@ -24,6 +24,9 @@ use wgpu::SamplerDescriptor;
 pub const WEBGPU_HEADER_INCLUDE_DIR: &str = env!("WEBGPU_SHIM_WEBGPU_HEADER_INCLUDE_DIR");
 
 mod conv;
+mod render_pass;
+
+pub use render_pass::{private_depth_target_size, with_render_pass_with_depth};
 
 fn mapped_buffer_views() -> &'static Mutex<HashMap<usize, Vec<wgpu::BufferViewMut>>> {
     static VIEWS: OnceLock<Mutex<HashMap<usize, Vec<wgpu::BufferViewMut>>>> = OnceLock::new();
@@ -93,7 +96,10 @@ impl WGPUCommandBufferImpl {
     }
 }
 
-pub struct WGPURenderPassEncoderImpl(Mutex<Option<wgpu::RenderPass<'static>>>);
+pub struct WGPURenderPassEncoderImpl(
+    Mutex<Option<wgpu::RenderPass<'static>>>,
+    render_pass::PassState,
+);
 
 /// Borrows an active render pass owned by the WebGPU C ABI bridge.
 ///
@@ -531,103 +537,17 @@ pub unsafe extern "C" fn wgpuCommandEncoderBeginRenderPass(
         panic!("wgpuCommandEncoderBeginRenderPass occlusionQuerySet not implemented");
     }
 
-    let mut color_attachments = Vec::with_capacity(desc.colorAttachmentCount);
-    if desc.colorAttachmentCount > 0 && !desc.colorAttachments.is_null() {
-        let c_color_attachments =
-            unsafe { std::slice::from_raw_parts(desc.colorAttachments, desc.colorAttachmentCount) };
-        for c in c_color_attachments {
-            if c.view.is_null() {
-                color_attachments.push(None);
-                continue;
-            }
-            let view = unsafe { c.view.as_ref().expect("Invalid color attachment view") };
-            let resolve_target = if c.resolveTarget.is_null() {
-                None
-            } else {
-                Some(
-                    &unsafe {
-                        c.resolveTarget.as_ref().expect("Invalid resolve target texture view")
-                    }
-                    .0,
-                )
-            };
-            let load = match c.loadOp {
-                WGPULoadOp_Clear => wgpu::LoadOp::Clear(wgpu::Color {
-                    r: c.clearValue.r,
-                    g: c.clearValue.g,
-                    b: c.clearValue.b,
-                    a: c.clearValue.a,
-                }),
-                _ => wgpu::LoadOp::Load,
-            };
-            let store = match c.storeOp {
-                WGPUStoreOp_Discard => wgpu::StoreOp::Discard,
-                _ => wgpu::StoreOp::Store,
-            };
-            let depth_slice = if c.depthSlice == u32::MAX { None } else { Some(c.depthSlice) };
-            color_attachments.push(Some(wgpu::RenderPassColorAttachment {
-                view: &view.0,
-                depth_slice,
-                resolve_target,
-                ops: wgpu::Operations { load, store },
-            }));
-        }
-    }
-
-    let depth_stencil_attachment = if desc.depthStencilAttachment.is_null() {
-        None
-    } else {
-        let c = unsafe {
-            desc.depthStencilAttachment.as_ref().expect("Invalid depth stencil attachment")
-        };
-        let view = unsafe { c.view.as_ref().expect("Invalid depth stencil attachment view") };
-        let depth_ops = if c.depthReadOnly != 0 {
-            None
-        } else {
-            Some(wgpu::Operations {
-                load: match c.depthLoadOp {
-                    WGPULoadOp_Clear => wgpu::LoadOp::Clear(c.depthClearValue),
-                    _ => wgpu::LoadOp::Load,
-                },
-                store: match c.depthStoreOp {
-                    WGPUStoreOp_Discard => wgpu::StoreOp::Discard,
-                    _ => wgpu::StoreOp::Store,
-                },
-            })
-        };
-        let stencil_ops = if c.stencilReadOnly != 0 {
-            None
-        } else {
-            Some(wgpu::Operations {
-                load: match c.stencilLoadOp {
-                    WGPULoadOp_Clear => wgpu::LoadOp::Clear(c.stencilClearValue),
-                    _ => wgpu::LoadOp::Load,
-                },
-                store: match c.stencilStoreOp {
-                    WGPUStoreOp_Discard => wgpu::StoreOp::Discard,
-                    _ => wgpu::StoreOp::Store,
-                },
-            })
-        };
-        Some(wgpu::RenderPassDepthStencilAttachment { view: &view.0, depth_ops, stencil_ops })
+    // SAFETY: the C ABI descriptor and its view handles are live during this call.
+    let attachments = unsafe { render_pass::Attachments::from_descriptor(desc) };
+    // SAFETY: commandEncoder is an Arc-backed shim handle with a live native owner.
+    let parent = unsafe {
+        Arc::increment_strong_count(commandEncoder);
+        Arc::from_raw(commandEncoder)
     };
-
-    let render_pass_desc = wgpu::RenderPassDescriptor {
-        label: None,
-        color_attachments: color_attachments.as_slice(),
-        depth_stencil_attachment,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-    };
-
     let mut encoder_guard = encoder_ref.0.lock().expect("command encoder lock poisoned");
-    let render_pass = encoder_guard
-        .as_mut()
-        .expect("command encoder already finished")
-        .begin_render_pass(&render_pass_desc)
-        .forget_lifetime();
-    WGPURenderPassEncoderImpl(Mutex::new(Some(render_pass))).to_pointer()
+    let encoder = encoder_guard.as_mut().expect("command encoder already finished");
+    let render_pass = attachments.begin(encoder, false);
+    WGPURenderPassEncoderImpl(Mutex::new(Some(render_pass)), render_pass::PassState::new(parent, attachments)).to_pointer()
 }
 
 #[unsafe(no_mangle)]
@@ -2095,21 +2015,11 @@ pub unsafe extern "C" fn wgpuRenderPassEncoderSetPipeline(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wgpuRenderPassEncoderSetScissorRect(
-    renderPassEncoder: WGPURenderPassEncoder,
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-) {
+pub unsafe extern "C" fn wgpuRenderPassEncoderSetScissorRect(renderPassEncoder: WGPURenderPassEncoder, x: u32, y: u32, width: u32, height: u32) {
     let pass_ref = unsafe { renderPassEncoder.as_ref().expect("Invalid renderPassEncoder") };
-    pass_ref
-        .0
-        .lock()
-        .expect("render pass lock poisoned")
-        .as_mut()
-        .expect("render pass already ended")
-        .set_scissor_rect(x, y, width, height);
+    let mut pass = pass_ref.0.lock().expect("render pass lock poisoned");
+    pass.as_mut().expect("render pass already ended").set_scissor_rect(x, y, width, height);
+    pass_ref.1.raster.lock().expect("raster state lock poisoned").scissor = Some([x, y, width, height]);
 }
 
 #[unsafe(no_mangle)]
@@ -2165,13 +2075,11 @@ pub unsafe extern "C" fn wgpuRenderPassEncoderSetViewport(
     maxDepth: f32,
 ) {
     let pass_ref = unsafe { renderPassEncoder.as_ref().expect("Invalid renderPassEncoder") };
-    pass_ref
-        .0
-        .lock()
-        .expect("render pass lock poisoned")
-        .as_mut()
+    let mut pass = pass_ref.0.lock().expect("render pass lock poisoned");
+    pass.as_mut()
         .expect("render pass already ended")
         .set_viewport(x, y, width, height, minDepth, maxDepth);
+    pass_ref.1.raster.lock().expect("raster state lock poisoned").viewport = Some([x, y, width, height, minDepth, maxDepth]);
 }
 
 #[unsafe(no_mangle)]

@@ -90,11 +90,26 @@ callback borrows the active pass on the renderer thread and must neither end
 nor retain it. Application-created GPU resources must use the renderer's device.
 The deinitialization callback releases resources on removal/context loss.
 
-The shim adds only `with_render_pass` (an unsafe, scoped borrow of its encoder)
-and `texture_format_from_webgpu`. It retains ownership of the native pass and
-ends/submits it through the existing MapLibre path. There are no handle-layout
-casts into Rust's private wgpu types, external render passes, or CPU pixel copies
-in the custom-layer integration.
+`WgpuCustomLayer::private_depth(parameters, size)` optionally supplies a cached
+`Depth32Float` view sized to the actual color attachment, including fractional
+HiDPI sizes. The shim checks support before requesting the view. When accepted,
+`render` receives `private_depth = true`, depth format `0x30`, and a private depth
+attachment cleared to zero for reversed-Z (`Greater`, depth writes enabled).
+Opaque globe bars use this path; alpha, palette transparency, and source/playback
+fades keep the existing offscreen composite. Unsupported attachments fall back
+to the original callback without switching passes.
+
+The shim's `private_depth_target_size` and `with_render_pass_with_depth` helpers
+retain the parent encoder and original attachments. A scoped private-depth draw
+loads/stores the same final color attachment, then resumes native color, depth,
+and stencil with Load on the same FFI pass handle and command encoder. Native
+viewport/scissor are restored; native drawables rebind their pipeline/resources
+as they already do after custom drawing. There is no intermediate submit,
+offscreen color texture, or fullscreen composite on the opaque path. This splits
+the native pass; it does not eliminate attachment-switch/pass-boundary costs.
+`with_render_pass` remains available for the ordinary scoped borrow, alongside
+`texture_format_from_webgpu`. There are no casts into Rust's private wgpu layouts
+or CPU pixel copies, and no native-core ABI change/rebuild is required.
 
 Application-specific tile scheduling, caches, and WGSL coloring live in
 `src/raster_tiles.rs`, `src/raster_layer.rs`, and `src/raster_layer.wgsl`, not in

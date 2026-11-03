@@ -51,10 +51,40 @@ pub use ffi::WgpuLayerParameters;
 /// extra vertices (raw tile Y < -32767.5 or > 32766.5), forced to (0, ±1, 0),
 /// with a separate pole-hiding transition; ordinary XYZ tiles stop at ±85.05113°.
 /// Mercator fallback X includes world wrap, while sphere longitude is periodic.
-/// Use `LessEqual` with depth writes disabled when `depth_test` is true; otherwise
-/// disable depth testing/writes (native globe 2D layers use painter's order).
+/// With native depth (`private_depth` is false), use `LessEqual` with depth
+/// writes disabled when `depth_test` is true; otherwise disable depth
+/// testing/writes (native globe 2D layers use painter's order).
+///
+/// Override [`Self::private_depth`] to request an isolated depth attachment
+/// while drawing directly into native's color attachment. When the request is
+/// supported, `render` receives `private_depth = true`, `depth_format = 0x30`
+/// (`Depth32Float`), and `depth_test = false`. Use reversed depth with `Greater`
+/// and depth writes; the private attachment is cleared to zero. Native depth
+/// and stencil are preserved, not copied into the private attachment.
 pub trait WgpuCustomLayer: 'static {
+    /// Requests private depth immediately before the render pass is borrowed.
+    ///
+    /// Called only when the active native pass supports private depth. `size`
+    /// is its actual color attachment extent in physical pixels, not the
+    /// logical viewport dimensions in `parameters`. Return `None` (the default)
+    /// to keep the native attachments. Unsupported passes skip this request.
+    ///
+    /// The returned view must be a same-device, single-sampled `Depth32Float`
+    /// render attachment with exactly this extent. Keep its resources valid
+    /// and undestroyed throughout the scoped draw. The shim validates the view
+    /// before switching; if rejected, `render` still runs once with the original
+    /// native parameters and attachments. Check `parameters.private_depth` in
+    /// `render` rather than assuming success.
+    fn private_depth(
+        &mut self,
+        _parameters: &WgpuLayerParameters,
+        _size: [u32; 2],
+    ) -> Option<wgpu::TextureView> {
+        None
+    }
+
     /// Records commands without ending or retaining the borrowed render pass.
+    /// The parameters describe the actual native or private depth attachment.
     fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters);
 
     /// Releases device resources on layer removal or context loss.
@@ -71,8 +101,31 @@ pub(crate) fn wgpu_layer_render(
     if encoder == 0 {
         return;
     }
+    // SAFETY: native supplies its live, exclusive shim handle on the renderer
+    // thread. This query does not change the active pass.
+    let size = unsafe { webgpu_shim::private_depth_target_size(encoder) };
+    if let Some(depth) = size.and_then(|size| host.0.private_depth(parameters, size)) {
+        let mut private_parameters = parameters.clone();
+        private_parameters.depth_format = 0x30; // WebGPU C ABI Depth32Float.
+        private_parameters.depth_test = false;
+        private_parameters.private_depth = true;
+        // SAFETY: native supplies a live, exclusive shim handle on its renderer
+        // thread. The layer supplies a same-device, framebuffer-matching depth
+        // view per the trait contract; it stays alive through the scoped draw.
+        // The FFI host rebinds pipeline/buffer state after custom drawing; the
+        // shim resumes the same handle and reapplies native viewport/scissor.
+        let rendered = unsafe {
+            webgpu_shim::with_render_pass_with_depth(encoder, &depth, |pass| {
+                host.0.render(pass, &private_parameters);
+            })
+        };
+        if rendered {
+            return;
+        }
+    }
     // SAFETY: the native CustomLayerHost supplies its current shim encoder only
-    // during render(), on the renderer thread. The borrow cannot escape.
+    // during render(), on the renderer thread. The borrow cannot escape. An
+    // unsupported private-depth request leaves this pass untouched.
     unsafe { webgpu_shim::with_render_pass(encoder, |pass| host.0.render(pass, parameters)) };
 }
 
@@ -179,6 +232,8 @@ mod tests {
             let parameters = capture_frame(&mut renderer, &captured, globe, zoom);
             let first = &parameters[0];
             let second = &parameters[1];
+            assert!(CaptureLayer(Rc::clone(&captured)).private_depth(first, [512; 2]).is_none());
+            assert!(!first.private_depth && !second.private_depth);
             assert_eq!(first.globe, transition > 0.0);
             assert!(
                 (first.projection_transition - transition).abs() < 1e-7,

@@ -47,6 +47,7 @@ pub fn parameters(zoom: f64) -> WgpuLayerParameters {
         color_format: 0x16,
         depth_format: 0,
         depth_test: false,
+        private_depth: false,
     }
 }
 

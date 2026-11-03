@@ -502,6 +502,10 @@ fn initialize_map(request: &RenderRequest, style_json: Option<&str>) -> Result<N
 struct RetainedRasterLayerHost(RasterLayerHost);
 
 impl WgpuCustomLayer for RetainedRasterLayerHost {
+    fn private_depth(&mut self, parameters: &WgpuLayerParameters, size: [u32; 2]) -> Option<wgpu::TextureView> {
+        self.0.private_depth(parameters, size)
+    }
+
     fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
         self.0.render(pass, parameters);
     }

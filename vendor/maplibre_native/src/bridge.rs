@@ -959,9 +959,16 @@ pub mod ffi {
         /// WebGPU C ABI depth/stencil attachment format, or zero if absent.
         depth_format: u32,
         /// Whether native layer ordering requires depth testing for this pass.
-        /// Use LessEqual without depth writes when true; otherwise disable both.
-        /// Globe surface layers use painter's order, with Z still clipping the horizon.
+        /// When `private_depth` is false, use LessEqual without depth writes when
+        /// true; otherwise disable both. Globe surface layers use painter's order,
+        /// with Z still clipping the horizon. Always false with private depth;
+        /// private depth testing is described by `private_depth` instead.
         depth_test: bool,
+        /// Whether the active attachment is private Depth32Float reversed depth,
+        /// cleared to zero. Use Greater with depth writes when true; native color
+        /// is shared, but native depth/stencil are preserved separately. False
+        /// means the native default attachment, including unsupported requests.
+        private_depth: bool,
     }
 
     #[cfg(feature = "wgpu")]

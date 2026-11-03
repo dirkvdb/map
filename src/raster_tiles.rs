@@ -436,6 +436,7 @@ mod tests {
             color_format: 0,
             depth_format: 0,
             depth_test: false,
+            private_depth: false,
         }
     }
 

@@ -24,6 +24,7 @@ fn parameters() -> WgpuLayerParameters {
         color_format: 0,
         depth_format: 0,
         depth_test: true,
+        private_depth: false,
     }
 }
 

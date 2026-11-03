@@ -4,7 +4,10 @@
 //! The oracle shares production XYW, sampling, indices and shading; only its near
 //! distance is enlarged. It is not an independent world-coordinate oracle.
 
+use std::cell::Cell;
+
 use super::*;
+use crate::map_readback::GpuReadback;
 use crate::raster_layer::extrusion_tests::paint_depth_with_clear;
 use crate::raster_tiles::test_support::device;
 use maplibre_native::{CameraUpdate, Continuous, ImageRenderer, ImageRendererBuilder, LatLng};
@@ -28,15 +31,44 @@ struct NativeCamera {
 
 impl NativeCamera {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Self> {
+        Self::with_builder(device, queue, ImageRendererBuilder::new())
+    }
+
+    fn with_builder(device: &wgpu::Device, queue: &wgpu::Queue, builder: ImageRendererBuilder) -> Result<Self> {
         let captured = Rc::new(RefCell::new(None));
-        // Keep native W at its real 512-pixel viewport scale, even though we
-        // later crop XY to the central 64 pixels for inexpensive readbacks.
-        let mut renderer = ImageRendererBuilder::new().build_continuous_renderer();
+        // Keep native W at the real viewport scale, even when later cropping XY
+        // to the central 64 pixels for inexpensive oracle readbacks.
+        let mut renderer = builder.build_continuous_renderer();
         renderer.set_device_queue(device.clone(), queue.clone());
         renderer.load_style_from_json_str(r#"{"version":8,"sources":{},"layers":[]}"#).wait()?;
         renderer.style().add_wgpu_custom_layer("capture", CaptureLayer(Rc::clone(&captured)), None)?;
         renderer.set_globe(true);
         Ok(Self { renderer, captured })
+    }
+
+    fn with_bars(device: &wgpu::Device, queue: &wgpu::Queue, mode: Rc<NativeBarMode>, builder: ImageRendererBuilder) -> Result<Self> {
+        let mut camera = Self::with_builder(device, queue, builder)?;
+        let style = r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#e0e0e0"}}]}"##;
+        camera.renderer.load_style_from_json_str(style).wait()?;
+        // Reloading the style removes the original capture layer.
+        camera
+            .renderer
+            .style()
+            .add_wgpu_custom_layer("capture", CaptureLayer(Rc::clone(&camera.captured)), None)?;
+        camera
+            .renderer
+            .style()
+            .add_wgpu_custom_layer("bars", NativeBars::new(device, queue, mode), None)?;
+        camera.renderer.set_globe(true);
+        Ok(camera)
+    }
+
+    fn native_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, readback: &mut GpuReadback, zoom: f64, offset: f64) -> Result<image::RgbaImage> {
+        // parameters() renders synchronously; do not read an earlier pending frame.
+        self.renderer.take_texture();
+        self.parameters(zoom, offset);
+        let texture = self.renderer.take_texture().expect("Native camera must publish the current frame");
+        readback.read(&texture, device, queue)
     }
 
     fn parameters(&mut self, zoom: f64, offset: f64) -> WgpuLayerParameters {
@@ -61,6 +93,86 @@ impl NativeCamera {
                 return parameters;
             }
             assert!(Instant::now() < deadline, "Native globe camera did not render");
+        }
+    }
+}
+
+#[derive(Default)]
+struct NativeBarMode {
+    direct: Cell<bool>,
+    accepted: Cell<Option<bool>>,
+    cell_pixels: Cell<f64>,
+    target_size: Cell<Option<[u32; 2]>>,
+    depth_size: Cell<Option<[u32; 2]>>,
+}
+
+struct NativeBars {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    mode: Rc<NativeBarMode>,
+    resources: Option<(RasterPipeline, DrawTile)>,
+    depth: Option<RasterDepth>,
+    composite: Option<RasterComposite>,
+}
+
+impl NativeBars {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, mode: Rc<NativeBarMode>) -> Self {
+        Self {
+            device: device.clone(),
+            queue: queue.clone(),
+            mode,
+            resources: None,
+            depth: None,
+            composite: None,
+        }
+    }
+}
+
+impl WgpuCustomLayer for NativeBars {
+    fn private_depth(&mut self, _parameters: &WgpuLayerParameters, size: [u32; 2]) -> Option<wgpu::TextureView> {
+        self.mode.target_size.set(Some(size));
+        if !self.mode.direct.get() {
+            return None;
+        }
+        self.depth = Some(RasterDepth::prepare(self.depth.take(), &self.device, size));
+        let view = &self.depth.as_ref().unwrap().view;
+        self.mode.depth_size.set(Some([view.texture().width(), view.texture().height()]));
+        Some(view.clone())
+    }
+
+    fn render(&mut self, pass: &mut wgpu::RenderPass<'_>, parameters: &WgpuLayerParameters) {
+        self.mode.accepted.set(Some(parameters.private_depth));
+        let (resources, draw) = self.resources.get_or_insert_with(|| {
+            let resources = RasterPipeline::new(&self.device, (parameters.color_format, 0x30, false, true));
+            let palette: Vec<_> = (0..256).flat_map(|_| GOLD).collect();
+            write_texture(&self.queue, &resources.palettes[0], &palette, 256, 1, 4);
+            let tile = varying_heights(&self.device, &self.queue);
+            let draw = resources.draw_tile(&self.device, (None, None), Some(&tile), None);
+            (resources, draw)
+        });
+        assert_eq!(resources.formats.0, parameters.color_format);
+        let mut uniform = depth_uniform(parameters, self.mode.cell_pixels.get());
+        // Undo only the oracle's XY crop; draw at the native attachment size.
+        for column in uniform.matrix.iter_mut().chain(uniform.projection.globe_matrix.iter_mut()) {
+            column[0] /= 8.0;
+            column[1] /= 8.0;
+        }
+        self.queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&uniform));
+        let render = |pass: &mut wgpu::RenderPass<'_>| {
+            pass.set_pipeline(&resources.extrusion_pipeline);
+            pass.set_bind_group(0, &draw.bindings, &[]);
+            draw_pixels(pass, uniform.extrusion, uniform.geometry, &resources.extrusion_indices, uniform.projection);
+        };
+        if parameters.private_depth {
+            assert_eq!(parameters.depth_format, 0x30);
+            assert!(!parameters.depth_test);
+            // No private encoder/submission: record into the actual bridge pass.
+            render(pass);
+        } else {
+            let target = RasterComposite::prepare(self.composite.take(), &self.device, parameters, 1.0);
+            target.render_surface(&self.device, &self.queue, parameters, |surface, _| render(surface));
+            target.composite(pass, &self.queue, 1.0);
+            self.composite = Some(target);
         }
     }
 }
@@ -258,6 +370,68 @@ fn assert_visible_faces(image: &image::RgbaImage) {
         tops > 500 && walls > 20,
         "Fixture must expose both gold tops and brown walls: tops={tops}, walls={walls}"
     );
+}
+
+#[test]
+#[ignore = "requires a native graphics device; local background style, no network"]
+fn gpu_native_globe_private_depth_uses_actual_fractional_odd_viewport_extent() -> Result<()> {
+    let (device, queue) = device()?;
+    let mode = Rc::new(NativeBarMode::default());
+    mode.direct.set(true);
+    mode.cell_pixels.set(1.0);
+    let builder = ImageRendererBuilder::new()
+        .with_size(101.try_into().unwrap(), 103.try_into().unwrap())
+        .with_pixel_ratio(1.5);
+    let mut camera = NativeCamera::with_bars(&device, &queue, Rc::clone(&mode), builder)?;
+    camera.renderer.take_texture();
+    let parameters = camera.parameters(10.0, 0.0);
+    assert_eq!([parameters.width, parameters.height], [101.0, 103.0]);
+    assert!(!parameters.private_depth, "The native capture layer did not request private depth");
+    assert_eq!(
+        mode.target_size.get(),
+        Some([151, 154]),
+        "Use native's truncated physical extent, not logical size or rounding"
+    );
+    assert_eq!(mode.depth_size.get(), mode.target_size.get());
+    assert_eq!(mode.accepted.get(), Some(true), "The bridge must accept the framebuffer-matching depth view");
+    let texture = camera.renderer.take_texture().expect("Native camera must publish the current frame");
+    assert_eq!([texture.width(), texture.height()], [151, 154]);
+    let image = GpuReadback::new(&device).read(&texture, &device, &queue)?;
+    assert_visible_faces(&image::imageops::crop_imm(&image, 43, 45, 64, 64).to_image());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a native graphics device; local background style, no network"]
+fn gpu_native_globe_private_depth_matches_composite_roundtrips() -> Result<()> {
+    let (device, queue) = device()?;
+    let mode = Rc::new(NativeBarMode::default());
+    let mut camera = NativeCamera::with_bars(&device, &queue, Rc::clone(&mode), ImageRendererBuilder::new())?;
+    let mut readback = GpuReadback::new(&device);
+    for (zoom, cell_pixels) in [(8.0, 0.5), (10.0, 1.0), (11.5, 2.0)] {
+        mode.cell_pixels.set(cell_pixels);
+        for offset in [-0.125, 0.125] {
+            mode.direct.set(false);
+            mode.accepted.set(None);
+            let reference = camera.native_frame(&device, &queue, &mut readback, zoom, offset)?;
+            assert_eq!(reference.dimensions(), (512, 512));
+            assert_eq!(mode.accepted.get(), Some(false));
+            assert_visible_faces(&image::imageops::crop_imm(&reference, 224, 224, 64, 64).to_image());
+            // Keep the host, pipelines and targets alive across both directions.
+            for direct in [true, false, true] {
+                mode.direct.set(direct);
+                mode.accepted.set(None);
+                let actual = camera.native_frame(&device, &queue, &mut readback, zoom, offset)?;
+                assert_eq!(actual.dimensions(), reference.dimensions());
+                assert_eq!(mode.accepted.get(), Some(direct), "Bridge did not accept the requested depth mode");
+                assert_visible_faces(&image::imageops::crop_imm(&actual, 224, 224, 64, 64).to_image());
+                let mismatches = color_mismatches(&actual, &reference);
+                eprintln!("native zoom={zoom}, cell={cell_pixels}, offset={offset}, direct={direct}: {mismatches}/262144 pixels differ by >3");
+                assert_eq!(mismatches, 0, "Native direct/composite roundtrip changed final color");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]
