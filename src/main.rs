@@ -27,6 +27,11 @@ mod settings;
 mod shortcuts;
 mod vector_source;
 
+use std::path::{Path, PathBuf};
+
+use anyhow::Context as _;
+use gdal::Metadata as _;
+use gdal::vector::LayerAccess as _;
 use gpui_kit::component::TitleBar;
 use gpui_kit::{App, AppContext, Bounds, QuitMode, Window, WindowBounds, WindowOptions, px, size};
 
@@ -46,7 +51,9 @@ fn main() {
         return;
     }
 
-    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
+    let paths = command_line_paths(std::env::args_os().skip(1).map(PathBuf::from));
+
+    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
         gpui_kit::init(cx);
         if let Err(error) = init_actions(cx).and_then(|()| map_view::init(cx)) {
             log::error!("Failed to initialize keyboard shortcuts: {error:#}");
@@ -55,7 +62,7 @@ fn main() {
         }
         appearance::init(cx);
 
-        if let Err(error) = create_main_window(cx) {
+        if let Err(error) = create_main_window(paths, cx) {
             log::error!("Failed to open window: {error:#}");
             cx.quit();
             return;
@@ -81,7 +88,51 @@ fn init_actions(cx: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn create_main_window(cx: &mut App) -> anyhow::Result<()> {
+fn command_line_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for path in paths {
+        if !path.is_dir() {
+            files.push(path);
+            continue;
+        }
+        match directory_source_paths(&path) {
+            Ok(paths) => files.extend(paths),
+            Err(error) => log::error!("Could not open source directory: {error:#}"),
+        }
+    }
+    files
+}
+
+fn directory_source_paths(directory: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(directory).with_context(|| format!("Could not read {}", directory.display()))?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry.with_context(|| format!("Could not read an entry in {}", directory.display()))?.path();
+        if path.is_file() && is_source_dataset(&path) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn is_source_dataset(path: &Path) -> bool {
+    // Probe metadata only: unsupported files and shapefile sidecars are not sources.
+    let Ok(dataset) = gdal::Dataset::open_ex(path, gdal::DatasetOptions::default()) else {
+        return false;
+    };
+    let driver = dataset.driver().short_name();
+    // GDAL also opens .dbf and .shx as their sibling shapefile dataset.
+    if driver == "ESRI Shapefile" && !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("shp")) {
+        return false;
+    }
+    dataset.raster_count() > 0
+        || dataset.metadata_domain("SUBDATASETS").is_some()
+        || driver == "CSV"
+        || dataset.layers().any(|layer| layer.defn().geom_fields().next().is_some())
+}
+
+fn create_main_window(paths: Vec<PathBuf>, cx: &mut App) -> anyhow::Result<()> {
     let window_bounds = Bounds::centered(None, size(px(1200.), px(760.)), cx);
     let window_options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(window_bounds)),
@@ -95,7 +146,7 @@ fn create_main_window(cx: &mut App) -> anyhow::Result<()> {
         window.set_window_title("Map");
         cx.new(|cx| {
             let view = map_view::MapView::new(window, cx);
-            view.open_paths(std::env::args_os().skip(1).map(std::path::PathBuf::from).collect(), cx);
+            view.open_paths(paths, cx);
             view
         })
     })?;
@@ -115,6 +166,80 @@ mod tests {
     use log::{Level, Log as _};
 
     use super::*;
+
+    #[test]
+
+    fn command_line_directories_add_supported_files_in_sorted_order_without_recursing() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let raster = directory.path().join("a-raster.TIF");
+        crate::raster_source::test_support::write_raster(&raster, 4326, 1)?;
+        let vector = directory.path().join("b-vector.geojson");
+        std::fs::write(&vector, r#"{"type":"FeatureCollection","features":[]}"#)?;
+        std::fs::write(directory.path().join("notes.txt"), "Not a dataset")?;
+        std::fs::create_dir(directory.path().join("nested"))?;
+        crate::raster_source::test_support::write_raster(&directory.path().join("nested/hidden.tif"), 4326, 1)?;
+        std::fs::create_dir(directory.path().join("looks-like-a-file.tif"))?;
+
+        assert_eq!(command_line_paths([directory.path().to_path_buf()]), [raster, vector]);
+        Ok(())
+    }
+
+    #[test]
+    fn command_line_paths_preserve_explicit_files_and_expand_multiple_directories_in_place() -> anyhow::Result<()> {
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        let first_raster = first.path().join("first.tif");
+        let second_raster = second.path().join("second.tif");
+        for path in [&first_raster, &second_raster] {
+            crate::raster_source::test_support::write_raster(path, 4326, 1)?;
+        }
+        let explicit = first.path().join("explicit.unknown");
+        let missing = first.path().join("missing.tif");
+        std::fs::write(&explicit, "Explicit inputs still go through the normal loader")?;
+        let paths = command_line_paths([explicit.clone(), first.path().to_path_buf(), missing.clone(), second.path().to_path_buf()]);
+        assert_eq!(paths, [explicit, first_raster, missing, second_raster]);
+        Ok(())
+    }
+
+    #[test]
+    fn command_line_directories_ignore_empty_and_unsupported_only_directories() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        assert!(command_line_paths([directory.path().to_path_buf()]).is_empty());
+        std::fs::write(directory.path().join("notes.txt"), "Not a dataset")?;
+        assert!(command_line_paths([directory.path().to_path_buf()]).is_empty());
+        assert!(command_line_paths([]).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn command_line_directories_detect_content_without_requiring_a_known_extension() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("raster.unusual");
+        crate::raster_source::test_support::write_raster(&path, 4326, 1)?;
+        assert_eq!(command_line_paths([directory.path().to_path_buf()]), [path]);
+        Ok(())
+    }
+
+    #[test]
+    fn command_line_directories_include_csv_sources_but_not_shapefile_sidecars() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let shapefile = directory.path().join("shape.shp");
+        let mut dataset = gdal::DriverManager::get_driver_by_name("ESRI Shapefile")?.create_vector_only(&shapefile)?;
+        dataset.create_layer(Default::default())?;
+        drop(dataset);
+        let csv = directory.path().join("points.csv");
+        std::fs::write(&csv, "lat,lon,value\n51,4,12\n")?;
+        assert_eq!(command_line_paths([directory.path().to_path_buf()]), [csv, shapefile]);
+        Ok(())
+    }
+
+    #[test]
+    fn directory_read_errors_include_the_requested_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let error = directory_source_paths(&missing).unwrap_err();
+        assert!(error.to_string().contains(&missing.display().to_string()));
+    }
 
     #[test]
     fn console_logging_defaults_to_info_for_map_and_geo_and_warn_for_infra_and_maplibre() {
