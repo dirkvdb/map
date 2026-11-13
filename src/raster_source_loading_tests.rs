@@ -3,6 +3,257 @@ use std::collections::HashSet;
 use super::*;
 
 #[test]
+fn grouped_coordinate_grids_use_declared_epsg_and_preserve_pixel_locations() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("copenhagen.nc");
+    super::test_support::write_netcdf_coordinate_grids(&path, Some(32633))?;
+    let original = std::fs::read(&path)?;
+    let sources = RasterSource::open_with_epsg(&path, Some(4326))?;
+    assert_eq!(sources.len(), 3, "Coordinate arrays must not appear as data layers");
+    for source in &sources {
+        assert_eq!(source.metadata().epsg, Some(geo::crs::Epsg::new(32633)));
+        assert!(source.range().0.is_finite() && source.range().1.is_finite());
+    }
+    let source = &sources[0];
+    assert!(source.metadata().name.contains("/Surface/T2M"));
+    let dataset = gdal::Dataset::open(&source.metadata().path)?;
+    assert!(std::fs::read_to_string(&source.metadata().path)?.contains("VRTWarpedDataset"));
+    for row in 0..3 {
+        for column in 0..4 {
+            let x = 339699.0 + column as f64 * 200.0;
+            let y = 6166080.0 + row as f64 * 200.0;
+            assert_eq!(value_at_projected_coordinate(&dataset, 1, x, y)?, (10 + row * 4 + column) as f32);
+        }
+    }
+    let [west, south, east, north] = source.metadata().bounds;
+    assert!((12.0..13.0).contains(&west) && (55.0..56.0).contains(&south));
+    assert!(west < east && south < north);
+    assert_tile_contains_band_values(source)?;
+    assert_eq!(std::fs::read(&path)?, original, "Opening must not modify the source file");
+    Ok(())
+}
+
+fn value_at_projected_coordinate(dataset: &gdal::Dataset, band: usize, x: f64, y: f64) -> Result<f32> {
+    use gdal::GeoTransformEx as _;
+    let (column, row) = dataset.geo_transform()?.invert()?.apply(x, y);
+    Ok(dataset
+        .rasterband(band)?
+        .read_as::<f32>((column.floor() as isize, row.floor() as isize), (1, 1), (1, 1), None)?
+        .data()[0])
+}
+
+#[test]
+fn cf_geolocation_discovered_by_gdal_needs_no_named_xy_fallback() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("cf.nc");
+    write_modified_coordinate_grids(
+        &path,
+        &[
+            ("<Array name=\"X\">", "<Array name=\"unused_easting\">"),
+            ("<Array name=\"Y\">", "<Array name=\"unused_northing\">"),
+            (
+                "<Array name=\"T2M\">",
+                "<Array name=\"T2M\"><Attribute name=\"coordinates\"><DataType>String</DataType><Value>/Parameters/LAT /Parameters/LON</Value></Attribute>",
+            ),
+            ("<Value>Degrees</Value>", "<Value>degrees_north</Value>"),
+            (
+                "<Array name=\"LON\"><DataType>Float32</DataType><DimensionRef ref=\"/nx\"/><DimensionRef ref=\"/ny\"/><Attribute name=\"units\"><DataType>String</DataType><Value>degrees_north</Value>",
+                "<Array name=\"LON\"><DataType>Float32</DataType><DimensionRef ref=\"/nx\"/><DimensionRef ref=\"/ny\"/><Attribute name=\"units\"><DataType>String</DataType><Value>degrees_east</Value>",
+            ),
+            ("name=\"nx\"", "name=\"y\""),
+            ("ref=\"/nx\"", "ref=\"/y\""),
+            ("name=\"ny\"", "name=\"x\""),
+            ("ref=\"/ny\"", "ref=\"/x\""),
+        ],
+    )?;
+    let grid = gdal::Dataset::open(format!("NETCDF:\"{}\":/Surface/T2M", path.display()))?;
+    assert!(grid.geo_transform().is_err());
+    assert!(grid.metadata_item("X_BAND", "GEOLOCATION").is_some());
+    let output = directory.path().join("cf.vrt");
+    let layers = netcdf_grid_metadata(&grid, &path, &output, "cf", &TileProviderOptions::default(), None)?;
+    assert_eq!(layers.len(), 1);
+    let warped = gdal::Dataset::open(&layers[0].path)?;
+    for row in 0..3 {
+        for column in 0..4 {
+            assert_eq!(
+                value_at_projected_coordinate(&warped, 1, 12.0 + column as f64, 55.0 + row as f64)?,
+                (10 + row * 4 + column) as f32
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn grouped_coordinate_grids_with_non_affine_eastings_preserve_pixel_locations() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("curved.nc");
+    write_modified_coordinate_grids(
+        &path,
+        &[(
+            "339699 339899 340099 340299 339699 339899 340099 340299 339699 339899 340099 340299",
+            "339699 339899 340099 340299 339739 339939 340139 340339 339699 339899 340099 340299",
+        )],
+    )?;
+    let sources = RasterSource::open(&path)?;
+    let source = sources
+        .iter()
+        .find(|source| source.metadata().name.contains("/Surface/T2M"))
+        .context("Missing T2M layer")?;
+    let dataset = gdal::Dataset::open(&source.metadata().path)?;
+    assert_projected_grid_values(&dataset, [339699.0, 339739.0, 339699.0], [6166080.0, 6166280.0, 6166480.0])?;
+    Ok(())
+}
+
+#[test]
+fn grouped_coordinate_grids_with_descending_northings_preserve_pixel_locations() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("descending.nc");
+    write_modified_coordinate_grids(
+        &path,
+        &[(
+            "6166080 6166080 6166080 6166080 6166280 6166280 6166280 6166280 6166480 6166480 6166480 6166480",
+            "6166480 6166480 6166480 6166480 6166280 6166280 6166280 6166280 6166080 6166080 6166080 6166080",
+        )],
+    )?;
+    let sources = RasterSource::open(&path)?;
+    let source = sources
+        .iter()
+        .find(|source| source.metadata().name.contains("/Surface/T2M"))
+        .context("Missing T2M layer")?;
+    let dataset = gdal::Dataset::open(&source.metadata().path)?;
+    assert_projected_grid_values(&dataset, [339699.0; 3], [6166480.0, 6166280.0, 6166080.0])?;
+    Ok(())
+}
+
+#[test]
+fn grouped_coordinate_grids_with_mismatched_shapes_report_georeferencing_not_missing_projection() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("mismatched.nc");
+    write_modified_coordinate_grids(
+        &path,
+        &[(
+            "<DataType>Float32</DataType><DimensionRef ref=\"/nx\"/><DimensionRef ref=\"/ny\"/>",
+            "<DataType>Float32</DataType><DimensionRef ref=\"/ny\"/><DimensionRef ref=\"/nx\"/>",
+        )],
+    )?;
+    let error = RasterSource::open(&path).err().context("Mismatched coordinate dimensions should be rejected")?;
+    assert!(
+        !error.is::<MissingProjection>(),
+        "A declared EPSG must not hide a coordinate shape error: {error:#}"
+    );
+    let message = format!("{error:#}");
+    assert!(message.contains("No georeferenced 2D grids"), "Unexpected error: {message}");
+    assert!(
+        message.contains("spatial axes"),
+        "The coordinate shape failure should remain actionable: {message}"
+    );
+    Ok(())
+}
+
+#[test]
+fn geolocation_warp_preserves_raw_samples_scale_offset_and_nodata() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("scaled.nc");
+    write_modified_coordinate_grids(
+        &path,
+        &[(
+            "<Array name=\"T2M\">",
+            "<Array name=\"T2M\"><Scale>0.5</Scale><Offset>-7</Offset><NoDataValue>21</NoDataValue>",
+        )],
+    )?;
+    let sources = RasterSource::open(&path)?;
+    let source = sources
+        .iter()
+        .find(|source| source.metadata().name.contains("/Surface/T2M"))
+        .context("Missing T2M layer")?;
+    assert!(source.unscaling_enabled());
+    assert_eq!(source.range(), (-2.0, 3.0));
+    let dataset = gdal::Dataset::open(&source.metadata().path)?;
+    let band = dataset.rasterband(1)?;
+    assert_eq!(band.scale(), Some(0.5));
+    assert_eq!(band.offset(), Some(-7.0));
+    assert_eq!(band.no_data_value(), Some(21.0));
+    assert_eq!(value_at_projected_coordinate(&dataset, 1, 339699.0, 6166080.0)?, 10.0);
+    assert_eq!(value_at_projected_coordinate(&dataset, 1, 340299.0, 6166480.0)?, 21.0);
+    Ok(())
+}
+
+#[test]
+fn grouped_coordinate_grids_restyled_sources_retain_lazy_geolocation_dependencies() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("restyled.nc");
+    super::test_support::write_netcdf_coordinate_grids(&path, Some(32633))?;
+    let sources = RasterSource::open(&path)?;
+    let source = sources
+        .iter()
+        .find(|source| source.metadata().name.contains("/Surface/T2M"))
+        .context("Missing T2M layer")?;
+    let restyled = source.restyled(ColorMapPreset::Gray, (10.0, 21.0))?;
+    let vrt_path = restyled.metadata().path.clone();
+    drop(sources);
+    let dataset = gdal::Dataset::open(&vrt_path)?;
+    assert_projected_grid_values(&dataset, [339699.0; 3], [6166080.0, 6166280.0, 6166480.0])?;
+    assert_tile_contains_band_values(&restyled)?;
+    drop(dataset);
+    drop(restyled);
+    assert!(!vrt_path.exists(), "Lazy dependencies must be released with the last source snapshot");
+    Ok(())
+}
+
+fn assert_projected_grid_values(dataset: &gdal::Dataset, eastings: [f64; 3], northings: [f64; 3]) -> Result<()> {
+    for (row, (x, y)) in eastings.into_iter().zip(northings).enumerate() {
+        for column in 0..4 {
+            assert_eq!(
+                value_at_projected_coordinate(dataset, 1, x + column as f64 * 200.0, y)?,
+                (10 + row * 4 + column) as f32,
+                "Wrong raw value at source row {row}, column {column}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn write_modified_coordinate_grids(path: &Path, replacements: &[(&str, &str)]) -> Result<()> {
+    super::test_support::write_netcdf_coordinate_grids(path, Some(32633))?;
+    let fixture = path.with_extension("fixture.vrt");
+    let mut xml = std::fs::read_to_string(&fixture)?;
+    for (original, replacement) in replacements {
+        assert!(xml.contains(original), "Fixture XML no longer contains {original}");
+        xml = xml.replace(original, replacement);
+    }
+    std::fs::write(&fixture, xml)?;
+    let dataset = gdal::Dataset::open_ex(
+        &fixture,
+        gdal::DatasetOptions {
+            open_flags: gdal::GdalOpenFlags::GDAL_OF_MULTIDIM_RASTER,
+            ..Default::default()
+        },
+    )?;
+    dataset
+        .create_copy(
+            &gdal::DriverManager::get_driver_by_name("netCDF")?,
+            path,
+            &gdal::raster::RasterCreationOptions::from_iter(["FORMAT=NC4"]),
+        )?
+        .close()?;
+    Ok(())
+}
+
+#[test]
+fn grouped_coordinate_grids_without_crs_request_projection_and_accept_supplied_epsg() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("copenhagen.nc");
+    super::test_support::write_netcdf_coordinate_grids(&path, None)?;
+    let error = RasterSource::open(&path).err().context("Expected a projection request")?;
+    assert!(error.is::<MissingProjection>(), "Unexpected error: {error:#}");
+    let sources = RasterSource::open_with_epsg(&path, Some(32633))?;
+    assert_eq!(sources.len(), 3);
+    assert_tile_contains_band_values(&sources[0])?;
+    Ok(())
+}
+
+#[test]
 fn supplied_epsg_3035_uses_easting_northing_order_for_plain_rasters() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("lisbon.tif");

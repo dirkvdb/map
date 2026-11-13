@@ -602,9 +602,16 @@ fn refresh_band_metadata(metadata: &mut LayerMetadata, dataset: &gdal::Dataset, 
             offset: offset.unwrap_or(0.0),
         }),
     };
-    if let Some(stats) = band.get_statistics(force_statistics, true)? {
-        metadata.min_value = stats.min as f32;
-        metadata.max_value = stats.max as f32;
+    match band.get_statistics(force_statistics, true) {
+        Ok(Some(stats)) => {
+            metadata.min_value = stats.min as f32;
+            metadata.max_value = stats.max as f32;
+        }
+        // NetCDF model outputs can include entirely uninitialized slices.
+        // GDAL reports these as a statistics error, not as absent statistics.
+        Err(gdal::errors::GdalError::CplError { msg, .. }) if msg.ends_with("no valid pixels found in sampling.") => {}
+        Err(error) => return Err(error.into()),
+        Ok(None) => {}
     }
     Ok(())
 }
@@ -747,7 +754,8 @@ fn netcdf_collect_auxiliary_variables(dataset: &gdal::Dataset, variable: &str, a
 
 fn netcdf_is_auxiliary(candidate: &NetcdfCandidate, auxiliary_variables: &HashSet<String>) -> gdal::errors::Result<bool> {
     let band = candidate.dataset.rasterband(1)?;
-    Ok(auxiliary_variables.contains(candidate.variable.trim_start_matches('/'))
+    Ok(netcdf_named_coordinate(&candidate.variable, &band)
+        || auxiliary_variables.contains(candidate.variable.trim_start_matches('/'))
         || band.metadata_item("standard_name", "").is_some_and(|name| {
             matches!(
                 name.as_str(),
@@ -757,6 +765,15 @@ fn netcdf_is_auxiliary(candidate: &NetcdfCandidate, auxiliary_variables: &HashSe
         || band
             .metadata_item("axis", "")
             .is_some_and(|axis| matches!(axis.as_str(), "X" | "Y" | "Z" | "T")))
+}
+
+fn netcdf_named_coordinate(variable: &str, band: &gdal::raster::RasterBand<'_>) -> bool {
+    let name = variable.rsplit('/').next().unwrap_or(variable).to_ascii_lowercase();
+    let units = band.metadata_item("units", "").unwrap_or_default().to_ascii_lowercase();
+    matches!(
+        (name.as_str(), units.as_str()),
+        ("x" | "y", "m" | "meter" | "meters") | ("lat" | "lon", "degrees")
+    )
 }
 
 fn open_netcdf_grid(grid: &str) -> gdal::errors::Result<gdal::Dataset> {
@@ -792,9 +809,21 @@ fn netcdf_grid_metadata(
     let mut vrt = dataset.create_copy(&gdal::DriverManager::get_driver_by_name("VRT")?, output, &Default::default())?;
     netcdf_georeference_vrt(dataset, &first_band, &mut vrt, source, output, epsg)?;
     vrt.close()?;
-    let mut metadata = WarpingTileProvider::new(output, options)?.layers();
+    let raster = netcdf_warped_vrt(output)?;
+    let mut metadata = WarpingTileProvider::new(&raster, options)?.layers();
     netcdf_label_layers(dataset, file_name, &mut metadata)?;
     Ok(metadata)
+}
+
+fn netcdf_warped_vrt(source: &Path) -> Result<std::path::PathBuf> {
+    let dataset = gdal::Dataset::open(source)?;
+    if dataset.geo_transform().is_ok() {
+        return Ok(source.to_path_buf());
+    }
+    let output = source.with_extension("warped.vrt");
+    let arguments = ["-of", "VRT", "-geoloc", "-r", "near"].map(str::to_owned);
+    geo::raster::algo::gdal::warp_to_disk_cli(&dataset, &output, &arguments, &Vec::new(), None)?;
+    Ok(output)
 }
 
 fn netcdf_georeference_vrt(
@@ -806,27 +835,110 @@ fn netcdf_georeference_vrt(
     epsg: Option<u32>,
 ) -> Result<()> {
     if dataset.geo_transform().is_err() {
-        // Some producers put GeoTransform on the data variable instead of the
-        // grid-mapping variable, where GDAL expects it. Never guess an extent.
-        let transform = netcdf_explicit_transform(first_band)?;
-        // The classic reader may reverse rows even when it cannot derive a
-        // transform. The explicit attribute describes native array order, so
-        // use lazy multidimensional sources rather than that reversed reader.
-        netcdf_native_sources(dataset, vrt, source, output)?;
-        vrt.set_geo_transform(&transform)?;
+        netcdf_locate_grid(dataset, first_band, vrt, source, output, epsg)?;
     }
     if dataset.spatial_ref().is_err() {
-        let crs = dataset
-            .metadata_item("NC_GLOBAL#crs", "")
-            .or_else(|| epsg.map(|code| format!("EPSG:{code}")))
-            .context(MissingProjection)?;
-        // Raster transforms use X/Y (easting/northing or longitude/latitude),
-        // even for authority CRSs such as EPSG:3035 with reversed axis order.
-        let mut reference = gdal::spatial_ref::SpatialRef::from_definition(&crs)?;
-        reference.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
-        vrt.set_spatial_ref(&reference)?;
+        vrt.set_spatial_ref(&netcdf_spatial_ref(vrt, epsg)?)?;
     }
     Ok(())
+}
+
+fn netcdf_locate_grid(
+    dataset: &gdal::Dataset,
+    first_band: &gdal::raster::RasterBand<'_>,
+    vrt: &mut gdal::Dataset,
+    source: &Path,
+    output: &Path,
+    epsg: Option<u32>,
+) -> Result<()> {
+    if first_band.metadata_item("GeoTransform", "").is_some() {
+        netcdf_native_sources(dataset, vrt, source, output)?;
+        vrt.set_geo_transform(&netcdf_explicit_transform(first_band)?)?;
+    } else if dataset.metadata_item("X_BAND", "GEOLOCATION").is_none() {
+        // Preserve GDAL-discovered geolocation as-is. Only adapt producers
+        // whose coordinate relationships GDAL cannot discover itself.
+        netcdf_native_sources(dataset, vrt, source, output)?;
+        netcdf_geolocation(source, dataset, vrt, output, epsg)?;
+    }
+    Ok(())
+}
+
+fn netcdf_spatial_ref(dataset: &gdal::Dataset, epsg: Option<u32>) -> Result<gdal::spatial_ref::SpatialRef> {
+    let crs = dataset
+        .metadata_item("SRS", "GEOLOCATION")
+        .or_else(|| dataset.metadata_item("NC_GLOBAL#crs", ""))
+        .or_else(|| dataset.metadata_item("NC_GLOBAL#EPSG", "").map(|code| format!("EPSG:{}", code.trim())))
+        .or_else(|| epsg.map(|code| format!("EPSG:{code}")))
+        .context(MissingProjection)?;
+    // Raster transforms use X/Y, even for authority CRSs with reversed axes.
+    let mut reference = gdal::spatial_ref::SpatialRef::from_definition(&crs)?;
+    reference.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
+    Ok(reference)
+}
+
+fn netcdf_coordinate_pair(source: &Path) -> Result<(String, String)> {
+    let container = gdal::Dataset::open(source)?;
+    let variables = netcdf_subdatasets(&container, source)
+        .into_iter()
+        .filter_map(|(_, name)| name.rsplit_once(':').map(|(_, variable)| variable.to_owned()))
+        .collect::<Vec<_>>();
+    let x = netcdf_unique_coordinate(&variables, "x")?;
+    let y = netcdf_unique_coordinate(&variables, "y")?;
+    ensure!(
+        x.rsplit_once('/').map(|(group, _)| group) == y.rsplit_once('/').map(|(group, _)| group),
+        "NetCDF X and Y coordinates must belong to the same group"
+    );
+    Ok((x.to_owned(), y.to_owned()))
+}
+
+fn netcdf_geolocation(source: &Path, dataset: &gdal::Dataset, vrt: &mut gdal::Dataset, output: &Path, epsg: Option<u32>) -> Result<()> {
+    let (x, y) = netcdf_coordinate_pair(source)?;
+    let reference = dataset.spatial_ref().or_else(|_| netcdf_spatial_ref(dataset, epsg))?;
+    let srs = reference.to_wkt()?;
+    let x = netcdf_geolocation_source(source, dataset, &x, &output.with_extension("X.vrt"))?;
+    let y = netcdf_geolocation_source(source, dataset, &y, &output.with_extension("Y.vrt"))?;
+    for (key, value) in [
+        ("SRS", srs.as_str()),
+        ("X_DATASET", x.as_str()),
+        ("Y_DATASET", y.as_str()),
+        ("X_BAND", "1"),
+        ("Y_BAND", "1"),
+        ("PIXEL_OFFSET", "0"),
+        ("LINE_OFFSET", "0"),
+        ("PIXEL_STEP", "1"),
+        ("LINE_STEP", "1"),
+        ("GEOREFERENCING_CONVENTION", "PIXEL_CENTER"),
+    ] {
+        vrt.set_metadata_item(key, value, "GEOLOCATION")?;
+    }
+    Ok(())
+}
+
+// The classic NetCDF reader may reverse rows. Use the same native-array VRT
+// sources for data and coordinates so GDAL's geolocation transformer sees
+// matching pixels without changing the original file.
+fn netcdf_geolocation_source(source: &Path, target: &gdal::Dataset, variable: &str, output: &Path) -> Result<String> {
+    let dataset = gdal::Dataset::open(format!("NETCDF:\"{}\":{variable}", source.display()))?;
+    let (_, sizes) = netcdf_native_dimensions(source, &dataset)?;
+    ensure!(
+        sizes.len() == 2 && dataset.raster_size() == target.raster_size(),
+        "NetCDF coordinate {variable} must match the grid's two spatial axes"
+    );
+    let mut vrt = dataset.create_copy(&gdal::DriverManager::get_driver_by_name("VRT")?, output, &Default::default())?;
+    netcdf_native_sources(&dataset, &mut vrt, source, output)?;
+    vrt.close()?;
+    Ok(output.to_str().context("NetCDF coordinate path is not valid UTF-8")?.to_owned())
+}
+
+fn netcdf_unique_coordinate<'a>(variables: &'a [String], axis: &str) -> Result<&'a str> {
+    let mut matches = variables
+        .iter()
+        .filter(|variable| variable.rsplit('/').next().is_some_and(|name| name.eq_ignore_ascii_case(axis)));
+    let coordinate = matches.next().with_context(|| {
+        format!("No affine transform or GeoTransform attribute, and no 2D {axis} coordinate variable; an EPSG code alone cannot locate this grid")
+    })?;
+    ensure!(matches.next().is_none(), "Ambiguous NetCDF {axis} coordinate variables");
+    Ok(coordinate)
 }
 
 fn netcdf_explicit_transform(band: &gdal::raster::RasterBand<'_>) -> Result<[f64; 6]> {
@@ -2192,6 +2304,60 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+
+    pub fn write_netcdf_coordinate_grids(path: &Path, epsg: Option<u32>) -> Result<()> {
+        let crs = epsg.map_or_else(String::new, |code| {
+            format!("<Attribute name=\"EPSG\"><DataType>Int32</DataType><Value>{code}</Value></Attribute>")
+        });
+        let mut arrays = String::new();
+        for (name, units, values) in [
+            ("X", "m", "339699 339899 340099 340299 339699 339899 340099 340299 339699 339899 340099 340299"),
+            (
+                "Y",
+                "m",
+                "6166080 6166080 6166080 6166080 6166280 6166280 6166280 6166280 6166480 6166480 6166480 6166480",
+            ),
+            ("LAT", "Degrees", "55 55 55 55 56 56 56 56 57 57 57 57"),
+            ("LON", "Degrees", "12 13 14 15 12 13 14 15 12 13 14 15"),
+        ] {
+            arrays.push_str(&format!(
+                "<Array name=\"{name}\"><DataType>Float32</DataType><DimensionRef ref=\"/nx\"/><DimensionRef ref=\"/ny\"/>\
+                 <Attribute name=\"units\"><DataType>String</DataType><Value>{units}</Value></Attribute>\
+                 <InlineValues>{values}</InlineValues></Array>"
+            ));
+        }
+        let fixture = path.with_extension("fixture.vrt");
+        std::fs::write(
+            &fixture,
+            format!(
+                "<VRTDataset><Group name=\"/\">{crs}<Dimension name=\"nx\" size=\"3\"/><Dimension name=\"ny\" size=\"4\"/>\
+             <Dimension name=\"nt\" size=\"1\"/><Dimension name=\"nz\" size=\"2\"/>\
+             <Group name=\"Parameters\">{arrays}</Group><Group name=\"Surface\"><Array name=\"T2M\">\
+             <DataType>Float32</DataType><DimensionRef ref=\"/nt\"/><DimensionRef ref=\"/nx\"/><DimensionRef ref=\"/ny\"/>\
+             <InlineValues>10 11 12 13 14 15 16 17 18 19 20 21</InlineValues></Array></Group>\
+             <Group name=\"Atmosphere\"><Array name=\"PT\"><DataType>Float32</DataType>\
+             <DimensionRef ref=\"/nz\"/><DimensionRef ref=\"/nt\"/><DimensionRef ref=\"/nx\"/><DimensionRef ref=\"/ny\"/>\
+             <NoDataValue>-9999</NoDataValue><InlineValues>30 31 32 33 34 35 36 37 38 39 40 41 \
+             -9999 -9999 -9999 -9999 -9999 -9999 -9999 -9999 -9999 -9999 -9999 -9999</InlineValues>\
+             </Array></Group></Group></VRTDataset>"
+            ),
+        )?;
+        let dataset = gdal::Dataset::open_ex(
+            &fixture,
+            gdal::DatasetOptions {
+                open_flags: gdal::GdalOpenFlags::GDAL_OF_MULTIDIM_RASTER,
+                ..Default::default()
+            },
+        )?;
+        dataset
+            .create_copy(
+                &gdal::DriverManager::get_driver_by_name("netCDF")?,
+                path,
+                &gdal::raster::RasterCreationOptions::from_iter(["FORMAT=NC4"]),
+            )?
+            .close()?;
+        Ok(())
+    }
 
     pub fn write_netcdf(path: &Path, time_dimension: bool, metadata_only_transform: bool) -> Result<()> {
         let mut dataset = gdal::DriverManager::get_driver_by_name("MEM")?.create_with_band_type::<f32, _>("", 64, 64, 2)?;
