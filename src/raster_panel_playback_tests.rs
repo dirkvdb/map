@@ -193,6 +193,34 @@ fn aligned_playback_fixture_opens_as_native_cog_with_all_band_descriptions() {
 }
 
 #[gpui_kit::test]
+fn netcdf_single_layer_parameters_are_selected_by_name_without_playback(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("weather - variables.nc");
+    crate::raster_source::test_support::write_netcdf(&path, false, false).unwrap();
+    let (panel, handle) = open_panel(cx);
+    load(&panel, handle, vec![path], cx);
+    assert_playback_visibility(&panel, handle, false, cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("raster-band-slider").is_none());
+        let select = window.find("raster-parameter");
+        assert_eq!(select.label(), Some("Parameter"));
+        assert_eq!(select.value(), Some("Band1"));
+    })
+    .unwrap();
+
+    click(handle, "raster-parameter", cx);
+    press(handle, "down", cx);
+    press(handle, "enter", cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("raster-parameter").value(), Some("Band2"));
+        assert_eq!(panel.read(cx).active().unwrap().metadata().name, "weather - variables - Band2");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn playback_controls_are_available_for_every_multiband_raster(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let cogs = cog_paths(&dir, &[1, 5]);
@@ -221,6 +249,12 @@ fn playback_controls_are_available_for_every_multiband_raster(cx: &mut TestAppCo
     ] {
         load(&panel, handle, vec![path], cx);
         assert_playback_visibility(&panel, handle, true, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("raster-parameter").is_none());
+            assert!(window.find("raster-band-slider").visible());
+        })
+        .unwrap();
         let initial = request(&panel, cx);
         assert!(!initial.is_playing());
         assert_eq!(initial.position(), 0.0);

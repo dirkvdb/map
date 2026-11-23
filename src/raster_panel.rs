@@ -206,6 +206,7 @@ struct RasterDataset {
     path: PathBuf,
     bands: Vec<tiler::LayerId>,
     selected: tiler::LayerId,
+    parameters: Vec<BandChoice>,
     playback: Option<PlaybackRequest>,
 }
 
@@ -333,6 +334,7 @@ pub struct RasterPanel {
     band_scroll: f32,
     palette_scroll: f32,
     bands: Entity<SelectState<Vec<BandChoice>>>,
+    parameters: Entity<SelectState<Vec<BandChoice>>>,
     palette: Entity<SelectState<PaletteChoices>>,
     property: Entity<SelectState<SearchableVec<SharedString>>>,
     opacity: Entity<SliderState>,
@@ -364,6 +366,7 @@ impl EventEmitter<RasterEvent> for RasterPanel {}
 impl RasterPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let bands = cx.new(|cx| SelectState::new(Vec::<BandChoice>::new(), None, window, cx));
+        let (parameters, parameter_subscription) = Self::parameter_control(window, cx);
         let palette = cx.new(|cx| initial_palette(window, cx));
         let (extrusion_height, extrusion_subscription) = Self::extrusion_control(window, cx);
         let property = cx.new(|cx| SelectState::new(SearchableVec::new(Vec::<SharedString>::new()), None, window, cx).searchable(true));
@@ -381,6 +384,7 @@ impl RasterPanel {
                 let SelectEvent::Confirm(id) = event;
                 this.select_layer(*id, window, cx);
             }),
+            parameter_subscription,
             cx.subscribe_in(&palette, window, |this, _, _: &SelectEvent<PaletteChoices>, window, cx| {
                 this.apply_style(window, cx)
             }),
@@ -419,6 +423,7 @@ impl RasterPanel {
             band_scroll: 0.0,
             palette_scroll: 0.0,
             bands,
+            parameters,
             palette,
             property,
             opacity,
@@ -553,6 +558,7 @@ impl RasterPanel {
             .and_then(|dataset| dataset.bands.iter().position(|&band| Some(SelectionId::Raster(band)) == id));
         self.reset_playback(position.unwrap_or(0) as f64);
         self.sync_band_controls(window, cx);
+        self.sync_parameter_control(window, cx);
         self.palette_scroll = 0.0;
         self.error = None;
         self.load_error = None;
@@ -609,6 +615,26 @@ impl RasterPanel {
                 *slider = SliderState::new().min(1.0).max(count).step(1.0).default_value(band);
             }
             slider.set_value(band, window, cx);
+        });
+    }
+
+    fn parameter_control(window: &mut Window, cx: &mut Context<Self>) -> (Entity<SelectState<Vec<BandChoice>>>, Subscription) {
+        let parameters = cx.new(|cx| SelectState::new(Vec::<BandChoice>::new(), None, window, cx));
+        let subscription = cx.subscribe_in(&parameters, window, |this, _, event, window, cx| {
+            if let SelectEvent::Confirm(Some(id)) = event {
+                this.select(Some(*id), false, window, cx);
+            }
+        });
+        (parameters, subscription)
+    }
+
+    fn sync_parameter_control(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let items = self.active_dataset().map_or(&[][..], |dataset| dataset.parameters.as_slice());
+        self.parameters.update(cx, |state, cx| {
+            state.set_items(items.to_vec(), window, cx);
+            if let Some(id) = self.selected.filter(|_| !items.is_empty()) {
+                state.set_selected_value(&id, window, cx);
+            }
         });
     }
 
@@ -1215,6 +1241,7 @@ impl RasterPanel {
             state.set_items(Vec::new(), window, cx);
             state.set_selected_index(None, window, cx);
         });
+        self.sync_parameter_control(window, cx);
         self.sync_color_controls(window, cx);
         self.emit(false, cx);
     }
@@ -1460,8 +1487,20 @@ impl RasterPanel {
         )
     }
 
+    fn render_parameter_selector(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
+        self.active_dataset().filter(|dataset| !dataset.parameters.is_empty())?;
+        Some(
+            overlay_card("raster-parameter-controls", cx)
+                .w_full()
+                .child(field_label("Parameter", cx))
+                .child(Select::new(&self.parameters).id("raster-parameter").accessibility_label("Parameter").w_full()),
+        )
+    }
+
     fn render_band_selector(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
-        let dataset = self.active_dataset().filter(|dataset| dataset.bands.len() > 1)?;
+        let dataset = self
+            .active_dataset()
+            .filter(|dataset| dataset.bands.len() > 1 && dataset.parameters.is_empty())?;
         let count = dataset.bands.len();
         let band = dataset.bands.iter().position(|&id| id == dataset.selected)? + 1;
         let metadata = self.active()?.metadata();
@@ -1714,7 +1753,7 @@ impl Render for RasterPanel {
         if !self.collapsed && self.color_range().is_some() {
             panel = panel.child(self.render_value_range(cx));
         }
-        panel = panel.children(self.render_band_selector(cx));
+        panel = panel.children(self.render_parameter_selector(cx)).children(self.render_band_selector(cx));
         div()
             .id("raster-controls")
             .test_support()
@@ -2017,11 +2056,14 @@ fn load_raster_path(path: &std::path::Path, epsg: Option<u32>, loaded: &mut Load
     match result {
         Ok(opened) => {
             if let Some(first) = opened.first() {
+                let parameters = netcdf_parameter_choices(path, &opened);
+                let playback = if parameters.is_empty() { PlaybackRequest::for_dataset(&opened) } else { None };
                 loaded.raster_datasets.push(RasterDataset {
                     path: path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
                     bands: opened.iter().map(|source| source.metadata().id).collect(),
                     selected: first.metadata().id,
-                    playback: PlaybackRequest::for_dataset(&opened),
+                    parameters,
+                    playback,
                 });
                 loaded.selected = Some(SelectionId::Raster(first.metadata().id));
             }
@@ -2034,6 +2076,31 @@ fn load_raster_path(path: &std::path::Path, epsg: Option<u32>, loaded: &mut Load
         Err(error) if error.is::<crate::raster_source::MissingProjection>() => loaded.missing_projections.push(path.to_path_buf()),
         Err(error) => loaded.errors.push(format!("{}: {error:#}", path.display())),
     }
+}
+
+fn netcdf_parameter_choices(path: &std::path::Path, sources: &[Arc<RasterSource>]) -> Vec<BandChoice> {
+    // NetCDF band numbers restart for each variable; any later band means
+    // at least one variable has multiple slices.
+    if sources.len() < 2
+        || !sources.iter().all(|source| {
+            let metadata = source.metadata();
+            metadata.source_format == tiler::LayerSourceType::Netcdf && metadata.band_nr == Some(1)
+        })
+    {
+        return Vec::new();
+    }
+    let file_name = path.file_stem().unwrap_or(path.as_os_str()).to_string_lossy();
+    let prefix = format!("{file_name} - ");
+    sources
+        .iter()
+        .map(|source| {
+            let metadata = source.metadata();
+            BandChoice {
+                id: SelectionId::Raster(metadata.id),
+                title: metadata.name.strip_prefix(&prefix).unwrap_or(&metadata.name).to_owned().into(),
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn scroll_index(event: &ScrollEvent, scroll: &mut f32, ix: usize, count: usize, cx: &mut App) -> usize {
@@ -2406,10 +2473,10 @@ mod tests {
             toggle_reverse_checkbox_with_keyboard(window, cx);
             assert_eq!(panel.read(cx).active().unwrap().palette_rgba(), original.palette_rgba());
             window.press("space", cx);
-            window.click("next-raster-band", cx);
+            activate_parameter(&panel, 2, window, cx);
             assert_eq!(window.find("raster-palette-reverse").checked(), Some(false));
             assert!(panel.read(cx).color_map_direction() == ColorMapDirection::Regular);
-            window.click("previous-raster-band", cx);
+            activate_parameter(&panel, 1, window, cx);
             assert_eq!(window.find("raster-palette-reverse").checked(), Some(true));
             assert!(panel.read(cx).color_map_direction() == ColorMapDirection::Reversed);
             window.scroll("raster-palette", ScrollDelta::Lines(point(0.0, -1.0)), cx);
@@ -2592,6 +2659,26 @@ mod tests {
     fn load_test_paths(panel: &Entity<RasterPanel>, handle: PanelWindow, paths: Vec<PathBuf>, cx: &mut TestAppContext) {
         cx.update_window(handle.into(), |_, _, cx| panel.update(cx, |panel, cx| panel.open_paths(paths, cx)))
             .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn activate_parameter(panel: &Entity<RasterPanel>, parameter: usize, window: &mut Window, cx: &mut App) {
+        panel.update(cx, |panel, cx| {
+            let id = panel.active_dataset().unwrap().parameters[parameter - 1].id;
+            panel.select(Some(id), false, window, cx);
+        });
+        window.render_frame(cx);
+    }
+
+    fn select_adjacent_parameter(handle: PanelWindow, direction: &str, cx: &mut TestAppContext) {
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("raster-parameter", cx);
+            window.render_frame(cx);
+            window.press(direction, cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
         cx.run_until_parked();
     }
 
@@ -2825,7 +2912,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn band_slider_preserves_independent_palette_and_range_styles(cx: &mut TestAppContext) {
+    fn parameter_selection_preserves_independent_palette_and_range_styles(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![per_band_style_test_path(&dir, 3)];
@@ -2834,7 +2921,7 @@ mod tests {
         let first = style_active_band(&panel, handle, 1, (25.0, 45.0), cx);
         assert_eq!(first.palette(), ColorMapPreset::YlGnBu);
         assert_eq!(first.range(), (25.0, 45.0));
-        click_band_slider(&panel, handle, 0.5, 2, cx);
+        select_adjacent_parameter(handle, "down", cx);
         cx.update(|cx| {
             let source = panel.read(cx).active().unwrap();
             assert_eq!(selected_band(panel.read(cx)), Some(2));
@@ -2845,8 +2932,8 @@ mod tests {
         let second = style_active_band(&panel, handle, 2, (35.0, 55.0), cx);
         assert_eq!(second.palette(), ColorMapPreset::YlOrRd);
         assert_eq!(second.range(), (35.0, 55.0));
-        for (position, band, source, palette) in [(0.05, 1, &first, "YlGnBu"), (0.5, 2, &second, "YlOrRd")] {
-            click_band_slider(&panel, handle, position, band, cx);
+        for (direction, source, palette) in [("up", &first, "YlGnBu"), ("down", &second, "YlOrRd")] {
+            select_adjacent_parameter(handle, direction, cx);
             cx.update(|cx| {
                 assert_eq!(panel.read(cx).active().unwrap().id(), source.id());
                 assert_eq!(panel.read(cx).min.read(cx).value().as_str(), format!("{:.2}", source.range().0));
@@ -3327,9 +3414,9 @@ mod tests {
             window.render_frame(cx);
             let height = panel.read(cx).extrusion().1;
             assert!(height > DEFAULT_EXTRUSION_HEIGHT);
-            window.click("next-raster-band", cx);
+            activate_parameter(&panel, 2, window, cx);
             assert_eq!(panel.read(cx).extrusion(), (false, DEFAULT_EXTRUSION_HEIGHT));
-            window.click("previous-raster-band", cx);
+            activate_parameter(&panel, 1, window, cx);
             assert_eq!(panel.read(cx).extrusion(), (true, height));
             assert_eq!(panel.read(cx).extrusion_height.read(cx).value().end(), height);
             window.click("raster-extrude-pixels", cx);
@@ -3503,11 +3590,11 @@ mod tests {
             assert_eq!(unclamped.range(), original.range());
             assert_eq!(unclamped.palette(), original.palette());
             assert_eq!(window.find("raster-clamp-colors").checked(), Some(false));
-            window.click("next-raster-band", cx);
+            activate_parameter(&panel, 2, window, cx);
             assert_ne!(panel.read(cx).active().unwrap().metadata().id, original.metadata().id);
             assert!(panel.read(cx).active().unwrap().clamp_colors());
             assert_eq!(window.find("raster-clamp-colors").checked(), Some(true));
-            window.click("previous-raster-band", cx);
+            activate_parameter(&panel, 1, window, cx);
             assert_eq!(panel.read(cx).active().unwrap().metadata().id, original.metadata().id);
             assert!(!panel.read(cx).active().unwrap().clamp_colors());
             assert_eq!(window.find("raster-clamp-colors").checked(), Some(false));
@@ -3808,7 +3895,7 @@ mod tests {
         let (panel, handle) = open_test_panel(cx, 1000.0);
         verify_picker_cancel_and_open(&panel, handle, path, cx);
         let original_band = cx.update(|cx| panel.read(cx).selected);
-        verify_band_navigation(&panel, handle, original_band, cx);
+        verify_parameter_navigation(&panel, handle, original_band, cx);
         verify_raster_range_precision(&panel, handle, cx);
         verify_raster_range_validation_and_repeated_commit(&panel, handle, cx);
         cx.update_window(handle.into(), |_, window, cx| {
@@ -3856,30 +3943,21 @@ mod tests {
         });
     }
 
-    fn verify_band_navigation(panel: &Entity<RasterPanel>, handle: PanelWindow, original_band: Option<SelectionId>, cx: &mut TestAppContext) {
+    fn verify_parameter_navigation(panel: &Entity<RasterPanel>, handle: PanelWindow, original_band: Option<SelectionId>, cx: &mut TestAppContext) {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             for delta in [1.0, -1.0] {
                 window.scroll("raster-band", ScrollDelta::Lines(point(0.0, delta)), cx);
                 assert_eq!(panel.read(cx).selected, original_band, "Title scrolling must not change bands within a file");
             }
-            assert_eq!(window.find("previous-raster-band").disabled(), Some(true));
-            window.click("previous-raster-band", cx);
-            assert_band_selection(panel, 1, original_band, cx);
-            window.click("next-raster-band", cx);
-            assert_band_selection(panel, 2, original_band, cx);
-            assert_ne!(panel.read(cx).selected, original_band);
-            assert_eq!(window.find("next-raster-band").disabled(), Some(true));
-            window.click("next-raster-band", cx);
-            assert_band_selection(panel, 2, original_band, cx);
-            window.click("previous-raster-band", cx);
-            assert_band_selection(panel, 1, original_band, cx);
         })
         .unwrap();
-        click_band_slider(panel, handle, 0.95, 2, cx);
+        for (direction, parameter) in [("down", 2), ("up", 1), ("down", 2)] {
+            select_adjacent_parameter(handle, direction, cx);
+            cx.update(|cx| assert_band_selection(panel, parameter, original_band, cx));
+        }
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert_band_selection(panel, 2, original_band, cx);
             window.click("raster-band", cx);
             window.press("down", cx);
             window.press("enter", cx);

@@ -4530,7 +4530,11 @@ mod tests {
                 .to_platform_input(),
                 cx,
             );
-            window.click("next-raster-band", cx);
+            window.render_frame(cx);
+            window.click("raster-parameter", cx);
+            window.render_frame(cx);
+            window.press("down", cx);
+            window.press("enter", cx);
         })
         .unwrap();
         cx.run_until_parked();
