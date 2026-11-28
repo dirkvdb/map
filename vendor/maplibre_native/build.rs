@@ -845,10 +845,24 @@ struct StaticDependencies(Vec<(&'static str, pkg_config::Library)>);
 fn is_system_library(target_os: &str, name: &str) -> bool {
     if target_os == "windows" {
         // Import libraries for Windows APIs are not bundled third-party archives.
-        // m is supplied by MinGW's CRT; C++ runtime selection remains the packager's.
+        // MinGW supplies synchronization for libuv and m for the CRT.
+        // C++ runtime selection remains the packager's.
         [
-            "m", "kernel32", "user32", "gdi32", "advapi32", "crypt32", "bcrypt", "ws2_32",
-            "iphlpapi", "psapi", "userenv", "dbghelp", "ole32", "shell32",
+            "m",
+            "kernel32",
+            "user32",
+            "gdi32",
+            "advapi32",
+            "crypt32",
+            "bcrypt",
+            "ws2_32",
+            "iphlpapi",
+            "psapi",
+            "userenv",
+            "dbghelp",
+            "ole32",
+            "shell32",
+            "synchronization",
         ]
         .contains(&name)
     } else {
@@ -1529,7 +1543,7 @@ mod static_dependency_tests {
         let fixture = Fixture::new();
         let archive = fixture.path("primary/lib/libuv.a");
         fs::write(&archive, []).unwrap();
-        let library = fixture.library_with_flags("-l:libuv.a", "-lws2_32");
+        let library = fixture.library_with_flags("-l:libuv.a", "-lws2_32 -lsynchronization");
         validate_static_library("libuv", &library, "windows");
         assert_eq!(static_archive("libuv", &library, &library.libs[0]), archive);
     }
